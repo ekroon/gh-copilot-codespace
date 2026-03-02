@@ -152,15 +152,18 @@ func (c *Client) Exec(ctx context.Context, command string) (stdout string, stder
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Ensure codespace-injected secrets are available for git auth etc.
+	wrapped := envSecretsLoader + " && " + command
+
 	var cmd *exec.Cmd
 	if c.sshConfigPath != "" {
 		// Use multiplexed SSH (fast path: ~0.1s per command)
-		cmd = exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, c.sshHost, command)
+		cmd = exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, c.sshHost, wrapped)
 	} else {
 		// Fallback to gh codespace ssh (~3s per command)
 		cmd = exec.CommandContext(ctx, "gh", "codespace", "ssh",
 			"-c", c.codespaceName,
-			"--", command,
+			"--", wrapped,
 		)
 	}
 
@@ -349,6 +352,11 @@ func globToFindName(pattern string) string {
 	parts := strings.Split(pattern, "/")
 	return parts[len(parts)-1]
 }
+
+// envSecretsLoader sources codespace-injected secrets (GITHUB_TOKEN, etc.)
+// that are normally loaded by the login shell profile. Non-login SSH commands
+// skip /etc/profile.d/ scripts, so we load the secrets file directly.
+const envSecretsLoader = `if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do export "$key=$(echo "$value" | base64 -d)"; done < /workspaces/.codespaces/shared/.env-secrets; fi`
 
 const tmuxPrefix = "copilot-"
 
