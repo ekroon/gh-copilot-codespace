@@ -81,6 +81,7 @@ func runLauncher(args []string) error {
 	// Parse our flags (consume them, don't pass to copilot)
 	localShell := false
 	codespaceName := ""
+	workdirOverride := ""
 	var copilotArgs []string
 	for i := 0; i < len(args); i++ {
 		switch {
@@ -88,6 +89,9 @@ func runLauncher(args []string) error {
 			localShell = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
 			codespaceName = args[i+1]
+			i++
+		case (args[i] == "--workdir" || args[i] == "-w") && i+1 < len(args):
+			workdirOverride = args[i+1]
 			i++
 		default:
 			copilotArgs = append(copilotArgs, args[i])
@@ -120,9 +124,14 @@ func runLauncher(args []string) error {
 	}
 
 	// Detect workspace directory
-	workdir, err := detectWorkdir(selected.Name)
-	if err != nil {
-		return err
+	var workdir string
+	if workdirOverride != "" {
+		workdir = workdirOverride
+	} else {
+		workdir, err = detectWorkdir(selected.Name, selected.Repository)
+		if err != nil {
+			return err
+		}
 	}
 	fmt.Printf("Workspace: %s\n", workdir)
 
@@ -328,18 +337,40 @@ func startCodespace(name string) error {
 	return fmt.Errorf("timed out waiting for codespace SSH")
 }
 
-func detectWorkdir(codespaceName string) (string, error) {
+func detectWorkdir(codespaceName, repository string) (string, error) {
 	out, err := exec.Command("gh", "codespace", "ssh", "-c", codespaceName,
-		"--", "ls -d /workspaces/*/ 2>/dev/null | head -1",
+		"--", "ls -d /workspaces/*/ 2>/dev/null",
 	).Output()
 	if err != nil {
 		return "/workspaces", nil
 	}
-	workdir := strings.TrimRight(strings.TrimSpace(string(out)), "/")
-	if workdir == "" {
+
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
 		return "/workspaces", nil
 	}
-	return workdir, nil
+
+	// Parse directory list and strip trailing slashes
+	var dirs []string
+	for _, line := range strings.Split(raw, "\n") {
+		d := strings.TrimRight(strings.TrimSpace(line), "/")
+		if d != "" {
+			dirs = append(dirs, d)
+		}
+	}
+	if len(dirs) == 0 {
+		return "/workspaces", nil
+	}
+
+	// Try automatic selection based on repository name
+	repoName := repoBaseName(repository)
+	chosen := chooseWorkdir(dirs, repoName)
+	if chosen != "" {
+		return chosen, nil
+	}
+
+	// Multiple dirs, no repo match — interactive selection
+	return selectWorkdir(dirs)
 }
 
 func sshCommand(codespaceName, command string) (string, error) {
@@ -769,6 +800,70 @@ func rewriteHooksForSSH(content []byte, codespaceName, workdir, remoteBinary str
 		return nil
 	}
 	return out
+}
+
+// repoBaseName extracts the repository name from an "owner/repo" string.
+func repoBaseName(repository string) string {
+	if i := strings.LastIndex(repository, "/"); i >= 0 {
+		return repository[i+1:]
+	}
+	return repository
+}
+
+// chooseWorkdir picks the best workspace directory from a list given the repo name.
+// Returns the best match or "" if interactive selection is needed.
+func chooseWorkdir(dirs []string, repoName string) string {
+	if len(dirs) == 1 {
+		return dirs[0]
+	}
+	if repoName == "" {
+		return ""
+	}
+	for _, d := range dirs {
+		base := filepath.Base(d)
+		if base == repoName {
+			return d
+		}
+	}
+	return ""
+}
+
+// selectWorkdir lets the user pick a workspace directory interactively.
+func selectWorkdir(dirs []string) (string, error) {
+	if len(dirs) == 0 {
+		return "/workspaces", nil
+	}
+
+	// Try gum filter for fuzzy interactive picker
+	if gumPath, err := exec.LookPath("gum"); err == nil {
+		cmd := exec.Command(gumPath, "filter", "--placeholder", "Choose workspace directory...")
+		cmd.Stdin = strings.NewReader(strings.Join(dirs, "\n"))
+		cmd.Stderr = os.Stderr
+		selected, err := cmd.Output()
+		if err == nil {
+			choice := strings.TrimSpace(string(selected))
+			if choice != "" {
+				return choice, nil
+			}
+		}
+	}
+
+	// Fallback: numbered list
+	fmt.Println("Multiple workspace directories found:")
+	for i, d := range dirs {
+		fmt.Printf("  %2d) %s\n", i+1, d)
+	}
+	fmt.Printf("\nSelect [1-%d]: ", len(dirs))
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("reading input: %w", err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(input))
+	if err != nil || n < 1 || n > len(dirs) {
+		return "", fmt.Errorf("invalid selection")
+	}
+	return dirs[n-1], nil
 }
 
 func shellQuote(s string) string {

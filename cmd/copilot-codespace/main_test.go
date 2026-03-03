@@ -362,6 +362,72 @@ func TestRewriteHooksForSSH(t *testing.T) {
 	}
 }
 
+func TestRepoBaseName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"github/github", "github"},
+		{"owner/repo", "repo"},
+		{"repo-only", "repo-only"},
+		{"org/sub/repo", "repo"},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		if got := repoBaseName(tc.input); got != tc.want {
+			t.Errorf("repoBaseName(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestChooseWorkdir(t *testing.T) {
+	tests := []struct {
+		name     string
+		dirs     []string
+		repoName string
+		want     string
+	}{
+		{
+			name:     "single dir",
+			dirs:     []string{"/workspaces/github"},
+			repoName: "github",
+			want:     "/workspaces/github",
+		},
+		{
+			name:     "single dir no match needed",
+			dirs:     []string{"/workspaces/other"},
+			repoName: "github",
+			want:     "/workspaces/other",
+		},
+		{
+			name:     "multiple dirs with match",
+			dirs:     []string{"/workspaces/github-ui", "/workspaces/github"},
+			repoName: "github",
+			want:     "/workspaces/github",
+		},
+		{
+			name:     "multiple dirs no match",
+			dirs:     []string{"/workspaces/foo", "/workspaces/bar"},
+			repoName: "github",
+			want:     "",
+		},
+		{
+			name:     "empty repo name",
+			dirs:     []string{"/workspaces/foo", "/workspaces/bar"},
+			repoName: "",
+			want:     "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := chooseWorkdir(tc.dirs, tc.repoName)
+			if got != tc.want {
+				t.Errorf("chooseWorkdir(%v, %q) = %q, want %q", tc.dirs, tc.repoName, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRewriteHooksForSSH_NoHooks(t *testing.T) {
 	result := rewriteHooksForSSH([]byte(`{"version": 1}`), "cs", "/workspaces/repo", "")
 	if result != nil {
