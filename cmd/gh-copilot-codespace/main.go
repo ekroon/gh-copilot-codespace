@@ -29,7 +29,32 @@ type codespace struct {
 	State       string `json:"state"`
 }
 
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `Usage: gh copilot-codespace [flags] [-- copilot-args...]
+
+Run Copilot CLI against a remote GitHub Codespace via SSH.
+
+Flags:
+  -c, --codespace NAME   Use a specific codespace (skip interactive picker)
+  -w, --workdir PATH     Override workspace directory on the codespace
+      --local-shell      Keep shell commands running locally
+
+Subcommands:
+  mcp                    Run as MCP server (used internally by Copilot)
+  exec                   Execute a command on the codespace (used internally).
+`)
+}
+
 func main() {
+	// Handle --help / -h before anything else
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--help", "-h":
+			printUsage()
+			return
+		}
+	}
+
 	// If first arg is "mcp", run as MCP server (called by copilot via --additional-mcp-config)
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
 		runMCPServer()
