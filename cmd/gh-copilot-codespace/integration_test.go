@@ -983,3 +983,29 @@ func TestIntegration_ConnectCodespace(t *testing.T) {
 		t.Errorf("resolved name %q, want %q", resolved.Name, cs)
 	}
 }
+
+// TestIntegration_RemoteExplorerAgent verifies the generated remote-explorer
+// agent file is created and contains the correct tools configuration.
+func TestIntegration_RemoteExplorerAgent(t *testing.T) {
+	_ = testCodespace(t)
+
+	dir := t.TempDir()
+	generateRemoteExplorerAgent(dir)
+
+	agentPath := filepath.Join(dir, ".github", "agents", "remote-explorer.agent.md")
+	data, err := os.ReadFile(agentPath)
+	if err != nil {
+		t.Fatalf("agent file not created: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "codespace/*") {
+		t.Error("agent should have codespace/* tools")
+	}
+	if !strings.Contains(content, "model: claude-haiku-4.5") {
+		t.Error("agent should use haiku model")
+	}
+	if !strings.Contains(content, "remote_grep") {
+		t.Error("agent instructions should mention remote_grep")
+	}
+}

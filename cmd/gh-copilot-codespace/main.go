@@ -334,6 +334,9 @@ func runLauncher(args []string) error {
 	// Generate a postToolUse hook to keep the branch in sync
 	generateBranchSyncHook(instructionsDir, primary.Name, firstWorkdir, firstSSHClient)
 
+	// Generate remote-explorer custom agent for codespace file exploration
+	generateRemoteExplorerAgent(instructionsDir)
+
 	// Change to the instructions dir so copilot finds the instruction files
 	if err := os.Chdir(instructionsDir); err != nil {
 		return fmt.Errorf("changing to instructions dir: %w", err)
@@ -745,6 +748,7 @@ You are working on a remote GitHub Codespace. Source code lives on the codespace
 - **Source code** (viewing, editing, creating, searching files in the project): use remote_* tools (remote_view, remote_edit, remote_create, remote_bash, remote_grep, remote_glob)
 - **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create)
 - **Shell commands**: use remote_bash (runs on the codespace), NOT the local bash
+- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent (the built-in explore agent cannot access remote files)
 
 `, workdir)
 
@@ -926,7 +930,8 @@ func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Reg
 	sb.WriteString("- **All remote_* tools** accept an optional `codespace` parameter. Use the alias name to target a specific codespace.\n")
 	sb.WriteString("- Use `list_codespaces` to see connected codespaces.\n")
 	sb.WriteString("- **Local session files** (plan.md, session state): use built-in local tools (view, edit, create)\n")
-	sb.WriteString("- **Shell commands**: use `remote_bash` with the `codespace` parameter\n\n")
+	sb.WriteString("- **Shell commands**: use `remote_bash` with the `codespace` parameter\n")
+	sb.WriteString("- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent\n\n")
 
 	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
 	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
@@ -1236,6 +1241,52 @@ func generateBranchSyncHook(mirrorDir, codespaceName, workdir string, sshClient 
 	os.WriteFile(filepath.Join(hooksDir, "branch-sync.json"), data, 0o644)
 }
 
+// generateRemoteExplorerAgent creates a custom agent that can explore codespace
+// files using remote_* MCP tools. This replaces the built-in explore agent which
+// can't access remote tools (its local grep/glob/view are excluded).
+func generateRemoteExplorerAgent(mirrorDir string) {
+	agentsDir := filepath.Join(mirrorDir, ".github", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		return
+	}
+
+	agent := `---
+name: remote-explorer
+description: >-
+  Explore and search codespace files using remote tools. Use this agent instead of the built-in
+  explore agent when you need to search, read, or understand code on a remote codespace.
+  Delegates to this agent are appropriate for: finding files, searching code patterns,
+  understanding codebase structure, reading specific files, and answering questions about code.
+model: claude-haiku-4.5
+tools:
+  - codespace/*
+  - read
+  - search
+---
+
+You are a fast code exploration agent for remote GitHub Codespaces.
+
+## Available tools
+
+Use these remote tools to explore the codespace:
+- **remote_grep** — search for patterns in files (ripgrep)
+- **remote_glob** — find files by name patterns
+- **remote_view** — read file contents with line numbers
+- **remote_bash** — run commands (e.g., find, wc, head, git log)
+- **remote_cwd** — check current working directory
+
+## Guidelines
+
+- Be concise — return focused answers under 300 words
+- Search broadly first, then narrow down
+- Use remote_grep for content search, remote_glob for file discovery
+- Read only the relevant portions of files (use view_range)
+- When exploring structure, use remote_bash with find or ls
+`
+
+	os.WriteFile(filepath.Join(agentsDir, "remote-explorer.agent.md"), []byte(agent), 0o644)
+}
+
 // runResume loads a workspace session and reconnects to its codespaces.
 func runResume(sessionName string, copilotArgs []string) error {
 	ws, err := workspace.Load(sessionName)
@@ -1307,6 +1358,8 @@ func runResume(sessionName string, copilotArgs []string) error {
 	if err := ensureTrustedFolder(instructionsDir); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not auto-trust directory: %v\n", err)
 	}
+
+	generateRemoteExplorerAgent(instructionsDir)
 
 	if err := os.Chdir(instructionsDir); err != nil {
 		return fmt.Errorf("changing to workspace dir: %w", err)
