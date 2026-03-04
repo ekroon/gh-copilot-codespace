@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -33,6 +34,7 @@ func NewServer(reg *registry.Registry) *server.MCPServer {
 	s.AddTool(cdTool(), cdHandler(reg))
 	s.AddTool(cwdTool(), cwdHandler(reg))
 	s.AddTool(listCodespacesTool(), listCodespacesHandler(reg))
+	s.AddTool(listAvailableCodespacesTool(), listAvailableCodespacesHandler(&RealGHRunner{}))
 	s.AddTool(createCodespaceTool(), createCodespaceHandler(reg, &RealGHRunner{}))
 	s.AddTool(connectCodespaceTool(), connectCodespaceHandler(reg))
 	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandler(reg, &RealGHRunner{}))
@@ -869,7 +871,7 @@ end tell`, escaped)
 func listCodespacesTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "list_codespaces",
-		Description: "List all connected codespaces with their aliases, repositories, branches, and working directories.",
+		Description: "List codespaces that are currently connected in this session, with their aliases, repositories, branches, and working directories.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type:       "object",
 			Properties: map[string]any{},
@@ -881,7 +883,7 @@ func listCodespacesHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		all := reg.All()
 		if len(all) == 0 {
-			return toolSuccess("No codespaces connected."), nil
+			return toolSuccess("No codespaces connected. Use list_available_codespaces to see codespaces you can connect to."), nil
 		}
 
 		var sb strings.Builder
@@ -894,6 +896,53 @@ func listCodespacesHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			}
 			sb.WriteString(fmt.Sprintf("%-12s %-30s %-20s %s\n", cs.Alias, cs.Repository, branch, cs.Workdir))
 		}
+		return toolSuccess(sb.String()), nil
+	}
+}
+
+// --- list_available_codespaces ---
+
+func listAvailableCodespacesTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "list_available_codespaces",
+		Description: "List all GitHub Codespaces available to connect to (runs gh codespace list locally). Use this to discover codespaces before connecting with connect_codespace.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+	}
+}
+
+func listAvailableCodespacesHandler(ghRunner GHRunner) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		output, err := ghRunner.Run(ctx, "codespace", "list",
+			"--json", "name,displayName,repository,state",
+			"--limit", "50")
+		if err != nil {
+			return toolError(fmt.Sprintf("failed to list codespaces: %v", err)), nil
+		}
+
+		var codespaces []struct {
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName"`
+			Repository  string `json:"repository"`
+			State       string `json:"state"`
+		}
+		if err := json.Unmarshal([]byte(output), &codespaces); err != nil {
+			return toolError(fmt.Sprintf("parsing codespace list: %v", err)), nil
+		}
+
+		if len(codespaces) == 0 {
+			return toolSuccess("No codespaces found. Use create_codespace to create one."), nil
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("%-45s %-30s %-12s %s\n", "Name", "Repository", "State", "Display Name"))
+		sb.WriteString(strings.Repeat("-", 100) + "\n")
+		for _, cs := range codespaces {
+			sb.WriteString(fmt.Sprintf("%-45s %-30s %-12s %s\n", cs.Name, cs.Repository, cs.State, cs.DisplayName))
+		}
+		sb.WriteString("\nConnect with: connect_codespace(name=\"<codespace-name>\")")
 		return toolSuccess(sb.String()), nil
 	}
 }
