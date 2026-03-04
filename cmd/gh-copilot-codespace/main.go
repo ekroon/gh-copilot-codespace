@@ -92,7 +92,7 @@ func runMCPServer() {
 		fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing setup warning: %v\n", err)
 	}
 
-	mcpServer := mcp.NewServer(sshClient, codespaceName)
+	mcpServer := mcp.NewServerSingle(sshClient, codespaceName)
 
 	log.SetOutput(os.Stderr)
 	log.Printf("codespace-mcp: starting for codespace %q", codespaceName)

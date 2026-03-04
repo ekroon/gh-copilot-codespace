@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -305,6 +306,17 @@ func resultText(r *mcpsdk.CallToolResult) string {
 	return tc.Text
 }
 
+// testReg wraps a mockExecutor in a single-codespace registry for handler testing.
+func testReg(mock *mockExecutor) *registry.Registry {
+	reg := registry.New()
+	reg.Register(&registry.ManagedCodespace{
+		Alias:    "test",
+		Name:     "test-cs",
+		Executor: mock,
+	})
+	return reg
+}
+
 // --- Handler Tests ---
 
 func TestViewHandler(t *testing.T) {
@@ -338,7 +350,7 @@ func TestViewHandler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := viewHandler(tt.mock)
+			handler := viewHandler(testReg(tt.mock))
 			res, err := handler(context.Background(), makeReq(tt.args))
 			if err != nil {
 				t.Fatalf("unexpected Go error: %v", err)
@@ -387,7 +399,7 @@ func TestEditHandler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := editHandler(tt.mock)
+			handler := editHandler(testReg(tt.mock))
 			res, err := handler(context.Background(), makeReq(tt.args))
 			if err != nil {
 				t.Fatalf("unexpected Go error: %v", err)
@@ -429,7 +441,7 @@ func TestCreateHandler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := createHandler(tt.mock)
+			handler := createHandler(testReg(tt.mock))
 			res, err := handler(context.Background(), makeReq(tt.args))
 			if err != nil {
 				t.Fatalf("unexpected Go error: %v", err)
@@ -483,7 +495,7 @@ func TestBashHandler_Sync(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := bashHandler(tt.mock)
+			handler := bashHandler(testReg(tt.mock))
 			res, err := handler(context.Background(), makeReq(tt.args))
 			if err != nil {
 				t.Fatalf("unexpected Go error: %v", err)
@@ -531,7 +543,7 @@ func TestGrepHandler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := grepHandler(tt.mock)
+			handler := grepHandler(testReg(tt.mock))
 			res, err := handler(context.Background(), makeReq(tt.args))
 			if err != nil {
 				t.Fatalf("unexpected Go error: %v", err)
@@ -579,7 +591,7 @@ func TestGlobHandler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := globHandler(tt.mock)
+			handler := globHandler(testReg(tt.mock))
 			res, err := handler(context.Background(), makeReq(tt.args))
 			if err != nil {
 				t.Fatalf("unexpected Go error: %v", err)
@@ -621,7 +633,7 @@ func TestStopBashHandler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := stopBashHandler(tt.mock)
+			handler := stopBashHandler(testReg(tt.mock))
 			res, err := handler(context.Background(), makeReq(tt.args))
 			if err != nil {
 				t.Fatalf("unexpected Go error: %v", err)
@@ -665,7 +677,7 @@ func TestListBashHandler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := listBashHandler(tt.mock)
+			handler := listBashHandler(testReg(tt.mock))
 			res, err := handler(context.Background(), makeReq(map[string]any{}))
 			if err != nil {
 				t.Fatalf("unexpected Go error: %v", err)
@@ -723,7 +735,7 @@ wantText: "failed to change directory",
 }
 for _, tt := range tests {
 t.Run(tt.name, func(t *testing.T) {
-handler := cdHandler(tt.mock)
+handler := cdHandler(testReg(tt.mock))
 res, err := handler(context.Background(), makeReq(tt.args))
 if err != nil {
 t.Fatalf("unexpected Go error: %v", err)
@@ -746,7 +758,7 @@ t.Errorf("expected workdir %q, got %q", tt.wantDir, tt.mock.workdir)
 
 func TestCwdHandler(t *testing.T) {
 mock := &mockExecutor{workdir: "/workspaces/myproject"}
-handler := cwdHandler(mock)
+handler := cwdHandler(testReg(mock))
 res, err := handler(context.Background(), makeReq(map[string]any{}))
 if err != nil {
 t.Fatalf("unexpected Go error: %v", err)
@@ -761,7 +773,7 @@ t.Errorf("expected workdir in result, got %q", resultText(res))
 
 func TestCwdHandlerDefault(t *testing.T) {
 mock := &mockExecutor{}
-handler := cwdHandler(mock)
+handler := cwdHandler(testReg(mock))
 res, err := handler(context.Background(), makeReq(map[string]any{}))
 if err != nil {
 t.Fatalf("unexpected Go error: %v", err)
@@ -769,4 +781,69 @@ t.Fatalf("unexpected Go error: %v", err)
 if !strings.Contains(resultText(res), "/workspaces") {
 t.Errorf("expected default workdir, got %q", resultText(res))
 }
+}
+
+func TestListCodespacesHandler(t *testing.T) {
+	reg := registry.New()
+	reg.Register(&registry.ManagedCodespace{
+		Alias:      "github",
+		Name:       "cs-abc",
+		Repository: "github/github",
+		Branch:     "main",
+		Workdir:    "/workspaces/github",
+		Executor:   &mockExecutor{},
+	})
+
+	handler := listCodespacesHandler(reg)
+	res, err := handler(context.Background(), makeReq(map[string]any{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := resultText(res)
+	if !strings.Contains(text, "github") {
+		t.Errorf("expected 'github' alias in output, got %q", text)
+	}
+	if !strings.Contains(text, "github/github") {
+		t.Errorf("expected repository in output, got %q", text)
+	}
+}
+
+func TestListCodespacesHandler_Empty(t *testing.T) {
+	reg := registry.New()
+	handler := listCodespacesHandler(reg)
+	res, _ := handler(context.Background(), makeReq(map[string]any{}))
+	if !strings.Contains(resultText(res), "No codespaces") {
+		t.Errorf("expected 'No codespaces' message, got %q", resultText(res))
+	}
+}
+
+func TestResolveExecutor_MultiCS_NoAlias(t *testing.T) {
+	reg := registry.New()
+	reg.Register(&registry.ManagedCodespace{Alias: "a", Name: "cs-a", Executor: &mockExecutor{}})
+	reg.Register(&registry.ManagedCodespace{Alias: "b", Name: "cs-b", Executor: &mockExecutor{}})
+
+	handler := viewHandler(reg)
+	res, _ := handler(context.Background(), makeReq(map[string]any{"path": "/tmp/f.txt"}))
+	if !res.IsError {
+		t.Fatal("expected error when multiple codespaces and no alias")
+	}
+	if !strings.Contains(resultText(res), "multiple codespaces") {
+		t.Errorf("expected disambiguation error, got %q", resultText(res))
+	}
+}
+
+func TestResolveExecutor_MultiCS_WithAlias(t *testing.T) {
+	mock := &mockExecutor{viewFileResult: "hello from b"}
+	reg := registry.New()
+	reg.Register(&registry.ManagedCodespace{Alias: "a", Name: "cs-a", Executor: &mockExecutor{}})
+	reg.Register(&registry.ManagedCodespace{Alias: "b", Name: "cs-b", Executor: mock})
+
+	handler := viewHandler(reg)
+	res, _ := handler(context.Background(), makeReq(map[string]any{"path": "/tmp/f.txt", "codespace": "b"}))
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	if !strings.Contains(resultText(res), "hello from b") {
+		t.Errorf("expected result from codespace b, got %q", resultText(res))
+	}
 }
