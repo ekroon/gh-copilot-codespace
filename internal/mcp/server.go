@@ -239,7 +239,7 @@ func createHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func bashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_bash",
-		Description: "Execute a bash command on the remote codespace. Use mode 'async' for commands that may take more than 30 seconds (builds, tests, benchmarks) to avoid MCP timeout. Async mode returns a shellId for use with remote_write_bash/remote_read_bash. Replaces the local 'bash' tool.",
+		Description: "Execute a bash command on the remote codespace. In sync mode (default), waits for completion. Use 'initial_wait' for commands that may take time — it will wait up to that many seconds, then return partial output and a shellId for continued reading with remote_read_bash. Use mode 'async' for interactive or very long-running commands. Replaces the local 'bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -256,6 +256,10 @@ func bashTool() mcpsdk.Tool {
 					"type":        "string",
 					"description": "Execution mode: 'sync' (default) waits for completion, 'async' runs in background and returns a shellId",
 					"enum":        []string{"sync", "async"},
+				},
+				"initial_wait": map[string]any{
+					"type":        "number",
+					"description": "Seconds to wait for initial output in sync mode (default: 30). If the command hasn't completed, returns partial output and a shellId for follow-up reads with remote_read_bash. Give long-running commands adequate time (e.g., 120+ for builds/tests).",
 				},
 				"shellId": map[string]any{
 					"type":        "string",
@@ -279,6 +283,8 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		mode := optionalString(req, "mode")
+		initialWait := optionalFloat(req, "initial_wait", 0)
+
 		if mode == "async" {
 			shellId := optionalString(req, "shellId")
 			if shellId == "" {
@@ -293,11 +299,23 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			return toolSuccess(fmt.Sprintf("Started async session: %s\n\n%s", shellId, output)), nil
 		}
 
+		// Sync mode with initial_wait: start as async, wait, return partial output
+		if initialWait > 0 {
+			shellId := fmt.Sprintf("sh-%d", time.Now().UnixMilli())
+			if err := c.StartSession(ctx, shellId, command); err != nil {
+				return toolError(err.Error()), nil
+			}
+			time.Sleep(time.Duration(initialWait * float64(time.Second)))
+			output, _ := c.ReadSession(ctx, shellId)
+			return toolSuccess(fmt.Sprintf("%s\n\n[shellId: %s — use remote_read_bash to check for more output]", output, shellId)), nil
+		}
+
+		// Pure sync: run and wait for completion
 		stdout, stderr, exitCode, err := c.RunBash(ctx, command)
 		if err != nil {
 			errMsg := err.Error()
 			if ctx.Err() != nil {
-				errMsg += "\n\nHint: This command may have timed out. Use mode='async' for long-running commands (builds, tests, benchmarks)."
+				errMsg += "\n\nHint: This command may have timed out. Use initial_wait parameter (e.g., initial_wait=60) or mode='async' for long-running commands."
 			}
 			return toolError(errMsg), nil
 		}
@@ -383,18 +401,18 @@ func writeBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func readBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_read_bash",
-		Description: "Read output from an async bash session on the remote codespace. Replaces the local 'read_bash' tool.",
+		Description: "Read output from an async bash session on the remote codespace. Returns the last 100 lines of the session's terminal output. If a command hasn't completed, call again with a longer delay. Use exponential backoff between reads to minimize overhead. Replaces the local 'read_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"codespace": codespaceParam,
 				"shellId": map[string]any{
 					"type":        "string",
-					"description": "The session ID returned by remote_bash in async mode",
+					"description": "The session ID returned by remote_bash in async mode or with initial_wait",
 				},
 				"delay": map[string]any{
 					"type":        "number",
-					"description": "Seconds to wait before reading output (default: 2)",
+					"description": "Seconds to wait before reading output (default: 2). Use longer delays for slow commands to avoid unnecessary reads.",
 				},
 			},
 			Required: []string{"shellId"},

@@ -69,6 +69,12 @@ Execute a bash command on the codespace. Supports two modes:
 remote_bash(command="go test -race ./...", description="Run tests")
 ```
 
+**Sync with initial_wait** — waits up to N seconds, returns partial output + shellId:
+```
+remote_bash(command="go test -race ./...", initial_wait=120, description="Run tests")
+→ partial output + "[shellId: sh-123 — use remote_read_bash to check for more output]"
+```
+
 **Async mode** — starts command in a tmux session, returns a `shellId`:
 ```
 remote_bash(command="npm run dev", mode="async", description="Start dev server")
@@ -79,6 +85,7 @@ remote_bash(command="npm run dev", mode="async", description="Start dev server")
 - `command` (required) — The bash command
 - `description` (optional) — Short description of what the command does
 - `mode` (optional) — `"sync"` (default) or `"async"`
+- `initial_wait` (optional) — Seconds to wait in sync mode before returning partial output (e.g., 120 for builds). Command continues in background with a shellId for follow-up reads.
 - `shellId` (optional) — Custom session ID for async mode
 
 ### `remote_write_bash`
