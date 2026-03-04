@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
+	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
 
@@ -908,5 +910,76 @@ echo "fixtures-ok"
 	}
 	if !strings.Contains(string(out), "fixtures-ok") {
 		t.Fatalf("fixture setup did not complete successfully.\nOutput: %s", string(out))
+	}
+}
+
+// --- Lifecycle integration tests ---
+
+// TestIntegration_ListAvailableCodespaces verifies that list_available_codespaces
+// runs gh cs list locally and returns results.
+func TestIntegration_ListAvailableCodespaces(t *testing.T) {
+	_ = testCodespace(t) // skip if no codespace configured
+
+	ctx := context.Background()
+	runner := &mcp.RealGHRunner{}
+	out, err := runner.Run(ctx, "codespace", "list",
+		"--json", "name,displayName,repository,state",
+		"--limit", "50")
+	if err != nil {
+		t.Fatalf("gh codespace list failed: %v", err)
+	}
+
+	var codespaces []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(out), &codespaces); err != nil {
+		t.Fatalf("parsing output: %v", err)
+	}
+	if len(codespaces) == 0 {
+		t.Fatal("expected at least one codespace")
+	}
+	t.Logf("Found %d codespace(s)", len(codespaces))
+}
+
+// TestIntegration_ConnectCodespace verifies that connecting to an existing
+// codespace sets up SSH multiplexing and registers in the registry.
+func TestIntegration_ConnectCodespace(t *testing.T) {
+	cs := testCodespace(t)
+
+	ctx := context.Background()
+	sshClient := ssh.NewClient(cs)
+	if err := sshClient.SetupMultiplexing(ctx); err != nil {
+		t.Logf("SSH multiplexing warning: %v", err)
+	}
+
+	// Verify we can run a command
+	stdout, _, exitCode, err := sshClient.Exec(ctx, "echo connected-ok")
+	if err != nil {
+		t.Fatalf("exec failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("exit code %d", exitCode)
+	}
+	if !strings.Contains(stdout, "connected-ok") {
+		t.Errorf("expected 'connected-ok', got %q", stdout)
+	}
+
+	// Register in registry
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "test",
+		Name:     cs,
+		Executor: sshClient,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Verify resolution
+	resolved, err := reg.Resolve("test")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if resolved.Name != cs {
+		t.Errorf("resolved name %q, want %q", resolved.Name, cs)
 	}
 }

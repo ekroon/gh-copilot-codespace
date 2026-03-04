@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -39,6 +40,10 @@ func createCodespaceTool() mcpsdk.Tool {
 					"type":        "string",
 					"description": "Display name for the codespace (optional, defaults to branch name)",
 				},
+				"devcontainer_path": map[string]any{
+					"type":        "string",
+					"description": "Path to devcontainer.json (e.g., '.devcontainer/devcontainer.json'). Required for repos with multiple devcontainer configs.",
+				},
 				"alias": map[string]any{
 					"type":        "string",
 					"description": "Local alias for the codespace (optional, derived from repo name)",
@@ -59,6 +64,7 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 		branch := optionalString(req, "branch")
 		machineType := optionalString(req, "machine_type")
 		displayName := optionalString(req, "display_name")
+		devcontainerPath := optionalString(req, "devcontainer_path")
 		alias := optionalString(req, "alias")
 
 		if alias == "" {
@@ -71,9 +77,12 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 		}
 
 		// Build gh cs create command
-		args := []string{"codespace", "create", "-R", repo}
+		args := []string{"codespace", "create", "-R", repo, "--default-permissions"}
 		if machineType != "" {
 			args = append(args, "-m", machineType)
+		}
+		if devcontainerPath != "" {
+			args = append(args, "--devcontainer-path", devcontainerPath)
 		}
 		if displayName != "" {
 			args = append(args, "--display-name", displayName)
@@ -325,8 +334,15 @@ type RealGHRunner struct{}
 
 func (r *RealGHRunner) Run(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "gh", args...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		// Include stderr in error message for diagnostics
+		return "", fmt.Errorf("%w\n%s", err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
 }
 
 func shellQuote(s string) string {
