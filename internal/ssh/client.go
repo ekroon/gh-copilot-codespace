@@ -16,12 +16,13 @@ import (
 
 // Client manages SSH connections to a GitHub Codespace via gh CLI.
 type Client struct {
-	codespaceName string
-	mu            sync.Mutex
-	sshConfigPath string // path to generated SSH config with ControlMaster
-	sshHost       string // SSH host alias (e.g., "cs.develop-xxx")
-	controlSocket string // path to control socket
-	workdir       string // current working directory on the codespace
+	codespaceName  string
+	mu             sync.Mutex
+	sshConfigPath  string // path to generated SSH config with ControlMaster
+	sshHost        string // SSH host alias (e.g., "cs.develop-xxx")
+	controlSocket  string // path to control socket
+	workdir        string // current working directory on the codespace
+	commandContext func(ctx context.Context, name string, args ...string) *exec.Cmd
 }
 
 // Executor defines the operations that MCP handlers use to interact with a codespace.
@@ -43,7 +44,17 @@ type Executor interface {
 
 // NewClient creates a new SSH client for the given codespace.
 func NewClient(codespaceName string) *Client {
-	return &Client{codespaceName: codespaceName}
+	return &Client{
+		codespaceName:  codespaceName,
+		commandContext: exec.CommandContext,
+	}
+}
+
+func (c *Client) command(ctx context.Context, name string, args ...string) *exec.Cmd {
+	if c.commandContext != nil {
+		return c.commandContext(ctx, name, args...)
+	}
+	return exec.CommandContext(ctx, name, args...)
 }
 
 // SetWorkdir sets the working directory used by RunBash and Glob.
@@ -67,6 +78,26 @@ func (c *Client) GetWorkdir() string {
 	return "/workspaces"
 }
 
+func (c *Client) sshState() (sshConfigPath, sshHost, controlSocket string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sshConfigPath, c.sshHost, c.controlSocket
+}
+
+func (c *Client) setSSHState(sshConfigPath, sshHost, controlSocket string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sshConfigPath = sshConfigPath
+	c.sshHost = sshHost
+	c.controlSocket = controlSocket
+}
+
+func (c *Client) setSSHConfigPath(sshConfigPath string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sshConfigPath = sshConfigPath
+}
+
 // SetupMultiplexing generates an SSH config with ControlMaster and establishes
 // a persistent connection. Subsequent Exec calls use this connection (~0.1s vs ~3s).
 func (c *Client) SetupMultiplexing(ctx context.Context) error {
@@ -80,26 +111,28 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 		return fmt.Errorf("creating config dir: %w", err)
 	}
 
-	c.controlSocket = filepath.Join(configDir, ".ssh-"+c.codespaceName)
-	c.sshConfigPath = filepath.Join(configDir, ".ssh-config-"+c.codespaceName)
+	controlSocket := filepath.Join(configDir, ".ssh-"+c.codespaceName)
+	sshConfigPath := filepath.Join(configDir, ".ssh-config-"+c.codespaceName)
 
 	// Reuse existing multiplexed connection if alive (e.g., set up by the launcher).
 	// Avoids calling gh codespace ssh --config which creates a new tunnel and may
 	// invalidate the existing ControlMaster's connection and its socket forwardings.
-	if data, err := os.ReadFile(c.sshConfigPath); err == nil {
+	var sshHost string
+	if data, err := os.ReadFile(sshConfigPath); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "Host ") {
-				c.sshHost = strings.TrimPrefix(strings.TrimSpace(line), "Host ")
+				sshHost = strings.TrimPrefix(strings.TrimSpace(line), "Host ")
 				break
 			}
 		}
-		if c.sshHost != "" {
-			check := exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, "-O", "check", c.sshHost)
+		if sshHost != "" {
+			check := c.command(ctx, "ssh", "-F", sshConfigPath, "-O", "check", sshHost)
 			if check.Run() == nil {
 				// Smoke-test the tunnel: ssh -O check only verifies the master
 				// process is alive, not that the underlying relay still works.
-				probe := exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, "-o", "ConnectTimeout=5", c.sshHost, "echo ok")
+				probe := c.command(ctx, "ssh", "-F", sshConfigPath, "-o", "ConnectTimeout=5", sshHost, "echo ok")
 				if out, err := probe.Output(); err == nil && strings.TrimSpace(string(out)) == "ok" {
+					c.setSSHState(sshConfigPath, sshHost, controlSocket)
 					fmt.Fprintf(os.Stderr, "codespace-mcp: reusing existing SSH multiplexing\n")
 					return nil
 				}
@@ -109,7 +142,7 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 	}
 
 	// Get SSH config from gh (contains ProxyCommand, identity file, etc.)
-	ghConfig, err := exec.CommandContext(ctx, "gh", "codespace", "ssh",
+	ghConfig, err := c.command(ctx, "gh", "codespace", "ssh",
 		"--config", "-c", c.codespaceName).Output()
 	if err != nil {
 		return fmt.Errorf("getting SSH config: %w", err)
@@ -121,34 +154,34 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 	for _, line := range strings.Split(config, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "Host ") {
-			c.sshHost = strings.TrimPrefix(line, "Host ")
+			sshHost = strings.TrimPrefix(line, "Host ")
 			break
 		}
 	}
-	if c.sshHost == "" {
+	if sshHost == "" {
 		return fmt.Errorf("could not parse Host from SSH config")
 	}
 
 	// Add ControlPath + ControlPersist if not present
 	if !strings.Contains(config, "ControlPath") {
-		config += fmt.Sprintf("\tControlPath %s\n", c.controlSocket)
+		config += fmt.Sprintf("\tControlPath %s\n", controlSocket)
 	}
 	if !strings.Contains(config, "ControlPersist") {
 		config += "\tControlPersist 600\n"
 	}
 
-	if err := os.WriteFile(c.sshConfigPath, []byte(config), 0o600); err != nil {
+	if err := os.WriteFile(sshConfigPath, []byte(config), 0o600); err != nil {
 		return fmt.Errorf("writing SSH config: %w", err)
 	}
 
 	// Establish master connection in background (retry once on failure)
 	for attempt := 0; attempt < 2; attempt++ {
-		cmd := exec.CommandContext(ctx, "ssh",
-			"-F", c.sshConfigPath,
+		cmd := c.command(ctx, "ssh",
+			"-F", sshConfigPath,
 			"-o", "ControlMaster=yes",
 			"-o", "ControlPersist=600",
 			"-fN", // background, no command
-			c.sshHost,
+			sshHost,
 		)
 		var sshErr bytes.Buffer
 		cmd.Stderr = &sshErr
@@ -161,46 +194,56 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 			}
 			// Final attempt failed — fall back to non-multiplexed mode
 			fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing failed, using fallback: %v (%s)\n", err, errDetail)
-			c.sshConfigPath = ""
+			c.setSSHState("", sshHost, controlSocket)
 			return nil
 		}
 		break
 	}
 
+	c.setSSHState(sshConfigPath, sshHost, controlSocket)
 	fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing established\n")
 	return nil
 }
 
 // ControlSocketPath returns the path to the SSH control socket, if multiplexing is active.
 func (c *Client) ControlSocketPath() string {
-	if c.sshConfigPath == "" {
+	sshConfigPath, _, controlSocket := c.sshState()
+	if sshConfigPath == "" {
 		return ""
 	}
-	return c.controlSocket
+	return controlSocket
 }
 
 // SSHHost returns the SSH host alias for this codespace.
 func (c *Client) SSHHost() string {
-	return c.sshHost
+	_, sshHost, _ := c.sshState()
+	return sshHost
 }
 
 // SSHConfigPath returns the path to the generated SSH config file.
 func (c *Client) SSHConfigPath() string {
-	return c.sshConfigPath
+	sshConfigPath, _, _ := c.sshState()
+	return sshConfigPath
 }
 
-// Exec runs a command on the codespace and returns stdout, stderr, and exit code.
-func (c *Client) Exec(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
-	// Ensure codespace-injected secrets are available for git auth etc.
-	wrapped := envSecretsLoader + " && " + command
+var sshTransportErrorMarkers = []string{
+	"broken pipe",
+	"connection closed",
+	"connection reset",
+	"control socket",
+	"kex_exchange_identification",
+	"mux_client_",
+	"ssh_exchange_identification",
+	"stdio forwarding failed",
+}
 
+func (c *Client) runRemoteCommand(ctx context.Context, wrapped string, useMultiplex bool) (stdout string, stderr string, exitCode int, err error) {
 	var cmd *exec.Cmd
-	if c.sshConfigPath != "" {
-		// Use multiplexed SSH (fast path: ~0.1s per command)
-		cmd = exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, c.sshHost, wrapped)
+	if useMultiplex {
+		sshConfigPath, sshHost, _ := c.sshState()
+		cmd = c.command(ctx, "ssh", "-F", sshConfigPath, sshHost, wrapped)
 	} else {
-		// Fallback to gh codespace ssh (~3s per command)
-		cmd = exec.CommandContext(ctx, "gh", "codespace", "ssh",
+		cmd = c.command(ctx, "gh", "codespace", "ssh",
 			"-c", c.codespaceName,
 			"--", wrapped,
 		)
@@ -228,6 +271,75 @@ func (c *Client) Exec(ctx context.Context, command string) (stdout string, stder
 	return stdout, stderr, exitCode, nil
 }
 
+func (c *Client) disableMultiplexing() {
+	_, _, controlSocket := c.sshState()
+	if controlSocket != "" {
+		if err := os.Remove(controlSocket); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "codespace-mcp: failed to remove SSH control socket %s: %v\n", controlSocket, err)
+		}
+	}
+	c.setSSHConfigPath("")
+}
+
+func isRetryableTransportFailure(useMultiplex bool, exitCode int, stderr string) bool {
+	if !useMultiplex || exitCode != 255 {
+		return false
+	}
+	trimmed := strings.TrimSpace(stderr)
+	lower := strings.ToLower(trimmed)
+	for _, marker := range sshTransportErrorMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func logDiagnostic(label, text string) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "codespace-mcp: %s: %s\n", label, trimmed)
+}
+
+func (c *Client) probeMultiplexing(ctx context.Context) bool {
+	sshConfigPath, sshHost, _ := c.sshState()
+	if sshConfigPath == "" || sshHost == "" {
+		return false
+	}
+
+	probe := c.command(ctx, "ssh", "-F", sshConfigPath, "-o", "ConnectTimeout=5", sshHost, "echo ok")
+	out, err := probe.Output()
+	return err == nil && strings.TrimSpace(string(out)) == "ok"
+}
+
+// Exec runs a command on the codespace and returns stdout, stderr, and exit code.
+func (c *Client) Exec(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
+	// Ensure codespace-injected secrets are available for git auth etc.
+	wrapped := envSecretsLoader + " && " + command
+	sshConfigPath, _, _ := c.sshState()
+	return c.runRemoteCommand(ctx, wrapped, sshConfigPath != "")
+}
+
+func (c *Client) execReadOnly(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
+	wrapped := envSecretsLoader + " && " + command
+	sshConfigPath, _, _ := c.sshState()
+	useMultiplex := sshConfigPath != ""
+	stdout, stderr, exitCode, err = c.runRemoteCommand(ctx, wrapped, useMultiplex)
+	if err != nil {
+		return stdout, stderr, exitCode, err
+	}
+	trimmedStderr := strings.TrimSpace(stderr)
+	if !isRetryableTransportFailure(useMultiplex, exitCode, stderr) && !(useMultiplex && exitCode == 255 && trimmedStderr == "" && !c.probeMultiplexing(ctx)) {
+		return stdout, stderr, exitCode, nil
+	}
+
+	fmt.Fprintln(os.Stderr, "codespace-mcp: SSH transport failed for read-only command, retrying without multiplexing")
+	c.disableMultiplexing()
+	return c.runRemoteCommand(ctx, wrapped, false)
+}
+
 // ViewFile reads a file with line numbers. If viewRange is provided [start, end], only those lines are shown.
 func (c *Client) ViewFile(ctx context.Context, path string, viewRange []int) (string, error) {
 	var cmd string
@@ -243,12 +355,12 @@ func (c *Client) ViewFile(ctx context.Context, path string, viewRange []int) (st
 		cmd = fmt.Sprintf("awk '{print NR\". \"$0}' %s", shellQuote(path))
 	}
 
-	stdout, stderr, exitCode, err := c.Exec(ctx, cmd)
+	stdout, stderr, exitCode, err := c.execReadOnly(ctx, cmd)
 	if err != nil {
 		return "", fmt.Errorf("view file: %w", err)
 	}
 	if exitCode != 0 {
-		return "", fmt.Errorf("view file failed (exit %d): %s", exitCode, stderr)
+		return "", formatCommandFailure("view file", exitCode, stderr)
 	}
 	return stdout, nil
 }
@@ -343,7 +455,7 @@ func (c *Client) Grep(ctx context.Context, pattern, path, globPattern string) (s
 	cmd = fmt.Sprintf("(%s) 2>/dev/null || grep -rn %s %s",
 		cmd, shellQuote(pattern), shellQuote(searchPath))
 
-	stdout, _, exitCode, err := c.Exec(ctx, cmd)
+	stdout, _, exitCode, err := c.execReadOnly(ctx, cmd)
 	if err != nil {
 		return "", fmt.Errorf("grep: %w", err)
 	}
@@ -368,7 +480,7 @@ func (c *Client) Glob(ctx context.Context, pattern, path string) (string, error)
 		"(cd %s && fd --type f --glob %s --exclude .git 2>/dev/null || find . -name %s -not -path '*/.git/*' 2>/dev/null) | head -200",
 		shellQuote(searchPath), shellQuote(pattern), shellQuote(globToFindName(pattern)))
 
-	stdout, _, exitCode, err := c.Exec(ctx, cmd)
+	stdout, _, exitCode, err := c.execReadOnly(ctx, cmd)
 	if err != nil {
 		return "", fmt.Errorf("glob: %w", err)
 	}
@@ -428,7 +540,7 @@ func (c *Client) StartSession(ctx context.Context, sessionID, command string) er
 		return fmt.Errorf("start session: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("start session failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+		return formatCommandFailure("start session", exitCode, stderr)
 	}
 	return nil
 }
@@ -448,12 +560,19 @@ func (c *Client) ensureTmux(ctx context.Context) error {
 		return fmt.Errorf("installing tmux: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("failed to install tmux via mise (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+		logDiagnostic("tmux install via mise failed", stderr)
+		return fmt.Errorf("failed to install tmux via mise (exit %d); verify that the codespace can run `mise use -g tmux`", exitCode)
 	}
 
-	// Verify tmux is now available
-	if _, _, ec, _ := c.execTmux(ctx, "command -v tmux"); ec != 0 {
-		return fmt.Errorf("tmux still not available after mise install")
+	// Verify tmux is now available and distinguish PATH problems from missing shims.
+	verifyCmd := `command -v tmux >/dev/null 2>&1 || { if [ -x "$HOME/.local/share/mise/shims/tmux" ]; then echo 'tmux shim exists but is not on PATH' >&2; else echo 'tmux shim not found after install' >&2; fi; exit 1; }`
+	_, verifyStderr, ec, err := c.execTmux(ctx, verifyCmd)
+	if err != nil {
+		return fmt.Errorf("verifying tmux installation: %w", err)
+	}
+	if ec != 0 {
+		logDiagnostic("tmux verification after mise install failed", verifyStderr)
+		return fmt.Errorf("tmux installation completed but tmux is still unavailable; %s", summarizeTmuxVerificationFailure(verifyStderr))
 	}
 	return nil
 }
@@ -521,7 +640,7 @@ func (c *Client) WriteSession(ctx context.Context, sessionID, input string) erro
 			return fmt.Errorf("write session: %w", err)
 		}
 		if exitCode != 0 {
-			return fmt.Errorf("write session failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+			return formatCommandFailure("write session", exitCode, stderr)
 		}
 	}
 	return nil
@@ -556,7 +675,7 @@ func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, err
 		return "", fmt.Errorf("read session: %w", err)
 	}
 	if exitCode != 0 {
-		return "", fmt.Errorf("read session failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+		return "", formatCommandFailure("read session", exitCode, stderr)
 	}
 
 	stdout = cleanPaneOutput(stdout)
@@ -581,7 +700,7 @@ func (c *Client) StopSession(ctx context.Context, sessionID string) error {
 		return fmt.Errorf("stop session: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("stop session failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+		return formatCommandFailure("stop session", exitCode, stderr)
 	}
 	return nil
 }
@@ -605,11 +724,32 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
+func formatCommandFailure(action string, exitCode int, stderr string) error {
+	trimmed := strings.TrimSpace(stderr)
+	if trimmed == "" {
+		return fmt.Errorf("%s failed (exit %d)", action, exitCode)
+	}
+	return fmt.Errorf("%s failed (exit %d): %s", action, exitCode, trimmed)
+}
+
+func summarizeTmuxVerificationFailure(stderr string) string {
+	lower := strings.ToLower(stderr)
+	switch {
+	case strings.Contains(lower, "shim exists but is not on path"):
+		return "the tmux shim exists, but `$HOME/.local/share/mise/shims` is not on PATH"
+	case strings.Contains(lower, "shim not found after install"):
+		return "mise did not create a tmux shim in `$HOME/.local/share/mise/shims`"
+	default:
+		return "verify that `mise use -g tmux` succeeds and that tmux is on PATH in the codespace"
+	}
+}
+
 // ForwardSocket sets up Unix socket forwarding from a local path to a remote path
 // using the existing SSH ControlMaster connection. The forwarding persists as long
 // as the master connection is alive. Returns an error if multiplexing is not active.
 func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string) error {
-	if c.sshConfigPath == "" {
+	sshConfigPath, sshHost, _ := c.sshState()
+	if sshConfigPath == "" {
 		return fmt.Errorf("SSH multiplexing not active, cannot forward socket")
 	}
 
@@ -627,12 +767,12 @@ func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string
 
 	// StreamLocalBindUnlink=yes tells SSH to remove the socket atomically before
 	// binding, avoiding a TOCTOU race between our Remove and the bind.
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-F", c.sshConfigPath,
+	cmd := c.command(ctx, "ssh",
+		"-F", sshConfigPath,
 		"-o", "StreamLocalBindUnlink=yes",
 		"-O", "forward",
 		"-L", fwdSpec,
-		c.sshHost,
+		sshHost,
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -643,15 +783,16 @@ func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string
 
 // CancelForward cancels an active socket forwarding.
 func (c *Client) CancelForward(ctx context.Context, localPath, remotePath string) {
-	if c.sshConfigPath == "" {
+	sshConfigPath, sshHost, _ := c.sshState()
+	if sshConfigPath == "" {
 		return
 	}
 	fwdSpec := localPath + ":" + remotePath
-	cancel := exec.CommandContext(ctx, "ssh",
-		"-F", c.sshConfigPath,
+	cancel := c.command(ctx, "ssh",
+		"-F", sshConfigPath,
 		"-O", "cancel",
 		"-L", fwdSpec,
-		c.sshHost,
+		sshHost,
 	)
 	cancel.Run() // ignore error — forwarding may not exist
 }

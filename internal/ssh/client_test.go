@@ -1,6 +1,12 @@
 package ssh
 
 import (
+	"context"
+	"os"
+	"os/exec"
+	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -141,23 +147,224 @@ func TestCleanPaneOutput(t *testing.T) {
 }
 
 func TestSetGetWorkdir(t *testing.T) {
-c := NewClient("test-codespace")
+	c := NewClient("test-codespace")
 
-// Default should fall back to env or /workspaces
-got := c.GetWorkdir()
-if got == "" {
-t.Fatal("GetWorkdir() returned empty string")
+	// Default should fall back to env or /workspaces
+	got := c.GetWorkdir()
+	if got == "" {
+		t.Fatal("GetWorkdir() returned empty string")
+	}
+
+	// Set a custom workdir
+	c.SetWorkdir("/workspaces/myproject/src")
+	if got := c.GetWorkdir(); got != "/workspaces/myproject/src" {
+		t.Errorf("GetWorkdir() = %q, want %q", got, "/workspaces/myproject/src")
+	}
+
+	// Override again
+	c.SetWorkdir("/workspaces/other")
+	if got := c.GetWorkdir(); got != "/workspaces/other" {
+		t.Errorf("GetWorkdir() = %q, want %q", got, "/workspaces/other")
+	}
 }
 
-// Set a custom workdir
-c.SetWorkdir("/workspaces/myproject/src")
-if got := c.GetWorkdir(); got != "/workspaces/myproject/src" {
-t.Errorf("GetWorkdir() = %q, want %q", got, "/workspaces/myproject/src")
+type fakeExecCall struct {
+	name string
+	args []string
 }
 
-// Override again
-c.SetWorkdir("/workspaces/other")
-if got := c.GetWorkdir(); got != "/workspaces/other" {
-t.Errorf("GetWorkdir() = %q, want %q", got, "/workspaces/other")
+type fakeExecResponse struct {
+	stdout   string
+	stderr   string
+	exitCode int
 }
+
+func fakeCommandContext(t *testing.T, calls *[]fakeExecCall, responses []fakeExecResponse) func(context.Context, string, ...string) *exec.Cmd {
+	t.Helper()
+
+	index := 0
+	return func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if index >= len(responses) {
+			t.Fatalf("unexpected command %q with args %v", name, args)
+		}
+		resp := responses[index]
+		index++
+
+		copiedArgs := append([]string(nil), args...)
+		*calls = append(*calls, fakeExecCall{name: name, args: copiedArgs})
+
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestCommandContextHelperProcess", "--", name)
+		cmd.Args = append(cmd.Args, args...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"GO_HELPER_STDOUT="+resp.stdout,
+			"GO_HELPER_STDERR="+resp.stderr,
+			"GO_HELPER_EXIT="+strconv.Itoa(resp.exitCode),
+		)
+		return cmd
+	}
+}
+
+func TestCommandContextHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	_, _ = os.Stdout.WriteString(os.Getenv("GO_HELPER_STDOUT"))
+	_, _ = os.Stderr.WriteString(os.Getenv("GO_HELPER_STDERR"))
+
+	exitCode, err := strconv.Atoi(os.Getenv("GO_HELPER_EXIT"))
+	if err != nil {
+		exitCode = 1
+	}
+	os.Exit(exitCode)
+}
+
+func TestViewFileRetriesReadOnlyTransportFailure(t *testing.T) {
+	client := NewClient("demo")
+	socketPath := t.TempDir() + "/control.sock"
+	if err := os.WriteFile(socketPath, []byte("socket"), 0o600); err != nil {
+		t.Fatalf("write control socket: %v", err)
+	}
+
+	client.sshConfigPath = "/tmp/ssh-config"
+	client.sshHost = "cs.demo"
+	client.controlSocket = socketPath
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{exitCode: 255},
+		{exitCode: 255},
+		{stdout: "1. hello\n"},
+	})
+
+	got, err := client.ViewFile(context.Background(), "/tmp/file.txt", nil)
+	if err != nil {
+		t.Fatalf("ViewFile() error = %v", err)
+	}
+	if got != "1. hello\n" {
+		t.Fatalf("ViewFile() = %q, want %q", got, "1. hello\n")
+	}
+	if client.sshConfigPath != "" {
+		t.Fatalf("sshConfigPath = %q, want empty after fallback", client.sshConfigPath)
+	}
+	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+		t.Fatalf("control socket still exists after fallback: %v", err)
+	}
+
+	expectedCommand := envSecretsLoader + " && awk '{print NR\". \"$0}' '/tmp/file.txt'"
+	wantCalls := []fakeExecCall{
+		{name: "ssh", args: []string{"-F", "/tmp/ssh-config", "cs.demo", expectedCommand}},
+		{name: "ssh", args: []string{"-F", "/tmp/ssh-config", "-o", "ConnectTimeout=5", "cs.demo", "echo ok"}},
+		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", expectedCommand}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestViewFileDoesNotRetryWhenTransportProbeSucceeds(t *testing.T) {
+	client := NewClient("demo")
+	client.sshConfigPath = "/tmp/ssh-config"
+	client.sshHost = "cs.demo"
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{exitCode: 255},
+		{stdout: "ok\n"},
+	})
+
+	_, err := client.ViewFile(context.Background(), "/tmp/file.txt", nil)
+	if err == nil {
+		t.Fatal("ViewFile() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "view file failed (exit 255)") {
+		t.Fatalf("ViewFile() error = %q", err.Error())
+	}
+
+	expectedCommand := envSecretsLoader + " && awk '{print NR\". \"$0}' '/tmp/file.txt'"
+	wantCalls := []fakeExecCall{
+		{name: "ssh", args: []string{"-F", "/tmp/ssh-config", "cs.demo", expectedCommand}},
+		{name: "ssh", args: []string{"-F", "/tmp/ssh-config", "-o", "ConnectTimeout=5", "cs.demo", "echo ok"}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+	if client.sshConfigPath == "" {
+		t.Fatal("sshConfigPath unexpectedly cleared when the transport probe succeeded")
+	}
+}
+
+func TestViewFileDoesNotRetryNonTransportExit255(t *testing.T) {
+	client := NewClient("demo")
+	client.sshConfigPath = "/tmp/ssh-config"
+	client.sshHost = "cs.demo"
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stderr: "application failure\n", exitCode: 255},
+	})
+
+	_, err := client.ViewFile(context.Background(), "/tmp/file.txt", nil)
+	if err == nil {
+		t.Fatal("ViewFile() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "view file failed (exit 255): application failure") {
+		t.Fatalf("ViewFile() error = %q", err.Error())
+	}
+	if len(calls) != 1 {
+		t.Fatalf("len(calls) = %d, want 1", len(calls))
+	}
+	if client.sshConfigPath == "" {
+		t.Fatal("sshConfigPath unexpectedly cleared for non-transport failure")
+	}
+}
+
+func TestEnsureTmuxInstallFailureReturnsActionableMessage(t *testing.T) {
+	client := NewClient("demo")
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{exitCode: 1},
+		{stderr: "curl: (6) Could not resolve host: mise.jdx.dev\n", exitCode: 2},
+	})
+
+	err := client.ensureTmux(context.Background())
+	if err == nil {
+		t.Fatal("ensureTmux() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "failed to install tmux via mise (exit 2); verify that the codespace can run `mise use -g tmux`") {
+		t.Fatalf("ensureTmux() error = %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "Could not resolve host") {
+		t.Fatalf("ensureTmux() leaked raw installer stderr: %q", err.Error())
+	}
+	if len(calls) != 2 {
+		t.Fatalf("len(calls) = %d, want 2", len(calls))
+	}
+}
+
+func TestEnsureTmuxVerificationExplainsShimPathProblem(t *testing.T) {
+	client := NewClient("demo")
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{exitCode: 1},
+		{exitCode: 0},
+		{stderr: "tmux shim exists but is not on PATH\n", exitCode: 1},
+	})
+
+	err := client.ensureTmux(context.Background())
+	if err == nil {
+		t.Fatal("ensureTmux() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "tmux installation completed but tmux is still unavailable") {
+		t.Fatalf("ensureTmux() error = %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "`$HOME/.local/share/mise/shims` is not on PATH") {
+		t.Fatalf("ensureTmux() error = %q", err.Error())
+	}
+	if len(calls) != 3 {
+		t.Fatalf("len(calls) = %d, want 3", len(calls))
+	}
 }
