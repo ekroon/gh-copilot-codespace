@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
 
 func TestBuildMCPConfig(t *testing.T) {
@@ -185,6 +186,23 @@ func TestCleanMirrorDir(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			t.Errorf("%s should have been removed", name)
 		}
+	}
+}
+
+func TestGenerateBranchSyncHookTracksSessionTools(t *testing.T) {
+	dir := t.TempDir()
+	client := ssh.NewClient("demo")
+
+	generateBranchSyncHook(dir, "demo", "/workspaces/repo", client)
+
+	path := filepath.Join(dir, ".github", "hooks", "branch-sync.json")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read hook file: %v", err)
+	}
+
+	if !strings.Contains(string(content), "remote_(bash|write_bash|read_bash|stop_bash)") {
+		t.Fatalf("hook file does not watch session tools: %s", content)
 	}
 }
 

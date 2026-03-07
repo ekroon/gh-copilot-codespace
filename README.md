@@ -12,7 +12,7 @@ A single Go binary (`gh-copilot-codespace`) serves four roles:
 
 2. **MCP server mode** (`gh-copilot-codespace mcp`) — Spawned by copilot, provides 17 remote tools over SSH:
    - `remote_view`, `remote_edit`, `remote_create` — file operations
-   - `remote_bash` (sync + async), `remote_grep`, `remote_glob` — commands & search
+   - `remote_bash` (session-backed fast path + async), `remote_grep`, `remote_glob` — commands & search
    - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash` — async session management (tmux-based)
    - `remote_cd`, `remote_cwd` — working directory navigation
    - `list_codespaces`, `create_codespace`, `connect_codespace`, `delete_codespace` — codespace lifecycle

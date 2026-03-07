@@ -21,7 +21,7 @@ This project provides MCP tools that execute on a remote GitHub Codespace via SS
 | **Search** code (grep, find files) | `remote_grep`, `remote_glob` | Files are on the codespace |
 | Edit **local session files** (plan.md, notes) | `view`, `edit`, `create` (built-in local) | Session state lives locally |
 | **Change directory** on codespace | `remote_cd` | Affects all subsequent remote commands |
-| **Interactive/long-running** commands | `remote_bash mode=async` + `remote_write_bash`/`remote_read_bash` | Backed by tmux sessions on the codespace |
+| **Interactive/long-running** commands | `remote_bash` or `remote_bash mode=async` + `remote_write_bash`/`remote_read_bash` | Backed by tmux sessions on the codespace |
 | **Open a terminal** to the codespace | `open_shell` | Opens `gh codespace ssh` in a new terminal window |
 
 ## File Operations
@@ -62,14 +62,18 @@ Create a new file on the codespace. Parent directories are created automatically
 
 ### `remote_bash`
 
-Execute a bash command on the codespace. Supports two modes:
+Execute a bash command on the codespace. By default it is session-backed even for quick commands:
 
-**Sync mode** (default) — runs command, waits for completion, returns output:
+**Default mode** — starts a tmux-backed session, waits briefly, then:
+- returns final output immediately if the command exits quickly, or
+- returns partial output plus a `shellId` if it is still running.
+
+Example quick command:
 ```
 remote_bash(command="go test -race ./...", description="Run tests")
 ```
 
-**Sync with initial_wait** — waits up to N seconds, returns partial output + shellId:
+**Default mode with longer `initial_wait`** — waits up to N seconds before falling back to a `shellId`:
 ```
 remote_bash(command="go test -race ./...", initial_wait=120, description="Run tests")
 → partial output + "[shellId: sh-123 — use remote_read_bash to check for more output]"
@@ -85,12 +89,12 @@ remote_bash(command="npm run dev", mode="async", description="Start dev server")
 - `command` (required) — The bash command
 - `description` (optional) — Short description of what the command does
 - `mode` (optional) — `"sync"` (default) or `"async"`
-- `initial_wait` (optional) — Seconds to wait in sync mode before returning partial output (e.g., 120 for builds). Command continues in background with a shellId for follow-up reads.
-- `shellId` (optional) — Custom session ID for async mode
+- `initial_wait` (optional) — Seconds to wait in default/sync mode before returning partial output (default: 2). Use larger values when you want more inline output before switching to follow-up reads.
+- `shellId` (optional) — Custom session ID for async mode or for session-backed sync commands
 
 ### `remote_write_bash`
 
-Send input to an async bash session. Supports special keys.
+Send input to a `remote_bash` session. Supports special keys.
 
 **Parameters:**
 - `shellId` (required) — Session ID from `remote_bash`
@@ -99,7 +103,7 @@ Send input to an async bash session. Supports special keys.
 
 ### `remote_read_bash`
 
-Read output from an async bash session.
+Read output from a `remote_bash` session.
 
 **Parameters:**
 - `shellId` (required) — Session ID
@@ -107,14 +111,14 @@ Read output from an async bash session.
 
 ### `remote_stop_bash`
 
-Stop (kill) an async bash session.
+Stop (kill) a `remote_bash` session.
 
 **Parameters:**
 - `shellId` (required) — Session ID to stop
 
 ### `remote_list_bash`
 
-List all active async bash sessions on the codespace.
+List all active `remote_bash` sessions on the codespace.
 
 ## Search Tools
 
@@ -184,6 +188,7 @@ Open an interactive SSH shell to the codespace in a new terminal window. Useful 
 ## Tips
 
 - **All remote paths are absolute** on the codespace (e.g., `/workspaces/repo/...`)
+- **Remote bash is session-backed by default** — quick commands may finish inline, but long ones naturally continue with a shellId
 - **Async sessions survive disconnects** — they run in tmux on the codespace
 - **`remote_cd` is sticky** — it affects all subsequent commands until changed
 - **grep falls back gracefully** — if ripgrep isn't installed, it uses grep

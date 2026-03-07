@@ -221,6 +221,7 @@ type mockExecutor struct {
 	viewFileErr        error
 	editFileErr        error
 	createFileErr      error
+	runBashCalls       int
 	runBashStdout      string
 	runBashStderr      string
 	runBashExit        int
@@ -229,10 +230,16 @@ type mockExecutor struct {
 	grepErr            error
 	globResult         string
 	globErr            error
+	startSessionCalls  int
+	lastSessionID      string
+	lastCommand        string
 	startSessionErr    error
 	writeSessionErr    error
+	readSessionCalls   int
+	readSessionResults []string
 	readSessionResult  string
 	readSessionErr     error
+	stopSessionCalls   int
 	stopSessionErr     error
 	listSessionsResult string
 	listSessionsErr    error
@@ -252,6 +259,7 @@ func (m *mockExecutor) CreateFile(_ context.Context, _, _ string) error {
 }
 
 func (m *mockExecutor) RunBash(_ context.Context, _ string) (string, string, int, error) {
+	m.runBashCalls++
 	return m.runBashStdout, m.runBashStderr, m.runBashExit, m.runBashErr
 }
 
@@ -263,7 +271,10 @@ func (m *mockExecutor) Glob(_ context.Context, _, _ string) (string, error) {
 	return m.globResult, m.globErr
 }
 
-func (m *mockExecutor) StartSession(_ context.Context, _, _ string) error {
+func (m *mockExecutor) StartSession(_ context.Context, sessionID, command string) error {
+	m.startSessionCalls++
+	m.lastSessionID = sessionID
+	m.lastCommand = command
 	return m.startSessionErr
 }
 
@@ -272,10 +283,17 @@ func (m *mockExecutor) WriteSession(_ context.Context, _, _ string) error {
 }
 
 func (m *mockExecutor) ReadSession(_ context.Context, _ string) (string, error) {
+	m.readSessionCalls++
+	if len(m.readSessionResults) > 0 {
+		result := m.readSessionResults[0]
+		m.readSessionResults = m.readSessionResults[1:]
+		return result, m.readSessionErr
+	}
 	return m.readSessionResult, m.readSessionErr
 }
 
 func (m *mockExecutor) StopSession(_ context.Context, _ string) error {
+	m.stopSessionCalls++
 	return m.stopSessionErr
 }
 
@@ -321,11 +339,11 @@ func testReg(mock *mockExecutor) *registry.Registry {
 
 func TestViewHandler(t *testing.T) {
 	tests := []struct {
-		name      string
-		mock      *mockExecutor
-		args      map[string]any
-		wantErr   bool
-		wantText  string
+		name     string
+		mock     *mockExecutor
+		args     map[string]any
+		wantErr  bool
+		wantText string
 	}{
 		{
 			name:     "success",
@@ -459,57 +477,135 @@ func TestCreateHandler(t *testing.T) {
 	}
 }
 
-func TestBashHandler_Sync(t *testing.T) {
-	tests := []struct {
-		name     string
-		mock     *mockExecutor
-		args     map[string]any
-		wantErr  bool
-		wantText string
-	}{
-		{
-			name:     "exit 0 stdout only",
-			mock:     &mockExecutor{runBashStdout: "hello world\n"},
-			args:     map[string]any{"command": "echo hello world"},
-			wantText: "hello world\n",
-		},
-		{
-			name:     "non-zero exit code",
-			mock:     &mockExecutor{runBashStdout: "", runBashStderr: "not found\n", runBashExit: 127},
-			args:     map[string]any{"command": "badcmd"},
-			wantText: "[exit code: 127]",
-		},
-		{
-			name:     "executor error",
-			mock:     &mockExecutor{runBashErr: fmt.Errorf("connection lost")},
-			args:     map[string]any{"command": "ls"},
-			wantErr:  true,
-			wantText: "connection lost",
-		},
-		{
-			name:     "stdout and stderr",
-			mock:     &mockExecutor{runBashStdout: "out\n", runBashStderr: "warn\n"},
-			args:     map[string]any{"command": "cmd"},
-			wantText: "STDERR:",
-		},
+func TestBashHandler_DefaultReturnsCompletedSessionOutput(t *testing.T) {
+	mock := &mockExecutor{
+		readSessionResult: "hello world\n[session exited]",
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			handler := bashHandler(testReg(tt.mock))
-			res, err := handler(context.Background(), makeReq(tt.args))
-			if err != nil {
-				t.Fatalf("unexpected Go error: %v", err)
-			}
-			if tt.wantErr && !res.IsError {
-				t.Fatal("expected tool error, got success")
-			}
-			if !tt.wantErr && res.IsError {
-				t.Fatalf("expected success, got tool error: %s", resultText(res))
-			}
-			if !strings.Contains(resultText(res), tt.wantText) {
-				t.Errorf("result text %q does not contain %q", resultText(res), tt.wantText)
-			}
-		})
+
+	handler := bashHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command":      "echo hello world",
+		"shellId":      "s1",
+		"initial_wait": 0.001,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if got := resultText(res); got != "hello world" {
+		t.Fatalf("result text = %q, want %q", got, "hello world")
+	}
+	if mock.startSessionCalls != 1 {
+		t.Fatalf("startSessionCalls = %d, want 1", mock.startSessionCalls)
+	}
+	if mock.stopSessionCalls != 1 {
+		t.Fatalf("stopSessionCalls = %d, want 1", mock.stopSessionCalls)
+	}
+	if mock.runBashCalls != 0 {
+		t.Fatalf("runBashCalls = %d, want 0", mock.runBashCalls)
+	}
+}
+
+func TestBashHandler_DefaultReturnsShellIDForRunningCommand(t *testing.T) {
+	mock := &mockExecutor{
+		readSessionResult: "still running",
+	}
+
+	handler := bashHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command":      "go test ./...",
+		"shellId":      "s2",
+		"initial_wait": 0.001,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	text := resultText(res)
+	if !strings.Contains(text, "still running") || !strings.Contains(text, "[shellId: s2") {
+		t.Fatalf("unexpected result text: %q", text)
+	}
+	if mock.stopSessionCalls != 0 {
+		t.Fatalf("stopSessionCalls = %d, want 0", mock.stopSessionCalls)
+	}
+}
+
+func TestBashHandler_DefaultPreservesOutputWhenCleanupFails(t *testing.T) {
+	mock := &mockExecutor{
+		readSessionResult: "done\n[session exited]",
+		stopSessionErr:    fmt.Errorf("session not found"),
+	}
+
+	handler := bashHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command":      "echo done",
+		"shellId":      "s2b",
+		"initial_wait": 0.001,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	text := resultText(res)
+	if !strings.Contains(text, "done") || !strings.Contains(text, "[cleanup warning: failed to stop completed session s2b: session not found]") {
+		t.Fatalf("unexpected result text: %q", text)
+	}
+}
+
+func TestBashHandler_DefaultFallsBackToRunBashWhenSessionStartFails(t *testing.T) {
+	mock := &mockExecutor{
+		startSessionErr: fmt.Errorf("tmux unavailable"),
+		runBashStdout:   "fallback output\n",
+	}
+
+	handler := bashHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command": "echo hi",
+		"shellId": "s3",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if !strings.Contains(resultText(res), "fallback output") {
+		t.Fatalf("unexpected result text: %q", resultText(res))
+	}
+	if mock.runBashCalls != 1 {
+		t.Fatalf("runBashCalls = %d, want 1", mock.runBashCalls)
+	}
+}
+
+func TestBashHandler_AsyncStartsSession(t *testing.T) {
+	mock := &mockExecutor{
+		readSessionResult: "server booting",
+	}
+
+	handler := bashHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command": "npm run dev",
+		"mode":    "async",
+		"shellId": "s4",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	text := resultText(res)
+	if !strings.Contains(text, "Started async session: s4") || !strings.Contains(text, "server booting") {
+		t.Fatalf("unexpected result text: %q", text)
+	}
+	if mock.stopSessionCalls != 0 {
+		t.Fatalf("stopSessionCalls = %d, want 0", mock.stopSessionCalls)
 	}
 }
 
@@ -696,91 +792,91 @@ func TestListBashHandler(t *testing.T) {
 }
 
 func TestCdHandler(t *testing.T) {
-tests := []struct {
-name     string
-args     map[string]any
-mock     *mockExecutor
-wantErr  bool
-wantText string
-wantDir  string
-}{
-{
-name:     "missing path",
-args:     map[string]any{},
-mock:     &mockExecutor{},
-wantErr:  true,
-wantText: "missing required parameter",
-},
-{
-name:     "directory exists",
-args:     map[string]any{"path": "/workspaces/myproject/src"},
-mock:     &mockExecutor{runBashStdout: "/workspaces/myproject/src\n", runBashExit: 0},
-wantText: "Changed working directory",
-wantDir:  "/workspaces/myproject/src",
-},
-{
-name:     "directory does not exist",
-args:     map[string]any{"path": "/nonexistent"},
-mock:     &mockExecutor{runBashExit: 1},
-wantErr:  true,
-wantText: "directory does not exist",
-},
-{
-name:     "executor error",
-args:     map[string]any{"path": "/workspaces"},
-mock:     &mockExecutor{runBashErr: fmt.Errorf("connection failed")},
-wantErr:  true,
-wantText: "failed to change directory",
-},
-}
-for _, tt := range tests {
-t.Run(tt.name, func(t *testing.T) {
-handler := cdHandler(testReg(tt.mock))
-res, err := handler(context.Background(), makeReq(tt.args))
-if err != nil {
-t.Fatalf("unexpected Go error: %v", err)
-}
-if tt.wantErr && !res.IsError {
-t.Fatal("expected tool error, got success")
-}
-if !tt.wantErr && res.IsError {
-t.Fatalf("expected success, got tool error: %s", resultText(res))
-}
-if !strings.Contains(resultText(res), tt.wantText) {
-t.Errorf("result text %q does not contain %q", resultText(res), tt.wantText)
-}
-if tt.wantDir != "" && tt.mock.workdir != tt.wantDir {
-t.Errorf("expected workdir %q, got %q", tt.wantDir, tt.mock.workdir)
-}
-})
-}
+	tests := []struct {
+		name     string
+		args     map[string]any
+		mock     *mockExecutor
+		wantErr  bool
+		wantText string
+		wantDir  string
+	}{
+		{
+			name:     "missing path",
+			args:     map[string]any{},
+			mock:     &mockExecutor{},
+			wantErr:  true,
+			wantText: "missing required parameter",
+		},
+		{
+			name:     "directory exists",
+			args:     map[string]any{"path": "/workspaces/myproject/src"},
+			mock:     &mockExecutor{runBashStdout: "/workspaces/myproject/src\n", runBashExit: 0},
+			wantText: "Changed working directory",
+			wantDir:  "/workspaces/myproject/src",
+		},
+		{
+			name:     "directory does not exist",
+			args:     map[string]any{"path": "/nonexistent"},
+			mock:     &mockExecutor{runBashExit: 1},
+			wantErr:  true,
+			wantText: "directory does not exist",
+		},
+		{
+			name:     "executor error",
+			args:     map[string]any{"path": "/workspaces"},
+			mock:     &mockExecutor{runBashErr: fmt.Errorf("connection failed")},
+			wantErr:  true,
+			wantText: "failed to change directory",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := cdHandler(testReg(tt.mock))
+			res, err := handler(context.Background(), makeReq(tt.args))
+			if err != nil {
+				t.Fatalf("unexpected Go error: %v", err)
+			}
+			if tt.wantErr && !res.IsError {
+				t.Fatal("expected tool error, got success")
+			}
+			if !tt.wantErr && res.IsError {
+				t.Fatalf("expected success, got tool error: %s", resultText(res))
+			}
+			if !strings.Contains(resultText(res), tt.wantText) {
+				t.Errorf("result text %q does not contain %q", resultText(res), tt.wantText)
+			}
+			if tt.wantDir != "" && tt.mock.workdir != tt.wantDir {
+				t.Errorf("expected workdir %q, got %q", tt.wantDir, tt.mock.workdir)
+			}
+		})
+	}
 }
 
 func TestCwdHandler(t *testing.T) {
-mock := &mockExecutor{workdir: "/workspaces/myproject"}
-handler := cwdHandler(testReg(mock))
-res, err := handler(context.Background(), makeReq(map[string]any{}))
-if err != nil {
-t.Fatalf("unexpected Go error: %v", err)
-}
-if res.IsError {
-t.Fatalf("expected success, got tool error: %s", resultText(res))
-}
-if !strings.Contains(resultText(res), "/workspaces/myproject") {
-t.Errorf("expected workdir in result, got %q", resultText(res))
-}
+	mock := &mockExecutor{workdir: "/workspaces/myproject"}
+	handler := cwdHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if !strings.Contains(resultText(res), "/workspaces/myproject") {
+		t.Errorf("expected workdir in result, got %q", resultText(res))
+	}
 }
 
 func TestCwdHandlerDefault(t *testing.T) {
-mock := &mockExecutor{}
-handler := cwdHandler(testReg(mock))
-res, err := handler(context.Background(), makeReq(map[string]any{}))
-if err != nil {
-t.Fatalf("unexpected Go error: %v", err)
-}
-if !strings.Contains(resultText(res), "/workspaces") {
-t.Errorf("expected default workdir, got %q", resultText(res))
-}
+	mock := &mockExecutor{}
+	handler := cwdHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if !strings.Contains(resultText(res), "/workspaces") {
+		t.Errorf("expected default workdir, got %q", resultText(res))
+	}
 }
 
 func TestListCodespacesHandler(t *testing.T) {

@@ -1329,7 +1329,7 @@ func detectRemoteBranch(sshClient *ssh.Client, codespaceName, workdir string) st
 }
 
 // generateBranchSyncHook writes a postToolUse hook that keeps the local mirror's
-// git branch in sync with the codespace after remote_bash commands.
+// git branch in sync with the codespace after remote shell session activity.
 func generateBranchSyncHook(mirrorDir, codespaceName, workdir string, sshClient *ssh.Client) {
 	hooksDir := filepath.Join(mirrorDir, ".github", "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
@@ -1345,7 +1345,7 @@ func generateBranchSyncHook(mirrorDir, codespaceName, workdir string, sshClient 
 
 	// Use lenient matching: MCP tools may be namespaced (e.g., mcp__codespace__remote_bash)
 	script := fmt.Sprintf(
-		`INPUT=$(cat); echo "$INPUT" | grep -q 'remote_bash' || exit 0; branch=$(%s 2>/dev/null); [ -n "$branch" ] && git -C %s symbolic-ref HEAD "refs/heads/$branch" 2>/dev/null; exit 0`,
+		`INPUT=$(cat); echo "$INPUT" | grep -Eq 'remote_(bash|write_bash|read_bash|stop_bash)' || exit 0; branch=$(%s 2>/dev/null); [ -n "$branch" ] && git -C %s symbolic-ref HEAD "refs/heads/$branch" 2>/dev/null; exit 0`,
 		sshCmd, shellQuote(mirrorDir),
 	)
 

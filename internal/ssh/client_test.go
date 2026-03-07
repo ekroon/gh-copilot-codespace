@@ -146,6 +146,39 @@ func TestCleanPaneOutput(t *testing.T) {
 	}
 }
 
+func TestParsePaneStatus(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		wantDead     bool
+		wantExitCode int
+		wantErr      bool
+	}{
+		{name: "dead pane", input: "1 127\n", wantDead: true, wantExitCode: 127},
+		{name: "running pane", input: "0 0\n", wantDead: false, wantExitCode: 0},
+		{name: "invalid format", input: "oops", wantErr: true},
+		{name: "invalid exit code", input: "1 nope", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotDead, gotExitCode, err := parsePaneStatus(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("parsePaneStatus() error = nil, want non-nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parsePaneStatus() error = %v", err)
+			}
+			if gotDead != tt.wantDead || gotExitCode != tt.wantExitCode {
+				t.Fatalf("parsePaneStatus() = (%v, %d), want (%v, %d)", gotDead, gotExitCode, tt.wantDead, tt.wantExitCode)
+			}
+		})
+	}
+}
+
 func TestSetGetWorkdir(t *testing.T) {
 	c := NewClient("test-codespace")
 

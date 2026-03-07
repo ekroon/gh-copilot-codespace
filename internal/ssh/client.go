@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -683,11 +685,32 @@ func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, err
 	// Check if the pane is dead (command exited)
 	statusCmd := fmt.Sprintf("tmux list-panes -t %s -F '#{pane_dead} #{pane_dead_status}' 2>/dev/null", shellQuote(name))
 	statusOut, _, _, _ := c.execTmux(ctx, statusCmd)
-	if strings.HasPrefix(strings.TrimSpace(statusOut), "1") {
-		stdout += "\n[session exited]"
+	paneDead, exitCode, err := parsePaneStatus(statusOut)
+	if err == nil && paneDead {
+		if stdout != "" {
+			stdout += "\n"
+		}
+		stdout += "[session exited]"
+		if exitCode != 0 {
+			stdout += fmt.Sprintf("\n[exit code: %d]", exitCode)
+		}
 	}
 
 	return stdout, nil
+}
+
+func parsePaneStatus(status string) (paneDead bool, exitCode int, err error) {
+	fields := strings.Fields(strings.TrimSpace(status))
+	if len(fields) < 2 {
+		return false, 0, errors.New("invalid pane status")
+	}
+
+	paneDead = fields[0] == "1"
+	exitCode, err = strconv.Atoi(fields[1])
+	if err != nil {
+		return false, 0, fmt.Errorf("parse pane exit code: %w", err)
+	}
+	return paneDead, exitCode, nil
 }
 
 // StopSession kills a tmux session on the codespace.

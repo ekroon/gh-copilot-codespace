@@ -236,10 +236,16 @@ func createHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 // --- remote_bash ---
 
+const (
+	defaultRemoteBashInitialWait = 2.0
+	asyncRemoteBashInitialDelay  = 1.0
+	sessionExitedMarker          = "[session exited]"
+)
+
 func bashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_bash",
-		Description: "Execute a bash command on the remote codespace. In sync mode (default), waits for completion. Use 'initial_wait' for commands that may take time — it will wait up to that many seconds, then return partial output and a shellId for continued reading with remote_read_bash. Use mode 'async' for interactive or very long-running commands. Replaces the local 'bash' tool.",
+		Description: "Execute a bash command on the remote codespace. By default, it starts a remote session, waits briefly for quick completion, and returns final output when the command exits quickly. If the command is still running, it returns partial output and a shellId for follow-up reads with remote_read_bash. Use mode 'async' for interactive or explicitly backgrounded commands. Replaces the local 'bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -254,12 +260,12 @@ func bashTool() mcpsdk.Tool {
 				},
 				"mode": map[string]any{
 					"type":        "string",
-					"description": "Execution mode: 'sync' (default) waits for completion, 'async' runs in background and returns a shellId",
+					"description": "Execution mode: 'sync' (default) waits briefly for quick completion before returning final output or a shellId, 'async' always returns a shellId for continued interaction",
 					"enum":        []string{"sync", "async"},
 				},
 				"initial_wait": map[string]any{
 					"type":        "number",
-					"description": "Seconds to wait for initial output in sync mode (default: 30). If the command hasn't completed, returns partial output and a shellId for follow-up reads with remote_read_bash. Give long-running commands adequate time (e.g., 120+ for builds/tests).",
+					"description": "Seconds to wait for initial output in sync mode (default: 2). If the command hasn't completed, returns partial output and a shellId for follow-up reads with remote_read_bash. Use larger values for builds/tests when you want more inline output before switching to reads.",
 				},
 				"shellId": map[string]any{
 					"type":        "string",
@@ -283,60 +289,91 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		mode := optionalString(req, "mode")
-		initialWait := optionalFloat(req, "initial_wait", 0)
+		shellId := optionalString(req, "shellId")
+		if shellId == "" {
+			shellId = fmt.Sprintf("sh-%d", time.Now().UnixMilli())
+		}
 
 		if mode == "async" {
-			shellId := optionalString(req, "shellId")
-			if shellId == "" {
-				shellId = fmt.Sprintf("sh-%d", time.Now().UnixMilli())
-			}
 			if err := c.StartSession(ctx, shellId, command); err != nil {
 				return toolError(err.Error()), nil
 			}
 			// Wait briefly and capture initial output
-			time.Sleep(1 * time.Second)
+			time.Sleep(time.Duration(asyncRemoteBashInitialDelay * float64(time.Second)))
 			output, _ := c.ReadSession(ctx, shellId)
 			return toolSuccess(fmt.Sprintf("Started async session: %s\n\n%s", shellId, output)), nil
 		}
 
-		// Sync mode with initial_wait: start as async, wait, return partial output
-		if initialWait > 0 {
-			shellId := fmt.Sprintf("sh-%d", time.Now().UnixMilli())
-			if err := c.StartSession(ctx, shellId, command); err != nil {
-				return toolError(err.Error()), nil
-			}
-			time.Sleep(time.Duration(initialWait * float64(time.Second)))
-			output, _ := c.ReadSession(ctx, shellId)
-			return toolSuccess(fmt.Sprintf("%s\n\n[shellId: %s — use remote_read_bash to check for more output]", output, shellId)), nil
+		initialWait := optionalFloat(req, "initial_wait", defaultRemoteBashInitialWait)
+		if err := c.StartSession(ctx, shellId, command); err != nil {
+			return runBashSyncFallback(ctx, c, command), nil
 		}
-
-		// Pure sync: run and wait for completion
-		stdout, stderr, exitCode, err := c.RunBash(ctx, command)
+		time.Sleep(time.Duration(initialWait * float64(time.Second)))
+		output, err := c.ReadSession(ctx, shellId)
 		if err != nil {
-			errMsg := err.Error()
-			if ctx.Err() != nil {
-				errMsg += "\n\nHint: This command may have timed out. Use initial_wait parameter (e.g., initial_wait=60) or mode='async' for long-running commands."
+			if stopErr := c.StopSession(ctx, shellId); stopErr != nil {
+				return toolError(fmt.Sprintf("%s\n\nAdditionally, failed to stop session %s after read failure: %v", err.Error(), shellId, stopErr)), nil
 			}
-			return toolError(errMsg), nil
+			return toolError(err.Error()), nil
 		}
 
-		var result strings.Builder
-		if stdout != "" {
-			result.WriteString(stdout)
-		}
-		if stderr != "" {
-			if result.Len() > 0 {
-				result.WriteString("\n")
+		if sessionOutputExited(output) {
+			finalOutput := trimSessionExitMarker(output)
+			if err := c.StopSession(ctx, shellId); err != nil {
+				if finalOutput != "" {
+					finalOutput += "\n"
+				}
+				finalOutput += fmt.Sprintf("[cleanup warning: failed to stop completed session %s: %v]", shellId, err)
 			}
-			result.WriteString("STDERR:\n")
-			result.WriteString(stderr)
-		}
-		if exitCode != 0 {
-			result.WriteString(fmt.Sprintf("\n[exit code: %d]", exitCode))
+			return toolSuccess(finalOutput), nil
 		}
 
-		return toolSuccess(result.String()), nil
+		return toolSuccess(fmt.Sprintf("%s\n\n[shellId: %s — use remote_read_bash to check for more output]", output, shellId)), nil
 	}
+}
+
+func runBashSyncFallback(ctx context.Context, c ssh.Executor, command string) *mcpsdk.CallToolResult {
+	stdout, stderr, exitCode, err := c.RunBash(ctx, command)
+	if err != nil {
+		errMsg := err.Error()
+		if ctx.Err() != nil {
+			errMsg += "\n\nHint: This command may have timed out. Use initial_wait parameter (e.g., initial_wait=60) or mode='async' for long-running commands."
+		}
+		return toolError(errMsg)
+	}
+
+	var result strings.Builder
+	if stdout != "" {
+		result.WriteString(stdout)
+	}
+	if stderr != "" {
+		if result.Len() > 0 {
+			result.WriteString("\n")
+		}
+		result.WriteString("STDERR:\n")
+		result.WriteString(stderr)
+	}
+	if exitCode != 0 {
+		result.WriteString(fmt.Sprintf("\n[exit code: %d]", exitCode))
+	}
+
+	return toolSuccess(result.String())
+}
+
+func sessionOutputExited(output string) bool {
+	return strings.Contains(output, sessionExitedMarker)
+}
+
+func trimSessionExitMarker(output string) string {
+	lines := strings.Split(output, "\n")
+	filtered := lines[:0]
+	for _, line := range lines {
+		if strings.TrimSpace(line) == sessionExitedMarker {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.TrimRight(strings.Join(filtered, "\n"), "\n")
 }
 
 // --- remote_write_bash ---
@@ -344,14 +381,14 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func writeBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_write_bash",
-		Description: "Send input to an async bash session on the remote codespace. Supports special keys: {enter}, {up}, {down}, {left}, {right}, {backspace}. Replaces the local 'write_bash' tool.",
+		Description: "Send input to a remote bash session on the codespace. Supports special keys: {enter}, {up}, {down}, {left}, {right}, {backspace}. Replaces the local 'write_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"codespace": codespaceParam,
 				"shellId": map[string]any{
 					"type":        "string",
-					"description": "The session ID returned by remote_bash in async mode",
+					"description": "The session ID returned by remote_bash when it keeps a session open",
 				},
 				"input": map[string]any{
 					"type":        "string",
@@ -401,14 +438,14 @@ func writeBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func readBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_read_bash",
-		Description: "Read output from an async bash session on the remote codespace. Returns the last 100 lines of the session's terminal output. If a command hasn't completed, call again with a longer delay. Use exponential backoff between reads to minimize overhead. Replaces the local 'read_bash' tool.",
+		Description: "Read output from a remote bash session on the codespace. Returns the last 100 lines of the session's terminal output. If a command hasn't completed, call again with a longer delay. Use exponential backoff between reads to minimize overhead. Replaces the local 'read_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"codespace": codespaceParam,
 				"shellId": map[string]any{
 					"type":        "string",
-					"description": "The session ID returned by remote_bash in async mode or with initial_wait",
+					"description": "The session ID returned by remote_bash when it keeps a session open",
 				},
 				"delay": map[string]any{
 					"type":        "number",
@@ -447,7 +484,7 @@ func readBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func stopBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_stop_bash",
-		Description: "Stop an async bash session on the remote codespace. Replaces the local 'stop_bash' tool.",
+		Description: "Stop a remote bash session on the codespace. Replaces the local 'stop_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -485,7 +522,7 @@ func stopBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func listBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_list_bash",
-		Description: "List active async bash sessions on the remote codespace. Replaces the local 'list_bash' tool.",
+		Description: "List active remote bash sessions on the codespace. Replaces the local 'list_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
