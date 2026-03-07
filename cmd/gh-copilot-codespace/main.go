@@ -37,10 +37,11 @@ Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 
 Flags:
   -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
+      --no-codespace     Start without connecting to any codespace (skip picker)
   -w, --workdir PATH     Override workspace directory on the codespace
-      --name SESSION      Name for the local workspace session
-      --resume SESSION    Re-attach to a previous workspace session
-      --local-tools       Keep all local tools (bash, grep, glob) enabled alongside remote_* tools
+      --name SESSION     Name for the local workspace session
+      --resume SESSION   Re-attach to a previous workspace session
+      --local-tools      Keep all local tools (bash, grep, glob) enabled alongside remote_* tools
 
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
@@ -185,44 +186,66 @@ func registryFromEntries(ctx context.Context, entries []registryEntry, build fun
 	return reg, nil
 }
 
-func runLauncher(args []string) error {
-	// Parse our flags (consume them, don't pass to copilot)
-	var codespaceNames []string
-	workdirOverride := ""
-	sessionName := ""
-	resumeSession := ""
-	localTools := false
-	var copilotArgs []string
+type launcherOptions struct {
+	codespaceNames  []string
+	noCodespace     bool
+	workdirOverride string
+	sessionName     string
+	resumeSession   string
+	localTools      bool
+	copilotArgs     []string
+}
+
+func parseLauncherArgs(args []string) (launcherOptions, error) {
+	var opts launcherOptions
 	for i := 0; i < len(args); i++ {
 		switch {
 		case args[i] == "--local-tools":
-			localTools = true
+			opts.localTools = true
+		case args[i] == "--no-codespace":
+			opts.noCodespace = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
 			// Support comma-separated: -c cs1,cs2
 			for _, name := range strings.Split(args[i+1], ",") {
 				name = strings.TrimSpace(name)
 				if name != "" {
-					codespaceNames = append(codespaceNames, name)
+					opts.codespaceNames = append(opts.codespaceNames, name)
 				}
 			}
 			i++
 		case (args[i] == "--workdir" || args[i] == "-w") && i+1 < len(args):
-			workdirOverride = args[i+1]
+			opts.workdirOverride = args[i+1]
 			i++
 		case args[i] == "--name" && i+1 < len(args):
-			sessionName = args[i+1]
+			opts.sessionName = args[i+1]
 			i++
 		case args[i] == "--resume" && i+1 < len(args):
-			resumeSession = args[i+1]
+			opts.resumeSession = args[i+1]
 			i++
 		default:
-			copilotArgs = append(copilotArgs, args[i])
+			opts.copilotArgs = append(opts.copilotArgs, args[i])
 		}
 	}
 
+	if opts.noCodespace && len(opts.codespaceNames) > 0 {
+		return launcherOptions{}, fmt.Errorf("--no-codespace and --codespace are mutually exclusive")
+	}
+	if opts.noCodespace && opts.resumeSession != "" {
+		return launcherOptions{}, fmt.Errorf("--no-codespace and --resume are mutually exclusive")
+	}
+
+	return opts, nil
+}
+
+func runLauncher(args []string) error {
+	opts, err := parseLauncherArgs(args)
+	if err != nil {
+		return err
+	}
+
 	// Handle --resume: load workspace and reconnect to codespaces
-	if resumeSession != "" {
-		return runResume(resumeSession, copilotArgs)
+	if opts.resumeSession != "" {
+		return runResume(opts.resumeSession, opts.copilotArgs)
 	}
 
 	// The binary serves as both launcher and MCP server
@@ -233,15 +256,15 @@ func runLauncher(args []string) error {
 
 	// Select codespace(s): use --codespace flag(s) or interactive picker
 	var selectedList []codespace
-	if len(codespaceNames) > 0 {
-		for _, name := range codespaceNames {
+	if len(opts.codespaceNames) > 0 {
+		for _, name := range opts.codespaceNames {
 			cs, err := lookupCodespace(name)
 			if err != nil {
 				return fmt.Errorf("codespace %q: %w", name, err)
 			}
 			selectedList = append(selectedList, cs)
 		}
-	} else {
+	} else if !opts.noCodespace {
 		selectedList, err = selectCodespaces()
 		if err != nil {
 			return err
@@ -267,8 +290,8 @@ func runLauncher(args []string) error {
 
 		// Detect workspace directory
 		var workdir string
-		if workdirOverride != "" {
-			workdir = workdirOverride
+		if opts.workdirOverride != "" {
+			workdir = opts.workdirOverride
 		} else {
 			workdir, err = detectWorkdir(selected.Name, selected.Repository)
 			if err != nil {
@@ -315,7 +338,7 @@ func runLauncher(args []string) error {
 
 	// Create a workspace manifest for --resume support. Empty sessions reuse this
 	// directory as the local bootstrap workspace until a codespace is connected.
-	ws, wsErr := workspace.New(sessionName)
+	ws, wsErr := workspace.New(opts.sessionName)
 
 	if len(selectedList) > 0 {
 		primary := selectedList[0]
@@ -372,7 +395,7 @@ func runLauncher(args []string) error {
 
 	// Excluded tools
 	var excludedTools []string
-	if !localTools {
+	if !opts.localTools {
 		excludedTools = []string{
 			"bash", "write_bash", "read_bash",
 			"stop_bash", "list_bash", "grep", "glob",
@@ -416,7 +439,7 @@ func runLauncher(args []string) error {
 	fmt.Printf("\n")
 
 	// Exec copilot
-	return execCopilot(excludedTools, mcpConfig, copilotArgs)
+	return execCopilot(excludedTools, mcpConfig, opts.copilotArgs)
 }
 
 // lookupCodespace finds a codespace by name (exact or prefix match).
@@ -448,7 +471,7 @@ func lookupCodespace(name string) (codespace, error) {
 }
 
 // selectCodespaces lets the user pick zero, one, or many codespaces interactively.
-// Uses gum filter for fuzzy multi-select if available, otherwise falls back to a numbered list.
+// Uses gum choose for multi-select if available, otherwise falls back to a numbered list.
 func selectCodespaces() ([]codespace, error) {
 	out, err := exec.Command("gh", "codespace", "list",
 		"--json", "name,displayName,repository,state",
@@ -483,25 +506,21 @@ func selectCodespaces() ([]codespace, error) {
 		lines[i] = fmt.Sprintf("%s\t%s %s: %s [%s]", cs.Name, icon, cs.Repository, cs.DisplayName, cs.State)
 	}
 
-	// Try gum filter for fuzzy interactive picker
+	// Try gum choose for interactive multi-select.
 	if gumPath, err := exec.LookPath("gum"); err == nil {
-		displayLines := make([]string, len(lines))
-		byDisplay := make(map[string]codespace, len(lines))
+		byChoice := make(map[string]codespace, len(lines))
 		for i, l := range lines {
-			// Show only the display part (after tab) in the picker
-			parts := strings.SplitN(l, "\t", 2)
-			displayLines[i] = parts[1]
-			byDisplay[displayLines[i]] = codespaces[i]
+			byChoice[l] = codespaces[i]
 		}
 
-		cmd := exec.Command(gumPath, "filter", "--no-limit", "--placeholder", "Choose codespace(s)...")
-		cmd.Stdin = strings.NewReader(strings.Join(displayLines, "\n"))
+		cmd := exec.Command(gumPath, "choose", "--no-limit", "--header", "Choose codespace(s) (Space toggles, Enter submits none)")
+		cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
 		cmd.Stderr = os.Stderr
 		selected, err := cmd.Output()
 		if err == nil {
-			return resolveSelectedCodespaces(strings.Split(strings.TrimSpace(string(selected)), "\n"), byDisplay), nil
+			return resolveSelectedCodespaces(strings.Split(strings.TrimSpace(string(selected)), "\n"), byChoice), nil
 		}
-		// gum failed (e.g., no TTY), fall through to numbered list
+		// gum failed (e.g., no TTY), fall through to numbered list.
 	}
 
 	// Fallback: numbered list

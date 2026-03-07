@@ -53,8 +53,8 @@ gh copilot-codespace -c my-codespace-name
 # Connect to multiple codespaces
 gh copilot-codespace -c codespace-1,codespace-2
 
-# Start with no codespaces, then create/connect from the agent
-gh copilot-codespace --name bootstrap-session
+# Start non-interactively with no codespaces, then create/connect from the agent
+gh copilot-codespace --no-codespace --name bootstrap-session
 
 # Name the session for later resume
 gh copilot-codespace --name my-session
@@ -69,7 +69,7 @@ gh copilot-codespace workspaces
 gh copilot-codespace --model claude-sonnet-4.5
 ```
 
-If you launch without `-c/--codespace`, the interactive picker supports selecting multiple codespaces. Press Enter on a blank selection to start with no codespaces connected, then use `list_available_codespaces`, `create_codespace`, or `connect_codespace` from the agent.
+If you launch without `-c/--codespace` or `--no-codespace`, the interactive picker supports selecting multiple codespaces. Press Enter without toggling any codespaces to start with no codespaces connected, or use `--no-codespace` to skip the picker entirely for non-interactive launches. From there, use `list_available_codespaces`, `create_codespace`, or `connect_codespace` from the agent.
 
 ## What gets fetched from the codespace
 

@@ -487,6 +487,104 @@ func TestParseSelectionIndices(t *testing.T) {
 	}
 }
 
+func TestParseLauncherArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		want    launcherOptions
+		wantErr string
+	}{
+		{
+			name: "no codespace mode skips picker",
+			args: []string{"--no-codespace", "--name", "bootstrap", "--model", "claude-sonnet-4.5"},
+			want: launcherOptions{
+				noCodespace: true,
+				sessionName: "bootstrap",
+				copilotArgs: []string{"--model", "claude-sonnet-4.5"},
+			},
+		},
+		{
+			name: "parses existing launcher flags",
+			args: []string{"--local-tools", "-w", "/workspaces/repo", "-c", "cs-1,cs-2", "--theme", "dark"},
+			want: launcherOptions{
+				codespaceNames:  []string{"cs-1", "cs-2"},
+				workdirOverride: "/workspaces/repo",
+				localTools:      true,
+				copilotArgs:     []string{"--theme", "dark"},
+			},
+		},
+		{
+			name: "repeated codespace flags append selections",
+			args: []string{"-c", "cs-1", "--codespace", "cs-2,cs-3"},
+			want: launcherOptions{
+				codespaceNames: []string{"cs-1", "cs-2", "cs-3"},
+			},
+		},
+		{
+			name:    "no-codespace conflicts with explicit codespace",
+			args:    []string{"--no-codespace", "--codespace", "cs-1"},
+			wantErr: "--no-codespace and --codespace are mutually exclusive",
+		},
+		{
+			name:    "no-codespace conflicts with resume",
+			args:    []string{"--no-codespace", "--resume", "saved-session"},
+			wantErr: "--no-codespace and --resume are mutually exclusive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseLauncherArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q", tt.wantErr)
+				}
+				if err.Error() != tt.wantErr {
+					t.Fatalf("got error %q, want %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveSelectedCodespaces(t *testing.T) {
+	alpha := codespace{Name: "alpha", DisplayName: "Alpha", Repository: "owner/alpha", State: "Available"}
+	beta := codespace{Name: "beta", DisplayName: "Beta", Repository: "owner/beta", State: "Available"}
+
+	alphaChoice := "alpha\t🟢 owner/alpha: Alpha [Available]"
+	betaChoice := "beta\t🟢 owner/beta: Beta [Available]"
+	byChoice := map[string]codespace{
+		alphaChoice: alpha,
+		betaChoice:  beta,
+	}
+
+	tests := []struct {
+		name     string
+		selected []string
+		want     []codespace
+	}{
+		{name: "blank means none", selected: []string{""}, want: []codespace{}},
+		{name: "resolves known choices", selected: []string{alphaChoice, betaChoice}, want: []codespace{alpha, beta}},
+		{name: "ignores unknown and duplicates", selected: []string{alphaChoice, "missing", alphaChoice}, want: []codespace{alpha}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveSelectedCodespaces(tt.selected, byChoice)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildMCPConfigWithRegistry(t *testing.T) {
 	reg := registry.New()
 	reg.Register(&registry.ManagedCodespace{
