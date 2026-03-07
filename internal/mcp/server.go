@@ -271,6 +271,10 @@ func bashTool() mcpsdk.Tool {
 					"type":        "string",
 					"description": "Session identifier for async mode. Auto-generated if not provided.",
 				},
+				"cwd": map[string]any{
+					"type":        "string",
+					"description": "Optional working directory for this call. Pass it explicitly for parallel-safe remote_bash usage instead of relying on remote_cd ordering.",
+				},
 			},
 			Required: []string{"command"},
 		},
@@ -290,12 +294,13 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		mode := optionalString(req, "mode")
 		shellId := optionalString(req, "shellId")
+		cwd := optionalString(req, "cwd")
 		if shellId == "" {
 			shellId = fmt.Sprintf("sh-%d", time.Now().UnixMilli())
 		}
 
 		if mode == "async" {
-			if err := c.StartSession(ctx, shellId, command); err != nil {
+			if err := c.StartSession(ctx, shellId, command, cwd); err != nil {
 				return toolError(err.Error()), nil
 			}
 			// Wait briefly and capture initial output
@@ -305,8 +310,8 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		initialWait := optionalFloat(req, "initial_wait", defaultRemoteBashInitialWait)
-		if err := c.StartSession(ctx, shellId, command); err != nil {
-			return runBashSyncFallback(ctx, c, command), nil
+		if err := c.StartSession(ctx, shellId, command, cwd); err != nil {
+			return runBashSyncFallback(ctx, c, command, cwd), nil
 		}
 		time.Sleep(time.Duration(initialWait * float64(time.Second)))
 		output, err := c.ReadSession(ctx, shellId)
@@ -332,8 +337,8 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	}
 }
 
-func runBashSyncFallback(ctx context.Context, c ssh.Executor, command string) *mcpsdk.CallToolResult {
-	stdout, stderr, exitCode, err := c.RunBash(ctx, command)
+func runBashSyncFallback(ctx context.Context, c ssh.Executor, command, cwd string) *mcpsdk.CallToolResult {
+	stdout, stderr, exitCode, err := c.RunBash(ctx, command, cwd)
 	if err != nil {
 		errMsg := err.Error()
 		if ctx.Err() != nil {
@@ -565,11 +570,15 @@ func grepTool() mcpsdk.Tool {
 				},
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory or file to search in (defaults to workspace root)",
+					"description": "Directory or file to search in (defaults to '.' within cwd)",
 				},
 				"glob": map[string]any{
 					"type":        "string",
 					"description": "Glob pattern to filter files (e.g., '*.go', '*.ts')",
+				},
+				"cwd": map[string]any{
+					"type":        "string",
+					"description": "Optional working directory for this call. Pass it explicitly for parallel-safe remote_grep usage instead of relying on remote_cd ordering.",
 				},
 			},
 			Required: []string{"pattern"},
@@ -590,8 +599,9 @@ func grepHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		path := optionalString(req, "path")
 		glob := optionalString(req, "glob")
+		cwd := optionalString(req, "cwd")
 
-		result, err := c.Grep(ctx, pattern, path, glob)
+		result, err := c.Grep(ctx, pattern, path, glob, cwd)
 		if err != nil {
 			return toolError(err.Error()), nil
 		}
@@ -618,7 +628,11 @@ func globTool() mcpsdk.Tool {
 				},
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory to search in (defaults to workspace root)",
+					"description": "Directory to search in (defaults to '.' within cwd)",
+				},
+				"cwd": map[string]any{
+					"type":        "string",
+					"description": "Optional working directory for this call. Pass it explicitly for parallel-safe remote_glob usage instead of relying on remote_cd ordering.",
 				},
 			},
 			Required: []string{"pattern"},
@@ -638,8 +652,9 @@ func globHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		path := optionalString(req, "path")
+		cwd := optionalString(req, "cwd")
 
-		result, err := c.Glob(ctx, pattern, path)
+		result, err := c.Glob(ctx, pattern, path, cwd)
 		if err != nil {
 			return toolError(err.Error()), nil
 		}
@@ -726,7 +741,7 @@ func toolError(text string) *mcpsdk.CallToolResult {
 func cdTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_cd",
-		Description: "Change the working directory on the remote codespace. Affects all subsequent remote_bash, remote_grep, and remote_glob commands. The directory must exist on the codespace.",
+		Description: "Change the default working directory on the remote codespace for later sequential remote_bash, remote_grep, and remote_glob calls that omit cwd. For parallel calls, pass cwd explicitly instead of relying on remote_cd ordering. The directory must exist on the codespace.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -754,7 +769,7 @@ func cdHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		// Validate the directory exists on the codespace
 		quoted := "'" + strings.ReplaceAll(path, "'", "'\"'\"'") + "'"
-		stdout, _, exitCode, execErr := c.RunBash(ctx, fmt.Sprintf("cd %s && pwd", quoted))
+		stdout, _, exitCode, execErr := c.RunBash(ctx, fmt.Sprintf("cd %s && pwd", quoted), c.GetWorkdir())
 		if execErr != nil {
 			return toolError(fmt.Sprintf("failed to change directory: %v", execErr)), nil
 		}
@@ -776,7 +791,7 @@ func cdHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func cwdTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_cwd",
-		Description: "Get the current working directory on the remote codespace.",
+		Description: "Get the current default working directory used by remote_bash, remote_grep, and remote_glob when cwd is not provided.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{

@@ -175,9 +175,9 @@ func createCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.
 		// Checkout branch if specified
 		if branch != "" {
 			sshClient.SetWorkdir(workdir)
-			sshClient.RunBash(ctx, "git fetch origin")
+			sshClient.RunBash(ctx, "git fetch origin", workdir)
 			sshClient.RunBash(ctx, fmt.Sprintf("git checkout %s 2>/dev/null || git checkout -b %s",
-				shellQuote(branch), shellQuote(branch)))
+				shellQuote(branch), shellQuote(branch)), workdir)
 		}
 
 		// Register

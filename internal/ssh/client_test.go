@@ -201,6 +201,26 @@ func TestSetGetWorkdir(t *testing.T) {
 	}
 }
 
+func TestResolveWorkdir(t *testing.T) {
+	c := NewClient("demo")
+	c.SetWorkdir("/workspaces/default")
+
+	if got := c.resolveWorkdir(""); got != "/workspaces/default" {
+		t.Fatalf("resolveWorkdir(\"\") = %q, want %q", got, "/workspaces/default")
+	}
+	if got := c.resolveWorkdir("/workspaces/override"); got != "/workspaces/override" {
+		t.Fatalf("resolveWorkdir(override) = %q, want %q", got, "/workspaces/override")
+	}
+}
+
+func TestWrapCommandInWorkdir(t *testing.T) {
+	got := wrapCommandInWorkdir("pwd", "/workspaces/repo")
+	want := "cd '/workspaces/repo' && pwd"
+	if got != want {
+		t.Fatalf("wrapCommandInWorkdir() = %q, want %q", got, want)
+	}
+}
+
 type fakeExecCall struct {
 	name string
 	args []string
@@ -290,6 +310,78 @@ func TestViewFileRetriesReadOnlyTransportFailure(t *testing.T) {
 		{name: "ssh", args: []string{"-F", "/tmp/ssh-config", "cs.demo", expectedCommand}},
 		{name: "ssh", args: []string{"-F", "/tmp/ssh-config", "-o", "ConnectTimeout=5", "cs.demo", "echo ok"}},
 		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", expectedCommand}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestRunBashUsesExplicitCwd(t *testing.T) {
+	client := NewClient("demo")
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "ok\n"},
+	})
+
+	stdout, stderr, exitCode, err := client.RunBash(context.Background(), "pwd", "/workspaces/repo/app")
+	if err != nil {
+		t.Fatalf("RunBash() error = %v", err)
+	}
+	if stdout != "ok\n" || stderr != "" || exitCode != 0 {
+		t.Fatalf("RunBash() = stdout:%q stderr:%q exit:%d", stdout, stderr, exitCode)
+	}
+
+	wantCalls := []fakeExecCall{
+		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && cd '/workspaces/repo/app' && pwd"}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestGrepUsesExplicitCwd(t *testing.T) {
+	client := NewClient("demo")
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "cmd/main.go:3:match\n"},
+	})
+
+	got, err := client.Grep(context.Background(), "match", "cmd", "*.go", "/workspaces/repo")
+	if err != nil {
+		t.Fatalf("Grep() error = %v", err)
+	}
+	if got != "cmd/main.go:3:match\n" {
+		t.Fatalf("Grep() = %q", got)
+	}
+
+	wantCalls := []fakeExecCall{
+		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && cd '/workspaces/repo' && (rg --color=never -n --glob '*.go' 'match' 'cmd') 2>/dev/null || grep -rn 'match' 'cmd'"}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestGlobUsesExplicitCwd(t *testing.T) {
+	client := NewClient("demo")
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "pkg/foo.go\n"},
+	})
+
+	got, err := client.Glob(context.Background(), "**/*.go", "pkg", "/workspaces/repo")
+	if err != nil {
+		t.Fatalf("Glob() error = %v", err)
+	}
+	if got != "pkg/foo.go\n" {
+		t.Fatalf("Glob() = %q", got)
+	}
+
+	wantCalls := []fakeExecCall{
+		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && cd '/workspaces/repo' && (fd --type f --glob '**/*.go' --exclude .git 'pkg' 2>/dev/null || find 'pkg' -name '*.go' -not -path '*/.git/*' 2>/dev/null) | head -200"}},
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)

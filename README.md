@@ -11,12 +11,12 @@ A single Go binary (`gh-copilot-codespace`) serves four roles:
    - `--additional-mcp-config` — adds itself as the MCP server (plus any remote MCP configs)
 
 2. **MCP server mode** (`gh-copilot-codespace mcp`) — Spawned by copilot, provides 17 remote tools over SSH:
-   - `remote_view`, `remote_edit`, `remote_create` — file operations
-   - `remote_bash` (session-backed fast path + async), `remote_grep`, `remote_glob` — commands & search
-   - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash` — async session management (tmux-based)
-   - `remote_cd`, `remote_cwd` — working directory navigation
-   - `list_codespaces`, `create_codespace`, `connect_codespace`, `delete_codespace` — codespace lifecycle
-   - `open_shell` — open interactive SSH session
+    - `remote_view`, `remote_edit`, `remote_create` — file operations
+    - `remote_bash` (session-backed fast path + async), `remote_grep`, `remote_glob` — commands & search
+    - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash` — async session management (tmux-based)
+    - `remote_cd`, `remote_cwd` — default working directory navigation
+    - `list_codespaces`, `create_codespace`, `connect_codespace`, `delete_codespace` — codespace lifecycle
+    - `open_shell` — open interactive SSH session
 
 3. **Exec agent** (`gh-copilot-codespace exec`) — Deployed to the codespace at startup. Provides structured command execution with workdir/env setup, replacing fragile shell escaping in SSH forwarding.
 
@@ -95,6 +95,8 @@ The launcher fetches all project-level Copilot CLI components in a single SSH ca
 ## Multi-codespace support
 
 When connecting to multiple codespaces, all `remote_*` MCP tools accept an optional `codespace` parameter (the alias). When only one codespace is connected, this parameter is optional.
+
+For `remote_bash`, `remote_grep`, and `remote_glob`, prefer passing `cwd` explicitly when you need predictable behavior across parallel tool calls. `remote_cd` still updates the default cwd for later sequential calls, but it should not be treated as an ordering dependency inside a parallel batch.
 
 The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools. Starting with zero connected codespaces is supported, so you can bootstrap a brand-new session and create the first codespace from inside the agent.
 

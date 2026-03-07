@@ -1029,6 +1029,7 @@ func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Reg
 	sb.WriteString("- Use `list_codespaces` to see connected codespaces.\n")
 	sb.WriteString("- **Local session files** (plan.md, session state): use built-in local tools (view, edit, create)\n")
 	sb.WriteString("- **Shell commands**: use `remote_bash` with the `codespace` parameter\n")
+	sb.WriteString("- For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when you need parallel-safe or targeted execution; `remote_cd` only changes the default cwd for later sequential calls.\n")
 	sb.WriteString("- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent\n\n")
 
 	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
@@ -1401,13 +1402,14 @@ Use these remote tools to explore the codespace:
 - **remote_glob** — find files by name patterns
 - **remote_view** — read file contents with line numbers
 - **remote_bash** — run commands (e.g., find, wc, head, git log)
-- **remote_cwd** — check current working directory
+- **remote_cwd** — check the default working directory used when cwd is omitted
 
 ## Guidelines
 
 - Be concise — return focused answers under 300 words
 - Search broadly first, then narrow down
 - Use remote_grep for content search, remote_glob for file discovery
+- Pass cwd explicitly on remote_bash/remote_grep/remote_glob when you need predictable parallel calls instead of relying on remote_cd ordering
 - Read only the relevant portions of files (use view_range)
 - When exploring structure, use remote_bash with find or ls
 `

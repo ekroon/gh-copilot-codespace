@@ -217,33 +217,43 @@ func searchSubstring(s, substr string) bool {
 // --- Mock Executor ---
 
 type mockExecutor struct {
-	viewFileResult     string
-	viewFileErr        error
-	editFileErr        error
-	createFileErr      error
-	runBashCalls       int
-	runBashStdout      string
-	runBashStderr      string
-	runBashExit        int
-	runBashErr         error
-	grepResult         string
-	grepErr            error
-	globResult         string
-	globErr            error
-	startSessionCalls  int
-	lastSessionID      string
-	lastCommand        string
-	startSessionErr    error
-	writeSessionErr    error
-	readSessionCalls   int
-	readSessionResults []string
-	readSessionResult  string
-	readSessionErr     error
-	stopSessionCalls   int
-	stopSessionErr     error
-	listSessionsResult string
-	listSessionsErr    error
-	workdir            string
+	viewFileResult      string
+	viewFileErr         error
+	editFileErr         error
+	createFileErr       error
+	runBashCalls        int
+	lastRunBashCommand  string
+	lastRunBashCwd      string
+	runBashStdout       string
+	runBashStderr       string
+	runBashExit         int
+	runBashErr          error
+	lastGrepPattern     string
+	lastGrepPath        string
+	lastGrepGlob        string
+	lastGrepCwd         string
+	grepResult          string
+	grepErr             error
+	lastGlobPattern     string
+	lastGlobPath        string
+	lastGlobCwd         string
+	globResult          string
+	globErr             error
+	startSessionCalls   int
+	lastSessionID       string
+	lastCommand         string
+	lastStartSessionCwd string
+	startSessionErr     error
+	writeSessionErr     error
+	readSessionCalls    int
+	readSessionResults  []string
+	readSessionResult   string
+	readSessionErr      error
+	stopSessionCalls    int
+	stopSessionErr      error
+	listSessionsResult  string
+	listSessionsErr     error
+	workdir             string
 }
 
 func (m *mockExecutor) ViewFile(_ context.Context, _ string, _ []int) (string, error) {
@@ -258,23 +268,33 @@ func (m *mockExecutor) CreateFile(_ context.Context, _, _ string) error {
 	return m.createFileErr
 }
 
-func (m *mockExecutor) RunBash(_ context.Context, _ string) (string, string, int, error) {
+func (m *mockExecutor) RunBash(_ context.Context, command, cwd string) (string, string, int, error) {
 	m.runBashCalls++
+	m.lastRunBashCommand = command
+	m.lastRunBashCwd = cwd
 	return m.runBashStdout, m.runBashStderr, m.runBashExit, m.runBashErr
 }
 
-func (m *mockExecutor) Grep(_ context.Context, _, _, _ string) (string, error) {
+func (m *mockExecutor) Grep(_ context.Context, pattern, path, glob, cwd string) (string, error) {
+	m.lastGrepPattern = pattern
+	m.lastGrepPath = path
+	m.lastGrepGlob = glob
+	m.lastGrepCwd = cwd
 	return m.grepResult, m.grepErr
 }
 
-func (m *mockExecutor) Glob(_ context.Context, _, _ string) (string, error) {
+func (m *mockExecutor) Glob(_ context.Context, pattern, path, cwd string) (string, error) {
+	m.lastGlobPattern = pattern
+	m.lastGlobPath = path
+	m.lastGlobCwd = cwd
 	return m.globResult, m.globErr
 }
 
-func (m *mockExecutor) StartSession(_ context.Context, sessionID, command string) error {
+func (m *mockExecutor) StartSession(_ context.Context, sessionID, command, cwd string) error {
 	m.startSessionCalls++
 	m.lastSessionID = sessionID
 	m.lastCommand = command
+	m.lastStartSessionCwd = cwd
 	return m.startSessionErr
 }
 
@@ -503,6 +523,9 @@ func TestBashHandler_DefaultReturnsCompletedSessionOutput(t *testing.T) {
 	if mock.stopSessionCalls != 1 {
 		t.Fatalf("stopSessionCalls = %d, want 1", mock.stopSessionCalls)
 	}
+	if mock.lastStartSessionCwd != "" {
+		t.Fatalf("lastStartSessionCwd = %q, want empty fallback cwd", mock.lastStartSessionCwd)
+	}
 	if mock.runBashCalls != 0 {
 		t.Fatalf("runBashCalls = %d, want 0", mock.runBashCalls)
 	}
@@ -593,6 +616,7 @@ func TestBashHandler_AsyncStartsSession(t *testing.T) {
 		"command": "npm run dev",
 		"mode":    "async",
 		"shellId": "s4",
+		"cwd":     "/workspaces/repo/web",
 	}))
 	if err != nil {
 		t.Fatalf("unexpected Go error: %v", err)
@@ -606,6 +630,9 @@ func TestBashHandler_AsyncStartsSession(t *testing.T) {
 	}
 	if mock.stopSessionCalls != 0 {
 		t.Fatalf("stopSessionCalls = %d, want 0", mock.stopSessionCalls)
+	}
+	if mock.lastStartSessionCwd != "/workspaces/repo/web" {
+		t.Fatalf("lastStartSessionCwd = %q, want %q", mock.lastStartSessionCwd, "/workspaces/repo/web")
 	}
 }
 
@@ -657,6 +684,27 @@ func TestGrepHandler(t *testing.T) {
 	}
 }
 
+func TestGrepHandler_PassesExplicitCwd(t *testing.T) {
+	mock := &mockExecutor{grepResult: "cmd/main.go:12:match\n"}
+
+	handler := grepHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"pattern": "match",
+		"path":    "cmd",
+		"glob":    "*.go",
+		"cwd":     "/workspaces/repo",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if mock.lastGrepPattern != "match" || mock.lastGrepPath != "cmd" || mock.lastGrepGlob != "*.go" || mock.lastGrepCwd != "/workspaces/repo" {
+		t.Fatalf("grep args = pattern:%q path:%q glob:%q cwd:%q", mock.lastGrepPattern, mock.lastGrepPath, mock.lastGrepGlob, mock.lastGrepCwd)
+	}
+}
+
 func TestGlobHandler(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -702,6 +750,26 @@ func TestGlobHandler(t *testing.T) {
 				t.Errorf("result text %q does not contain %q", resultText(res), tt.wantText)
 			}
 		})
+	}
+}
+
+func TestGlobHandler_PassesExplicitCwd(t *testing.T) {
+	mock := &mockExecutor{globResult: "pkg/foo.go\n"}
+
+	handler := globHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"pattern": "**/*.go",
+		"path":    "pkg",
+		"cwd":     "/workspaces/repo",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if mock.lastGlobPattern != "**/*.go" || mock.lastGlobPath != "pkg" || mock.lastGlobCwd != "/workspaces/repo" {
+		t.Fatalf("glob args = pattern:%q path:%q cwd:%q", mock.lastGlobPattern, mock.lastGlobPath, mock.lastGlobCwd)
 	}
 }
 
@@ -849,6 +917,29 @@ func TestCdHandler(t *testing.T) {
 				t.Errorf("expected workdir %q, got %q", tt.wantDir, tt.mock.workdir)
 			}
 		})
+	}
+}
+
+func TestCdHandler_ValidatesRelativePathAgainstCurrentDefaultCwd(t *testing.T) {
+	mock := &mockExecutor{
+		workdir:       "/workspaces/repo",
+		runBashStdout: "/workspaces/repo/src\n",
+		runBashExit:   0,
+	}
+
+	handler := cdHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{"path": "src"}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if mock.lastRunBashCwd != "/workspaces/repo" {
+		t.Fatalf("lastRunBashCwd = %q, want %q", mock.lastRunBashCwd, "/workspaces/repo")
+	}
+	if mock.workdir != "/workspaces/repo/src" {
+		t.Fatalf("workdir = %q, want %q", mock.workdir, "/workspaces/repo/src")
 	}
 }
 

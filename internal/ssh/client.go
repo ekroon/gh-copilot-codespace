@@ -32,10 +32,10 @@ type Executor interface {
 	ViewFile(ctx context.Context, path string, viewRange []int) (string, error)
 	EditFile(ctx context.Context, path, oldStr, newStr string) error
 	CreateFile(ctx context.Context, path, content string) error
-	RunBash(ctx context.Context, command string) (stdout, stderr string, exitCode int, err error)
-	Grep(ctx context.Context, pattern, path, glob string) (string, error)
-	Glob(ctx context.Context, pattern, path string) (string, error)
-	StartSession(ctx context.Context, sessionID, command string) error
+	RunBash(ctx context.Context, command, cwd string) (stdout, stderr string, exitCode int, err error)
+	Grep(ctx context.Context, pattern, path, glob, cwd string) (string, error)
+	Glob(ctx context.Context, pattern, path, cwd string) (string, error)
+	StartSession(ctx context.Context, sessionID, command, cwd string) error
 	WriteSession(ctx context.Context, sessionID, input string) error
 	ReadSession(ctx context.Context, sessionID string) (string, error)
 	StopSession(ctx context.Context, sessionID string) error
@@ -59,14 +59,15 @@ func (c *Client) command(ctx context.Context, name string, args ...string) *exec
 	return exec.CommandContext(ctx, name, args...)
 }
 
-// SetWorkdir sets the working directory used by RunBash and Glob.
+// SetWorkdir sets the default working directory used when a command/search
+// call does not provide an explicit cwd override.
 func (c *Client) SetWorkdir(dir string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.workdir = dir
 }
 
-// GetWorkdir returns the current working directory. Falls back to
+// GetWorkdir returns the default working directory. Falls back to
 // CODESPACE_WORKDIR env var, then "/workspaces".
 func (c *Client) GetWorkdir() string {
 	c.mu.Lock()
@@ -342,6 +343,17 @@ func (c *Client) execReadOnly(ctx context.Context, command string) (stdout strin
 	return c.runRemoteCommand(ctx, wrapped, false)
 }
 
+func (c *Client) resolveWorkdir(cwd string) string {
+	if cwd != "" {
+		return cwd
+	}
+	return c.GetWorkdir()
+}
+
+func wrapCommandInWorkdir(command, cwd string) string {
+	return fmt.Sprintf("cd %s && %s", shellQuote(cwd), command)
+}
+
 // ViewFile reads a file with line numbers. If viewRange is provided [start, end], only those lines are shown.
 func (c *Client) ViewFile(ctx context.Context, path string, viewRange []int) (string, error) {
 	var cmd string
@@ -427,15 +439,12 @@ func (c *Client) CreateFile(ctx context.Context, path, content string) error {
 }
 
 // RunBash executes a bash command on the codespace.
-func (c *Client) RunBash(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
-	workdir := c.GetWorkdir()
-
-	wrapped := fmt.Sprintf("cd %s && %s", shellQuote(workdir), command)
-	return c.Exec(ctx, wrapped)
+func (c *Client) RunBash(ctx context.Context, command, cwd string) (stdout string, stderr string, exitCode int, err error) {
+	return c.Exec(ctx, wrapCommandInWorkdir(command, c.resolveWorkdir(cwd)))
 }
 
 // Grep searches for a pattern in files on the codespace.
-func (c *Client) Grep(ctx context.Context, pattern, path, globPattern string) (string, error) {
+func (c *Client) Grep(ctx context.Context, pattern, path, globPattern, cwd string) (string, error) {
 	var args []string
 	args = append(args, "rg", "--color=never", "-n")
 
@@ -457,7 +466,7 @@ func (c *Client) Grep(ctx context.Context, pattern, path, globPattern string) (s
 	cmd = fmt.Sprintf("(%s) 2>/dev/null || grep -rn %s %s",
 		cmd, shellQuote(pattern), shellQuote(searchPath))
 
-	stdout, _, exitCode, err := c.execReadOnly(ctx, cmd)
+	stdout, _, exitCode, err := c.execReadOnly(ctx, wrapCommandInWorkdir(cmd, c.resolveWorkdir(cwd)))
 	if err != nil {
 		return "", fmt.Errorf("grep: %w", err)
 	}
@@ -470,19 +479,19 @@ func (c *Client) Grep(ctx context.Context, pattern, path, globPattern string) (s
 
 // Glob finds files matching a glob pattern on the codespace.
 // Supports standard glob patterns like **/*.go, *.ts, src/**/*.test.js.
-func (c *Client) Glob(ctx context.Context, pattern, path string) (string, error) {
+func (c *Client) Glob(ctx context.Context, pattern, path, cwd string) (string, error) {
 	searchPath := path
 	if searchPath == "" {
-		searchPath = c.GetWorkdir()
+		searchPath = "."
 	}
 
 	// Use fd if available (supports glob natively), fallback to find with -name
 	// Extract the filename pattern from globs like **/*.go → *.go for find -name
 	cmd := fmt.Sprintf(
-		"(cd %s && fd --type f --glob %s --exclude .git 2>/dev/null || find . -name %s -not -path '*/.git/*' 2>/dev/null) | head -200",
-		shellQuote(searchPath), shellQuote(pattern), shellQuote(globToFindName(pattern)))
+		"(fd --type f --glob %s --exclude .git %s 2>/dev/null || find %s -name %s -not -path '*/.git/*' 2>/dev/null) | head -200",
+		shellQuote(pattern), shellQuote(searchPath), shellQuote(searchPath), shellQuote(globToFindName(pattern)))
 
-	stdout, _, exitCode, err := c.execReadOnly(ctx, cmd)
+	stdout, _, exitCode, err := c.execReadOnly(ctx, wrapCommandInWorkdir(cmd, c.resolveWorkdir(cwd)))
 	if err != nil {
 		return "", fmt.Errorf("glob: %w", err)
 	}
@@ -525,17 +534,19 @@ func (c *Client) execTmux(ctx context.Context, tmuxCmd string) (string, string, 
 
 // StartSession creates a named tmux session running the given command on the codespace.
 // Uses remain-on-exit so the pane stays readable even after the command exits.
-func (c *Client) StartSession(ctx context.Context, sessionID, command string) error {
+func (c *Client) StartSession(ctx context.Context, sessionID, command, cwd string) error {
 	name := tmuxSessionName(sessionID)
 
 	if err := c.ensureTmux(ctx); err != nil {
 		return err
 	}
 
+	wrappedCommand := wrapCommandInWorkdir(command, c.resolveWorkdir(cwd))
+
 	// Create session with remain-on-exit so we can read output after command finishes
 	cmd := fmt.Sprintf(
 		"tmux new-session -d -s %s -x 200 -y 50 %s && tmux set-option -t %s remain-on-exit on",
-		shellQuote(name), shellQuote(command), shellQuote(name))
+		shellQuote(name), shellQuote(wrappedCommand), shellQuote(name))
 
 	_, stderr, exitCode, err := c.execTmux(ctx, cmd)
 	if err != nil {
