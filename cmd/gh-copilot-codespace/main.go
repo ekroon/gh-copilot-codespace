@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/delegate"
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
@@ -42,6 +43,7 @@ Flags:
       --name SESSION     Name for the local workspace session
       --resume SESSION   Re-attach to a previous workspace session
       --local-tools      Keep all local tools (bash, grep, glob) enabled alongside remote_* tools
+      --headless-delegate Enable the opt-in headless delegate extra (delegate_task/read_delegate_task/cancel_delegate_task)
 
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
@@ -128,7 +130,12 @@ func runMCPServer() {
 		}
 	}
 
-	mcpServer := mcp.NewServer(reg)
+	var cfg mcp.LifecycleConfig
+	if headlessDelegateEnabled() {
+		cfg.DelegateManager = delegate.NewManager(delegate.NewHeadlessRunner())
+	}
+
+	mcpServer := mcp.NewServer(reg, cfg)
 
 	log.SetOutput(os.Stderr)
 	log.Printf("codespace-mcp: starting with %d codespace(s)", reg.Len())
@@ -186,14 +193,19 @@ func registryFromEntries(ctx context.Context, entries []registryEntry, build fun
 	return reg, nil
 }
 
+func headlessDelegateEnabled() bool {
+	return os.Getenv("CODESPACE_ENABLE_HEADLESS_DELEGATE") == "1"
+}
+
 type launcherOptions struct {
-	codespaceNames  []string
-	noCodespace     bool
-	workdirOverride string
-	sessionName     string
-	resumeSession   string
-	localTools      bool
-	copilotArgs     []string
+	codespaceNames   []string
+	noCodespace      bool
+	workdirOverride  string
+	sessionName      string
+	resumeSession    string
+	localTools       bool
+	headlessDelegate bool
+	copilotArgs      []string
 }
 
 func parseLauncherArgs(args []string) (launcherOptions, error) {
@@ -202,6 +214,8 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 		switch {
 		case args[i] == "--local-tools":
 			opts.localTools = true
+		case args[i] == "--headless-delegate":
+			opts.headlessDelegate = true
 		case args[i] == "--no-codespace":
 			opts.noCodespace = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
@@ -245,7 +259,7 @@ func runLauncher(args []string) error {
 
 	// Handle --resume: load workspace and reconnect to codespaces
 	if opts.resumeSession != "" {
-		return runResume(opts.resumeSession, opts.copilotArgs)
+		return runResume(opts.resumeSession, opts.copilotArgs, opts.headlessDelegate)
 	}
 
 	// The binary serves as both launcher and MCP server
@@ -351,16 +365,16 @@ func runLauncher(args []string) error {
 
 		// Prepend codespace context to copilot-instructions.md
 		if reg.Len() > 1 {
-			writeMultiCodespaceInstructionsPreamble(instructionsDir, reg)
+			writeMultiCodespaceInstructionsPreamble(instructionsDir, reg, opts.headlessDelegate)
 		} else {
-			writeCodespaceInstructionsPreamble(instructionsDir, firstWorkdir)
+			writeCodespaceInstructionsPreamble(instructionsDir, firstWorkdir, opts.headlessDelegate)
 		}
 	} else {
 		if wsErr != nil {
 			return fmt.Errorf("creating workspace: %w", wsErr)
 		}
 		instructionsDir = ws.Dir
-		writeZeroCodespaceInstructionsPreamble(instructionsDir)
+		writeZeroCodespaceInstructionsPreamble(instructionsDir, opts.headlessDelegate)
 		fmt.Println("No codespaces selected. Start with create_codespace or connect_codespace from the agent.")
 	}
 
@@ -384,6 +398,9 @@ func runLauncher(args []string) error {
 
 	// Generate remote-explorer custom agent for codespace file exploration
 	generateRemoteExplorerAgent(instructionsDir)
+	if opts.headlessDelegate {
+		generateRemoteDelegateAgent(instructionsDir)
+	}
 
 	// Change to the instructions dir so copilot finds the instruction files
 	if err := os.Chdir(instructionsDir); err != nil {
@@ -391,7 +408,7 @@ func runLauncher(args []string) error {
 	}
 
 	// Build MCP config with registry serialization for multi-CS support
-	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers)
+	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers, opts.headlessDelegate)
 
 	// Excluded tools
 	var excludedTools []string
@@ -836,7 +853,7 @@ func parseMCPConfigJSON(content []byte) map[string]any {
 // writeCodespaceInstructionsPreamble prepends a codespace-context section to the
 // copilot-instructions.md in the mirror dir. If the file doesn't exist, it creates it.
 // This tells the agent how to route between local and remote tools.
-func writeCodespaceInstructionsPreamble(mirrorDir, workdir string) {
+func writeCodespaceInstructionsPreamble(mirrorDir, workdir string, headlessDelegate bool) {
 	preamble := fmt.Sprintf(`# Codespace Remote Development
 
 You are working on a remote GitHub Codespace. Source code lives on the codespace at %s, NOT locally.
@@ -849,6 +866,15 @@ You are working on a remote GitHub Codespace. Source code lives on the codespace
 - **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent (the built-in explore agent cannot access remote files)
 
 `, workdir)
+	if headlessDelegate {
+		preamble += `## Delegate lane
+
+- Use ` + "`delegate_task`" + ` to start an autonomous remote Copilot worker on the codespace.
+- Use ` + "`read_delegate_task`" + ` and ` + "`cancel_delegate_task`" + ` to inspect or stop delegate runs.
+- Delegate to @remote-delegate when you want a high-level remote worker instead of the direct remote_* tool lane.
+
+`
+	}
 
 	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
 	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
@@ -924,17 +950,22 @@ func ensureTrustedFolder(dir string) error {
 	return os.WriteFile(configPath, out, 0o644)
 }
 
-func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers map[string]any, remoteBinary string) string {
+func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers map[string]any, remoteBinary string, headlessDelegate bool) string {
+	env := map[string]string{
+		"CODESPACE_NAME":    codespaceName,
+		"CODESPACE_WORKDIR": workdir,
+	}
+	if headlessDelegate {
+		env["CODESPACE_ENABLE_HEADLESS_DELEGATE"] = "1"
+	}
+
 	servers := map[string]any{
 		"codespace": map[string]any{
 			"type":    "local",
 			"command": selfBinary,
 			"args":    []string{"mcp"},
-			"env": map[string]string{
-				"CODESPACE_NAME":    codespaceName,
-				"CODESPACE_WORKDIR": workdir,
-			},
-			"tools": []string{"*"},
+			"env":     env,
+			"tools":   []string{"*"},
 		},
 	}
 
@@ -960,7 +991,7 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 
 // buildMCPConfigWithRegistry creates the MCP config JSON using the full registry.
 // Uses CODESPACE_REGISTRY env var (JSON array) for zero-, single-, or multi-codespace support.
-func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any) string {
+func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any, headlessDelegate bool) string {
 	// Serialize registry entries for the MCP server process
 	var entries []registryEntry
 	for _, cs := range reg.All() {
@@ -973,16 +1004,20 @@ func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remot
 		})
 	}
 	registryJSON, _ := json.Marshal(entries)
+	env := map[string]string{
+		"CODESPACE_REGISTRY": string(registryJSON),
+	}
+	if headlessDelegate {
+		env["CODESPACE_ENABLE_HEADLESS_DELEGATE"] = "1"
+	}
 
 	servers := map[string]any{
 		"codespace": map[string]any{
 			"type":    "local",
 			"command": selfBinary,
 			"args":    []string{"mcp"},
-			"env": map[string]string{
-				"CODESPACE_REGISTRY": string(registryJSON),
-			},
-			"tools": []string{"*"},
+			"env":     env,
+			"tools":   []string{"*"},
 		},
 	}
 
@@ -1010,7 +1045,7 @@ func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remot
 }
 
 // writeMultiCodespaceInstructionsPreamble writes a preamble listing all connected codespaces.
-func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Registry) {
+func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Registry, headlessDelegate bool) {
 	var sb strings.Builder
 	sb.WriteString("# Multi-Codespace Remote Development\n\n")
 	sb.WriteString("You are connected to multiple remote GitHub Codespaces. Source code lives on the codespaces, NOT locally.\n\n")
@@ -1031,6 +1066,12 @@ func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Reg
 	sb.WriteString("- **Shell commands**: use `remote_bash` with the `codespace` parameter\n")
 	sb.WriteString("- For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when you need parallel-safe or targeted execution; `remote_cd` only changes the default cwd for later sequential calls.\n")
 	sb.WriteString("- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent\n\n")
+	if headlessDelegate {
+		sb.WriteString("## Delegate lane\n\n")
+		sb.WriteString("- Use `delegate_task` for longer autonomous work on a selected codespace.\n")
+		sb.WriteString("- Use `read_delegate_task` and `cancel_delegate_task` to inspect or stop a delegate run.\n")
+		sb.WriteString("- Delegate to @remote-delegate when you want a remote Copilot worker to plan and execute work on the codespace.\n\n")
+	}
 
 	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
 	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
@@ -1047,7 +1088,7 @@ func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Reg
 
 // writeZeroCodespaceInstructionsPreamble bootstraps a local session before any
 // codespace has been connected, so the agent knows to use lifecycle tools first.
-func writeZeroCodespaceInstructionsPreamble(mirrorDir string) {
+func writeZeroCodespaceInstructionsPreamble(mirrorDir string, headlessDelegate bool) {
 	preamble := `# Codespace Lifecycle Session
 
 You are not connected to any remote GitHub Codespaces yet, so project source code is not available locally.
@@ -1061,6 +1102,14 @@ You are not connected to any remote GitHub Codespaces yet, so project source cod
 - **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create).
 
 `
+	if headlessDelegate {
+		preamble += `## Optional delegate lane
+
+- After a codespace is connected, use ` + "`delegate_task`" + ` for longer autonomous remote Copilot work.
+- Use ` + "`read_delegate_task`" + ` and ` + "`cancel_delegate_task`" + ` to inspect or stop delegate runs.
+
+`
+	}
 
 	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
 	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
@@ -1417,8 +1466,46 @@ Use these remote tools to explore the codespace:
 	os.WriteFile(filepath.Join(agentsDir, "remote-explorer.agent.md"), []byte(agent), 0o644)
 }
 
+func generateRemoteDelegateAgent(mirrorDir string) {
+	agentsDir := filepath.Join(mirrorDir, ".github", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		return
+	}
+
+	agent := `---
+name: remote-delegate
+description: >-
+  Run longer autonomous tasks on a remote codespace via the delegate_task tool family.
+  Use this agent when you want a remote Copilot worker to plan and execute work with less
+  frontend context churn than direct step-by-step tool use.
+model: claude-sonnet-4.5
+tools:
+  - codespace/*
+  - read
+  - search
+---
+
+You orchestrate autonomous work on remote GitHub Codespaces.
+
+## Workflow
+
+1. Use list_codespaces to confirm the target alias when more than one codespace is connected.
+2. Start the remote worker with delegate_task.
+3. Poll progress with read_delegate_task.
+4. Cancel with cancel_delegate_task if the task is clearly going in the wrong direction.
+
+## Guidelines
+
+- Prefer delegate_task for multi-step implementation or review work that should stay mostly remote.
+- Keep prompts explicit about codespace, cwd, and expected outcome.
+- Use direct remote_* tools when you need precise manual control or small surgical edits.
+`
+
+	os.WriteFile(filepath.Join(agentsDir, "remote-delegate.agent.md"), []byte(agent), 0o644)
+}
+
 // runResume loads a workspace session and reconnects to its codespaces.
-func runResume(sessionName string, copilotArgs []string) error {
+func runResume(sessionName string, copilotArgs []string, headlessDelegate bool) error {
 	ws, err := workspace.Load(sessionName)
 	if err != nil {
 		return fmt.Errorf("loading workspace %q: %w", sessionName, err)
@@ -1478,12 +1565,12 @@ func runResume(sessionName string, copilotArgs []string) error {
 		fetchInstructionFiles(primary.Executor.(*ssh.Client), primary.Name, primary.Workdir, remoteBinary)
 
 		if reg.Len() > 1 {
-			writeMultiCodespaceInstructionsPreamble(instructionsDir, reg)
+			writeMultiCodespaceInstructionsPreamble(instructionsDir, reg, headlessDelegate)
 		} else {
-			writeCodespaceInstructionsPreamble(instructionsDir, primary.Workdir)
+			writeCodespaceInstructionsPreamble(instructionsDir, primary.Workdir, headlessDelegate)
 		}
 	} else {
-		writeZeroCodespaceInstructionsPreamble(instructionsDir)
+		writeZeroCodespaceInstructionsPreamble(instructionsDir, headlessDelegate)
 	}
 
 	if err := ensureTrustedFolder(instructionsDir); err != nil {
@@ -1491,12 +1578,15 @@ func runResume(sessionName string, copilotArgs []string) error {
 	}
 
 	generateRemoteExplorerAgent(instructionsDir)
+	if headlessDelegate {
+		generateRemoteDelegateAgent(instructionsDir)
+	}
 
 	if err := os.Chdir(instructionsDir); err != nil {
 		return fmt.Errorf("changing to workspace dir: %w", err)
 	}
 
-	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil)
+	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil, headlessDelegate)
 
 	excludedTools := []string{
 		"bash", "write_bash", "read_bash",

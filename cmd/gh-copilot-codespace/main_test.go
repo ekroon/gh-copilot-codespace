@@ -14,7 +14,7 @@ import (
 )
 
 func TestBuildMCPConfig(t *testing.T) {
-	result := buildMCPConfig("/usr/local/bin/self", "my-codespace", "/workspaces/repo", nil, "")
+	result := buildMCPConfig("/usr/local/bin/self", "my-codespace", "/workspaces/repo", nil, "", false)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -51,6 +51,23 @@ func TestBuildMCPConfig(t *testing.T) {
 	}
 }
 
+func TestBuildMCPConfig_HeadlessDelegate(t *testing.T) {
+	result := buildMCPConfig("/usr/local/bin/self", "my-codespace", "/workspaces/repo", nil, "", true)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("buildMCPConfig returned invalid JSON: %v", err)
+	}
+
+	servers := parsed["mcpServers"].(map[string]any)
+	cs := servers["codespace"].(map[string]any)
+	env := cs["env"].(map[string]any)
+
+	if got := env["CODESPACE_ENABLE_HEADLESS_DELEGATE"]; got != "1" {
+		t.Fatalf("CODESPACE_ENABLE_HEADLESS_DELEGATE = %v, want 1", got)
+	}
+}
+
 func TestBuildMCPConfigWithRemoteServers(t *testing.T) {
 	remoteMCP := map[string]any{
 		"my-tool": map[string]any{
@@ -60,7 +77,7 @@ func TestBuildMCPConfigWithRemoteServers(t *testing.T) {
 		},
 	}
 
-	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "")
+	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "", false)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -87,7 +104,7 @@ func TestBuildMCPConfigRemoteCannotOverrideCodespace(t *testing.T) {
 		},
 	}
 
-	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "")
+	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "", false)
 
 	var parsed map[string]any
 	json.Unmarshal([]byte(result), &parsed)
@@ -613,7 +630,7 @@ func TestBuildMCPConfigWithRegistry(t *testing.T) {
 		Workdir:    "/workspaces/github",
 	})
 
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, false)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -652,7 +669,7 @@ func TestBuildMCPConfigWithRegistry(t *testing.T) {
 func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
 	reg := registry.New()
 
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, false)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -677,10 +694,29 @@ func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
 	}
 }
 
+func TestBuildMCPConfigWithRegistry_HeadlessDelegate(t *testing.T) {
+	reg := registry.New()
+
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, true)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	servers := parsed["mcpServers"].(map[string]any)
+	cs := servers["codespace"].(map[string]any)
+	env := cs["env"].(map[string]any)
+
+	if got := env["CODESPACE_ENABLE_HEADLESS_DELEGATE"]; got != "1" {
+		t.Fatalf("CODESPACE_ENABLE_HEADLESS_DELEGATE = %v, want 1", got)
+	}
+}
+
 func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
 	dir := t.TempDir()
 
-	writeZeroCodespaceInstructionsPreamble(dir)
+	writeZeroCodespaceInstructionsPreamble(dir, false)
 
 	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
 	if err != nil {
@@ -690,6 +726,41 @@ func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
 	for _, want := range []string{"list_available_codespaces", "create_codespace", "connect_codespace", "remote_*"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected %q in preamble, got %q", want, text)
+		}
+	}
+}
+
+func TestWriteCodespaceInstructionsPreamble_HeadlessDelegate(t *testing.T) {
+	dir := t.TempDir()
+
+	writeCodespaceInstructionsPreamble(dir, "/workspaces/repo", true)
+
+	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
+	if err != nil {
+		t.Fatalf("reading instructions: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{"delegate_task", "read_delegate_task", "@remote-delegate"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in preamble, got %q", want, text)
+		}
+	}
+}
+
+func TestGenerateRemoteDelegateAgent(t *testing.T) {
+	dir := t.TempDir()
+
+	generateRemoteDelegateAgent(dir)
+
+	data, err := os.ReadFile(filepath.Join(dir, ".github", "agents", "remote-delegate.agent.md"))
+	if err != nil {
+		t.Fatalf("reading agent: %v", err)
+	}
+
+	text := string(data)
+	for _, want := range []string{"delegate_task", "read_delegate_task", "cancel_delegate_task"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in agent, got %q", want, text)
 		}
 	}
 }

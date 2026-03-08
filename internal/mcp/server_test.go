@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/delegate"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 )
@@ -353,6 +354,35 @@ func testReg(mock *mockExecutor) *registry.Registry {
 		Executor: mock,
 	})
 	return reg
+}
+
+type fakeTaskManager struct {
+	lastStartOptions delegate.StartOptions
+	startTaskID      string
+	startErr         error
+	readSnapshot     delegate.TaskSnapshot
+	readErr          error
+	readTaskID       string
+	cancelTaskID     string
+	cancelErr        error
+}
+
+func (f *fakeTaskManager) StartTask(opts delegate.StartOptions) (string, error) {
+	f.lastStartOptions = opts
+	if f.startTaskID == "" {
+		f.startTaskID = "delegate-1"
+	}
+	return f.startTaskID, f.startErr
+}
+
+func (f *fakeTaskManager) GetTask(id string) (delegate.TaskSnapshot, error) {
+	f.readTaskID = id
+	return f.readSnapshot, f.readErr
+}
+
+func (f *fakeTaskManager) CancelTask(id string) error {
+	f.cancelTaskID = id
+	return f.cancelErr
 }
 
 // --- Handler Tests ---
@@ -1001,6 +1031,86 @@ func TestListCodespacesHandler_Empty(t *testing.T) {
 	res, _ := handler(context.Background(), makeReq(map[string]any{}))
 	if !strings.Contains(resultText(res), "No codespaces") {
 		t.Errorf("expected 'No codespaces' message, got %q", resultText(res))
+	}
+}
+
+func TestDelegateTaskHandler(t *testing.T) {
+	mock := &mockExecutor{}
+	reg := testReg(mock)
+	cs, err := reg.Resolve("test")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	cs.Workdir = "/workspaces/repo"
+	cs.ExecAgent = "/tmp/gh-copilot-codespace"
+
+	manager := &fakeTaskManager{startTaskID: "delegate-42"}
+	handler := delegateTaskHandler(reg, manager)
+
+	result, err := handler(context.Background(), makeReq(map[string]any{
+		"codespace": "test",
+		"prompt":    "Implement the feature",
+		"cwd":       "/workspaces/repo/subdir",
+		"model":     "gpt-5",
+	}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %s", resultText(result))
+	}
+	if manager.lastStartOptions.CodespaceName != "test-cs" {
+		t.Fatalf("codespace = %q, want test-cs", manager.lastStartOptions.CodespaceName)
+	}
+	if manager.lastStartOptions.Cwd != "/workspaces/repo/subdir" {
+		t.Fatalf("cwd = %q", manager.lastStartOptions.Cwd)
+	}
+	if manager.lastStartOptions.ExecAgent != "/tmp/gh-copilot-codespace" {
+		t.Fatalf("exec agent = %q", manager.lastStartOptions.ExecAgent)
+	}
+	if !strings.Contains(resultText(result), "delegate-42") {
+		t.Fatalf("result text = %q", resultText(result))
+	}
+}
+
+func TestReadDelegateTaskHandler(t *testing.T) {
+	manager := &fakeTaskManager{
+		readSnapshot: delegate.TaskSnapshot{
+			ID:            "delegate-7",
+			Status:        delegate.StatusCompleted,
+			CodespaceName: "test-cs",
+			Cwd:           "/workspaces/repo",
+			Result:        "Done.",
+			Log:           "Created delegate session.",
+		},
+	}
+	handler := readDelegateTaskHandler(manager)
+
+	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": "delegate-7"}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	text := resultText(result)
+	for _, want := range []string{"Task ID: delegate-7", "Status: completed", "Result:", "Done."} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in %q", want, text)
+		}
+	}
+}
+
+func TestCancelDelegateTaskHandler(t *testing.T) {
+	manager := &fakeTaskManager{}
+	handler := cancelDelegateTaskHandler(manager)
+
+	result, err := handler(context.Background(), makeReq(map[string]any{"task_id": "delegate-9"}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %s", resultText(result))
+	}
+	if manager.cancelTaskID != "delegate-9" {
+		t.Fatalf("cancel task id = %q, want delegate-9", manager.cancelTaskID)
 	}
 }
 

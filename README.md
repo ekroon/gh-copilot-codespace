@@ -1,6 +1,6 @@
 # gh-copilot-codespace
 
-Launch Copilot CLI with all file/bash operations executing on remote GitHub Codespace(s) via SSH. Supports multiple codespaces, session resume, and on-demand codespace creation.
+Launch Copilot CLI with all file/bash operations executing on remote GitHub Codespace(s) via SSH. Supports multiple codespaces, session resume, on-demand codespace creation, and an opt-in headless delegate lane for autonomous remote Copilot work.
 
 ## How it works
 
@@ -16,7 +16,8 @@ A single Go binary (`gh-copilot-codespace`) serves four roles:
     - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash` — async session management (tmux-based)
     - `remote_cd`, `remote_cwd` — default working directory navigation
     - `list_codespaces`, `create_codespace`, `connect_codespace`, `delete_codespace` — codespace lifecycle
-    - `open_shell` — open interactive SSH session
+     - `open_shell` — open interactive SSH session
+     - Optional extra: `delegate_task`, `read_delegate_task`, `cancel_delegate_task` — run and manage remote headless Copilot delegate tasks
 
 3. **Exec agent** (`gh-copilot-codespace exec`) — Deployed to the codespace at startup. Provides structured command execution with workdir/env setup, replacing fragile shell escaping in SSH forwarding.
 
@@ -62,6 +63,9 @@ gh copilot-codespace --name my-session
 # Resume a previous session
 gh copilot-codespace --resume my-session
 
+# Enable the headless delegate extra
+gh copilot-codespace --headless-delegate -c my-codespace
+
 # List workspace sessions
 gh copilot-codespace workspaces
 
@@ -99,6 +103,16 @@ When connecting to multiple codespaces, all `remote_*` MCP tools accept an optio
 For `remote_bash`, `remote_grep`, and `remote_glob`, prefer passing `cwd` explicitly when you need predictable behavior across parallel tool calls. `remote_cd` still updates the default cwd for later sequential calls, but it should not be treated as an ordering dependency inside a parallel batch.
 
 The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools. Starting with zero connected codespaces is supported, so you can bootstrap a brand-new session and create the first codespace from inside the agent.
+
+## Headless delegate extra
+
+Pass `--headless-delegate` to enable an additive delegate lane behind the MCP bridge. This exposes:
+
+- `delegate_task` — start a background remote Copilot worker on a codespace
+- `read_delegate_task` — read progress and final output
+- `cancel_delegate_task` — stop a running delegate task
+
+The delegate lane is opt-in and leaves the default `remote_*` workflow unchanged.
 
 ## Session resume
 

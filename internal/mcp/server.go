@@ -48,6 +48,11 @@ func NewServer(reg *registry.Registry, lcfg ...LifecycleConfig) *server.MCPServe
 	s.AddTool(createCodespaceTool(), createCodespaceHandler(reg, cfg))
 	s.AddTool(connectCodespaceTool(), connectCodespaceHandler(reg, cfg))
 	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandler(reg, cfg.GHRunner))
+	if cfg.DelegateManager != nil {
+		s.AddTool(delegateTaskTool(), delegateTaskHandler(reg, cfg.DelegateManager))
+		s.AddTool(readDelegateTaskTool(), readDelegateTaskHandler(cfg.DelegateManager))
+		s.AddTool(cancelDelegateTaskTool(), cancelDelegateTaskHandler(cfg.DelegateManager))
+	}
 
 	return s
 }

@@ -186,7 +186,7 @@ func TestIntegration_MCPConfigRewriting(t *testing.T) {
 	}
 
 	// Verify buildMCPConfig rewrites it to use gh
-	mcpConfig := buildMCPConfig("/usr/local/bin/self", cs, wd, remoteMCP, "")
+	mcpConfig := buildMCPConfig("/usr/local/bin/self", cs, wd, remoteMCP, "", false)
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(mcpConfig), &parsed); err != nil {
 		t.Fatalf("invalid merged MCP config JSON: %v", err)

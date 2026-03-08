@@ -55,6 +55,19 @@ func (r *Registry) Deregister(alias string) {
 	delete(r.codespaces, alias)
 }
 
+// UpdateBranch updates the tracked branch for an already-registered codespace.
+func (r *Registry) UpdateBranch(alias, branch string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cs, ok := r.codespaces[alias]
+	if !ok {
+		return fmt.Errorf("codespace %q not found", alias)
+	}
+	cs.Branch = branch
+	return nil
+}
+
 // Resolve finds a codespace by alias. When alias is empty and exactly one
 // codespace is registered, it returns that one (single-codespace convenience).
 func (r *Registry) Resolve(alias string) (*ManagedCodespace, error) {

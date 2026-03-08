@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/delegate"
 	"github.com/ekroon/gh-copilot-codespace/internal/provisioner"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
@@ -23,9 +24,10 @@ type DeployFunc func(sshClient *ssh.Client, codespaceName string) (string, error
 
 // LifecycleConfig holds dependencies for lifecycle tool handlers.
 type LifecycleConfig struct {
-	GHRunner     GHRunner
-	DeployFunc   DeployFunc                // optional: deploy exec agent after SSH setup
-	Provisioners []provisioner.Provisioner // optional: run after setup
+	GHRunner        GHRunner
+	DeployFunc      DeployFunc                // optional: deploy exec agent after SSH setup
+	Provisioners    []provisioner.Provisioner // optional: run after setup
+	DelegateManager delegate.TaskManager      // optional: headless delegate task manager
 }
 
 // --- create_codespace ---
