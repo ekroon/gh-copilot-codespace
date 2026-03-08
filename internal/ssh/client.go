@@ -512,10 +512,10 @@ func globToFindName(pattern string) string {
 // envSecretsLoader sources codespace-injected secrets (GITHUB_TOKEN, etc.)
 // that are normally loaded by the login shell profile. Non-login SSH commands
 // skip /etc/profile.d/ scripts, so we load the secrets file directly.
-// Guards: skip empty keys ([ -n "$key" ]) and suppress export errors (2>/dev/null)
-// so that a single malformed entry cannot break the && chain and silently drop
-// the user's command.
-const envSecretsLoader = `if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do [ -n "$key" ] && export "$key=$(echo "$value" | base64 -d)" 2>/dev/null; done < /workspaces/.codespaces/shared/.env-secrets; true; fi`
+// Guards: skip empty keys, preserve already-exported variables, and suppress
+// export errors (2>/dev/null) so that a single malformed entry cannot break the
+// && chain and silently drop the user's command.
+const envSecretsLoader = `if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do if [ -n "$key" ]; then printenv "$key" >/dev/null 2>&1 || export "$key=$(echo "$value" | base64 -d)" 2>/dev/null; fi; done < /workspaces/.codespaces/shared/.env-secrets; true; fi`
 
 const tmuxPrefix = "copilot-"
 

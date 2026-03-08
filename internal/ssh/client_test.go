@@ -221,6 +221,12 @@ func TestWrapCommandInWorkdir(t *testing.T) {
 	}
 }
 
+func TestEnvSecretsLoaderPreservesExistingVars(t *testing.T) {
+	if !strings.Contains(envSecretsLoader, `printenv "$key" >/dev/null 2>&1 || export "$key=$(echo "$value" | base64 -d)"`) {
+		t.Fatalf("envSecretsLoader should preserve already-set variables, got %q", envSecretsLoader)
+	}
+}
+
 type fakeExecCall struct {
 	name string
 	args []string
