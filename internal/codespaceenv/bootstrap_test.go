@@ -22,8 +22,9 @@ GITHUB_SERVER_URL=%s
 OTHER_SECRET=%s
 ' "$GITHUB_TOKEN" "$GH_TOKEN" "$GITHUB_SERVER_URL" "$OTHER_SECRET"`)
 	cmd.Env = mergeEnv(os.Environ(), map[string]string{
-		"GITHUB_TOKEN": "stale-token",
-		"OTHER_SECRET": "preserved",
+		"GITHUB_TOKEN":      "stale-token",
+		"GITHUB_SERVER_URL": "",
+		"OTHER_SECRET":      "preserved",
 	})
 
 	out, err := cmd.CombinedOutput()
@@ -51,7 +52,8 @@ func TestBuildShellBootstrapFromPathDerivesEnterpriseServerURL(t *testing.T) {
 printf 'GITHUB_SERVER_URL=%s
 ' "$GITHUB_SERVER_URL"`)
 	cmd.Env = mergeEnv(os.Environ(), map[string]string{
-		"GITHUB_API_URL": "https://ghe.example.com/api/v3",
+		"GITHUB_API_URL":    "https://ghe.example.com/api/v3",
+		"GITHUB_SERVER_URL": "",
 	})
 
 	out, err := cmd.CombinedOutput()
