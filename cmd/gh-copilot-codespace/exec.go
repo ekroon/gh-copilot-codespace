@@ -5,6 +5,13 @@ import (
 	"os"
 	"strings"
 	"syscall"
+
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
+)
+
+var (
+	applyCodespaceEnv = codespaceenv.ApplyProcessBootstrap
+	execProcess       = syscall.Exec
 )
 
 // runExec runs a command with optional workdir and env setup.
@@ -38,6 +45,8 @@ func runExec(args []string) error {
 		return fmt.Errorf("no command specified (use: exec [--workdir DIR] [--env K=V]... -- COMMAND [ARGS...])")
 	}
 
+	applyCodespaceEnv()
+
 	// Change to workdir if specified
 	if workdir != "" {
 		if err := os.Chdir(workdir); err != nil {
@@ -62,7 +71,7 @@ func runExec(args []string) error {
 	}
 
 	// Replace this process with the command
-	return syscall.Exec(path, cmdArgs, os.Environ())
+	return execProcess(path, cmdArgs, os.Environ())
 }
 
 // lookPath finds the full path to a command, handling absolute paths.

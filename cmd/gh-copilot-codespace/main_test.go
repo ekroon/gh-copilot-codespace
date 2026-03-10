@@ -142,6 +142,9 @@ func TestRewriteMCPServerForSSH(t *testing.T) {
 	if !contains(remoteCmd, "--mode") {
 		t.Errorf("remote command should contain args, got %q", remoteCmd)
 	}
+	if !contains(remoteCmd, ".env-secrets") {
+		t.Errorf("remote command should bootstrap codespace auth env, got %q", remoteCmd)
+	}
 }
 
 func contains(s, substr string) bool {
@@ -368,6 +371,9 @@ func TestRewriteHooksForSSH(t *testing.T) {
 	if !contains(bash0, "echo") {
 		t.Errorf("sessionStart bash should contain original command, got %q", bash0)
 	}
+	if !contains(bash0, ".env-secrets") {
+		t.Errorf("sessionStart bash should bootstrap codespace auth env, got %q", bash0)
+	}
 	// cwd should be removed (baked into SSH command)
 	if _, ok := hook0["cwd"]; ok {
 		t.Error("cwd should be removed from rewritten hook")
@@ -379,6 +385,9 @@ func TestRewriteHooksForSSH(t *testing.T) {
 	bash1 := hook1["bash"].(string)
 	if !contains(bash1, "./scripts/policy-check.sh") {
 		t.Errorf("preToolUse bash should contain original command, got %q", bash1)
+	}
+	if !contains(bash1, ".env-secrets") {
+		t.Errorf("preToolUse bash should bootstrap codespace auth env, got %q", bash1)
 	}
 	// Env should be removed (baked into SSH command)
 	if _, ok := hook1["env"]; ok {

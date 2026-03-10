@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"reflect"
@@ -221,9 +222,15 @@ func TestWrapCommandInWorkdir(t *testing.T) {
 	}
 }
 
-func TestEnvSecretsLoaderPreservesExistingVars(t *testing.T) {
-	if !strings.Contains(envSecretsLoader, `printenv "$key" >/dev/null 2>&1 || export "$key=$(echo "$value" | base64 -d)"`) {
-		t.Fatalf("envSecretsLoader should preserve already-set variables, got %q", envSecretsLoader)
+func TestEnvSecretsLoaderRefreshesGitHubAuth(t *testing.T) {
+	if !strings.Contains(envSecretsLoader, `GITHUB_TOKEN|GH_TOKEN) export "$key=$decoded"`) {
+		t.Fatalf("envSecretsLoader should refresh GitHub auth vars, got %q", envSecretsLoader)
+	}
+	if !strings.Contains(envSecretsLoader, `export GH_TOKEN="$GITHUB_TOKEN"`) {
+		t.Fatalf("envSecretsLoader should normalize GH_TOKEN from GITHUB_TOKEN, got %q", envSecretsLoader)
+	}
+	if !strings.Contains(envSecretsLoader, `GITHUB_SERVER_URL`) {
+		t.Fatalf("envSecretsLoader should ensure GITHUB_SERVER_URL is set, got %q", envSecretsLoader)
 	}
 }
 
@@ -388,6 +395,34 @@ func TestGlobUsesExplicitCwd(t *testing.T) {
 
 	wantCalls := []fakeExecCall{
 		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && cd '/workspaces/repo' && (fd --type f --glob '**/*.go' --exclude .git 'pkg' 2>/dev/null || find 'pkg' -name '*.go' -not -path '*/.git/*' 2>/dev/null) | head -200"}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestStartSessionBootstrapsAuthInsideTmuxCommand(t *testing.T) {
+	client := NewClient("demo")
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "/usr/bin/tmux\n"},
+		{stdout: ""},
+	})
+
+	if err := client.StartSession(context.Background(), "session-1", "git fetch origin", "/workspaces/repo"); err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+
+	name := tmuxSessionName("session-1")
+	sessionCommand := envSecretsLoader + " && " + wrapCommandInWorkdir("git fetch origin", "/workspaces/repo")
+	tmuxCommand := fmt.Sprintf(
+		"tmux new-session -d -s %s -x 200 -y 50 %s && tmux set-option -t %s remain-on-exit on",
+		shellQuote(name), shellQuote(sessionCommand), shellQuote(name))
+
+	wantCalls := []fakeExecCall{
+		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && " + misePATH + " && command -v tmux"}},
+		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && " + misePATH + " && " + tmuxCommand}},
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)

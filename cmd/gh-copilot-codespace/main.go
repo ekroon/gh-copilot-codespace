@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
@@ -1132,7 +1133,7 @@ func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir, remot
 			}
 		}
 	}
-	remoteCmd = envPrefix + " && exec " + remoteCmd
+	remoteCmd = codespaceenv.BuildShellBootstrap() + " && " + envPrefix + " && exec " + remoteCmd
 
 	return map[string]any{
 		"type":    "local",
@@ -1201,7 +1202,7 @@ func rewriteHooksForSSH(content []byte, codespaceName, workdir, remoteBinary str
 						}
 					}
 				}
-				remoteCmd := fmt.Sprintf("cd %s && %s%s", shellQuote(remoteCwd), envPrefix, bashCmd)
+				remoteCmd := fmt.Sprintf("%s && cd %s && %s%s", codespaceenv.BuildShellBootstrap(), shellQuote(remoteCwd), envPrefix, bashCmd)
 				h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- bash -c %s", codespaceName, shellQuote(shellQuote(remoteCmd)))
 			}
 

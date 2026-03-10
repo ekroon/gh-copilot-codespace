@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 )
 
 // Client manages SSH connections to a GitHub Codespace via gh CLI.
@@ -509,13 +511,9 @@ func globToFindName(pattern string) string {
 	return parts[len(parts)-1]
 }
 
-// envSecretsLoader sources codespace-injected secrets (GITHUB_TOKEN, etc.)
-// that are normally loaded by the login shell profile. Non-login SSH commands
-// skip /etc/profile.d/ scripts, so we load the secrets file directly.
-// Guards: skip empty keys, preserve already-exported variables, and suppress
-// export errors (2>/dev/null) so that a single malformed entry cannot break the
-// && chain and silently drop the user's command.
-const envSecretsLoader = `if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do if [ -n "$key" ]; then printenv "$key" >/dev/null 2>&1 || export "$key=$(echo "$value" | base64 -d)" 2>/dev/null; fi; done < /workspaces/.codespaces/shared/.env-secrets; true; fi`
+// envSecretsLoader restores the GitHub auth env that Codespaces login shells
+// normally provide. Non-login SSH commands skip /etc/profile.d/ scripts.
+var envSecretsLoader = codespaceenv.BuildShellBootstrap()
 
 const tmuxPrefix = "copilot-"
 
@@ -541,7 +539,7 @@ func (c *Client) StartSession(ctx context.Context, sessionID, command, cwd strin
 		return err
 	}
 
-	wrappedCommand := wrapCommandInWorkdir(command, c.resolveWorkdir(cwd))
+	wrappedCommand := envSecretsLoader + " && " + wrapCommandInWorkdir(command, c.resolveWorkdir(cwd))
 
 	// Create session with remain-on-exit so we can read output after command finishes
 	cmd := fmt.Sprintf(
