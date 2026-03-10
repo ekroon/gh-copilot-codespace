@@ -67,9 +67,36 @@ gh copilot-codespace workspaces
 
 # Pass extra copilot flags
 gh copilot-codespace --model claude-sonnet-4.5
+
+# Opt in to local GitHub auth forwarding for this session
+gh copilot-codespace --github-auth local -c my-codespace-name
 ```
 
 If you launch without `-c/--codespace` or `--no-codespace`, the interactive picker supports selecting multiple codespaces. Press Enter without toggling any codespaces to start with no codespaces connected, or use `--no-codespace` to skip the picker entirely for non-interactive launches. From there, use `list_available_codespaces`, `create_codespace`, or `connect_codespace` from the agent.
+
+## GitHub auth modes
+
+By default, `gh-copilot-codespace` keeps using the codespace-managed GitHub auth bootstrap from `/workspaces/.codespaces/shared/.env-secrets`. That default path is unchanged, including the refresh/normalization behavior for `GITHUB_TOKEN` / `GH_TOKEN`.
+
+If you want this session to prefer your local GitHub token instead, launch with `--github-auth local`:
+
+```bash
+# Prefer the local token for this session
+gh copilot-codespace --github-auth local -c my-codespace
+
+# Name and resume a local-auth session
+gh copilot-codespace --github-auth local --name my-feature -c my-codespace
+gh copilot-codespace --resume my-feature
+```
+
+Rules:
+
+- `--github-auth codespace` (default) keeps the current codespace bootstrap behavior.
+- `--github-auth local` is explicit and requires a local `GITHUB_TOKEN` or `GH_TOKEN`; the launcher fails early if neither is set.
+- Local mode normalizes `GITHUB_TOKEN` / `GH_TOKEN` and forwards local `GITHUB_SERVER_URL` / `GITHUB_API_URL` when present so GitHub Enterprise-style hosts keep working.
+- Explicit per-command env overrides (for example rewritten MCP server or hook env values, or `exec --env`) still win over the session-wide auth mode.
+
+Security note: local mode does **not** write your token into workspace manifests, MCP config JSON, or rewritten hook files. The token is resolved from the local environment only at runtime. Because the forwarding path still relies on `gh codespace ssh` / remote process env injection, the token may still briefly exist in descendant process args/env while those local helper processes start.
 
 ## What gets fetched from the codespace
 
@@ -102,7 +129,7 @@ The agent can also create, connect to, and delete codespaces on the fly using `c
 
 ## Session resume
 
-Workspace sessions are saved to `~/.copilot/workspaces/` with a manifest (`workspace.json`) tracking connected codespaces. Empty sessions are resumable too, which is useful when you want to launch first and create/connect codespaces later from the agent. Use `--resume` to reconnect:
+Workspace sessions are saved to `~/.copilot/workspaces/` with a manifest (`workspace.json`) tracking connected codespaces and the selected GitHub auth mode. Empty sessions are resumable too, which is useful when you want to launch first and create/connect codespaces later from the agent. Use `--resume` to reconnect:
 
 ```bash
 # First session
@@ -187,4 +214,5 @@ To promote a dev pre-release to `latest` (for mise users), run the "Promote to L
 |---|---|---|
 | `CODESPACE_NAME` | Codespace name | Launcher → MCP server |
 | `CODESPACE_WORKDIR` | Working directory on codespace | Launcher → MCP server |
+| `CODESPACE_GITHUB_AUTH` | Session GitHub auth mode (`codespace` or `local`) | Launcher → MCP server / local proxy helper |
 | `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` | Temp dir with fetched instruction files | Launcher → copilot |

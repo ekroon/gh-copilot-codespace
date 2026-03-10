@@ -2,6 +2,7 @@ package codespaceenv
 
 import (
 	"encoding/base64"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,6 +105,92 @@ func TestApplyProcessBootstrapFromPathBackfillsGitHubTokenFromGHToken(t *testing
 
 	if got := os.Getenv("GITHUB_TOKEN"); got != "gh-only-token" {
 		t.Fatalf("GITHUB_TOKEN = %q, want gh-only-token", got)
+	}
+}
+
+func TestResolveLocalGitHubAuthFromEnvUsesGitHubToken(t *testing.T) {
+	authEnv, err := ResolveLocalGitHubAuthFromEnv(func(key string) (string, bool) {
+		values := map[string]string{
+			"GITHUB_TOKEN":   "local-token",
+			"GITHUB_API_URL": "https://ghe.example.com/api/v3",
+		}
+		value, ok := values[key]
+		return value, ok
+	})
+	if err != nil {
+		t.Fatalf("ResolveLocalGitHubAuthFromEnv() error = %v", err)
+	}
+
+	if authEnv.Token != "local-token" {
+		t.Fatalf("Token = %q, want local-token", authEnv.Token)
+	}
+	if authEnv.APIURL != "https://ghe.example.com/api/v3" {
+		t.Fatalf("APIURL = %q, want https://ghe.example.com/api/v3", authEnv.APIURL)
+	}
+	if authEnv.ServerURL != "https://ghe.example.com" {
+		t.Fatalf("ServerURL = %q, want https://ghe.example.com", authEnv.ServerURL)
+	}
+
+	envVars := authEnv.EnvPairs()
+	if got, want := strings.Join(envVars, ","), "GITHUB_TOKEN=local-token,GH_TOKEN=local-token,GITHUB_API_URL=https://ghe.example.com/api/v3,GITHUB_SERVER_URL=https://ghe.example.com"; got != want {
+		t.Fatalf("EnvPairs() = %q, want %q", got, want)
+	}
+}
+
+func TestResolveLocalGitHubAuthFromEnvUsesGHToken(t *testing.T) {
+	authEnv, err := ResolveLocalGitHubAuthFromEnv(func(key string) (string, bool) {
+		values := map[string]string{
+			"GH_TOKEN":          "gh-only-token",
+			"GITHUB_SERVER_URL": "https://github.example.com",
+		}
+		value, ok := values[key]
+		return value, ok
+	})
+	if err != nil {
+		t.Fatalf("ResolveLocalGitHubAuthFromEnv() error = %v", err)
+	}
+
+	if authEnv.Token != "gh-only-token" {
+		t.Fatalf("Token = %q, want gh-only-token", authEnv.Token)
+	}
+	if authEnv.APIURL != "https://github.example.com/api/v3" {
+		t.Fatalf("APIURL = %q, want https://github.example.com/api/v3", authEnv.APIURL)
+	}
+	if authEnv.ServerURL != "https://github.example.com" {
+		t.Fatalf("ServerURL = %q, want https://github.example.com", authEnv.ServerURL)
+	}
+}
+
+func TestResolveLocalGitHubAuthFromEnvErrorsWithoutToken(t *testing.T) {
+	_, err := ResolveLocalGitHubAuthFromEnv(func(string) (string, bool) {
+		return "", false
+	})
+	if err == nil {
+		t.Fatal("ResolveLocalGitHubAuthFromEnv() error = nil, want non-nil")
+	}
+	if !errors.Is(err, ErrMissingLocalGitHubToken) {
+		t.Fatalf("error = %v, want %v", err, ErrMissingLocalGitHubToken)
+	}
+}
+
+func TestSessionEnvExportPrefixForLocalAuth(t *testing.T) {
+	t.Setenv("GH_TOKEN", "gh-only-token")
+	t.Setenv("GITHUB_SERVER_URL", "https://github.example.com")
+
+	prefix, err := SessionEnvExportPrefix(GitHubAuthLocal)
+	if err != nil {
+		t.Fatalf("SessionEnvExportPrefix() error = %v", err)
+	}
+
+	for _, want := range []string{
+		"export GITHUB_TOKEN='gh-only-token'",
+		"export GH_TOKEN='gh-only-token'",
+		"export GITHUB_API_URL='https://github.example.com/api/v3'",
+		"export GITHUB_SERVER_URL='https://github.example.com'",
+	} {
+		if !strings.Contains(prefix, want) {
+			t.Fatalf("SessionEnvExportPrefix() missing %q in %q", want, prefix)
+		}
 	}
 }
 

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 )
 
 // Workspace represents a local workspace session directory.
@@ -21,8 +23,9 @@ type Workspace struct {
 
 // Manifest is the session state stored in workspace.json.
 type Manifest struct {
-	Created    time.Time                  `json:"created"`
-	Codespaces map[string]CodespaceEntry  `json:"codespaces"`
+	Created    time.Time                 `json:"created"`
+	GitHubAuth string                    `json:"githubAuth,omitempty"`
+	Codespaces map[string]CodespaceEntry `json:"codespaces"`
 }
 
 // CodespaceEntry records a codespace that is part of this workspace session.
@@ -74,6 +77,7 @@ func New(name string) (*Workspace, error) {
 		Dir:  dir,
 		Manifest: &Manifest{
 			Created:    time.Now(),
+			GitHubAuth: string(codespaceenv.GitHubAuthCodespace),
 			Codespaces: make(map[string]CodespaceEntry),
 		},
 	}
@@ -102,6 +106,9 @@ func Load(name string) (*Workspace, error) {
 
 	if manifest.Codespaces == nil {
 		manifest.Codespaces = make(map[string]CodespaceEntry)
+	}
+	if manifest.GitHubAuth == "" {
+		manifest.GitHubAuth = string(codespaceenv.GitHubAuthCodespace)
 	}
 
 	return &Workspace{

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
@@ -186,7 +187,7 @@ func TestIntegration_MCPConfigRewriting(t *testing.T) {
 	}
 
 	// Verify buildMCPConfig rewrites it to use gh
-	mcpConfig := buildMCPConfig("/usr/local/bin/self", cs, wd, remoteMCP, "")
+	mcpConfig := buildMCPConfig("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, cs, wd, remoteMCP, "")
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(mcpConfig), &parsed); err != nil {
 		t.Fatalf("invalid merged MCP config JSON: %v", err)
@@ -550,7 +551,7 @@ func TestIntegration_MCPForwardingEndToEnd_VSCode(t *testing.T) {
 	if !ok {
 		t.Fatal("vscode-test-server config should be a map")
 	}
-	rewritten := rewriteMCPServerForSSH(serverConfig, cs, wd, "")
+	rewritten := rewriteMCPServerForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, serverConfig, cs, wd, "")
 	if rewritten == nil {
 		t.Fatal("rewriteMCPServerForSSH returned nil for vscode-test-server")
 	}

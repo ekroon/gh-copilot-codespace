@@ -39,6 +39,7 @@ Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 Flags:
   -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
       --no-codespace     Start without connecting to any codespace (skip picker)
+      --github-auth MODE Use GitHub auth source: codespace (default) or local
   -w, --workdir PATH     Override workspace directory on the codespace
       --name SESSION     Name for the local workspace session
       --resume SESSION   Re-attach to a previous workspace session
@@ -76,6 +77,15 @@ func main() {
 		return
 	}
 
+	// If first arg is "proxy", forward a local process to a remote codespace command.
+	if len(os.Args) > 1 && os.Args[1] == "proxy" {
+		if err := runProxy(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "proxy: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// If first arg is "workspaces", list/manage workspace sessions
 	if len(os.Args) > 1 && os.Args[1] == "workspaces" {
 		if err := runWorkspaces(os.Args[2:]); err != nil {
@@ -93,14 +103,19 @@ func main() {
 }
 
 func runMCPServer() {
+	authMode, err := codespaceenv.ParseGitHubAuthMode(os.Getenv(codespaceenv.GitHubAuthModeEnvVar))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "codespace-mcp: invalid %s: %v\n", codespaceenv.GitHubAuthModeEnvVar, err)
+		os.Exit(1)
+	}
+
 	// Support multi-codespace via CODESPACE_REGISTRY env var (JSON)
 	// Falls back to single CODESPACE_NAME for backward compatibility
 	registryJSON := os.Getenv("CODESPACE_REGISTRY")
 
 	var reg *registry.Registry
 	if registryJSON != "" {
-		var err error
-		reg, err = registryFromJSON(registryJSON)
+		reg, err = registryFromJSON(registryJSON, authMode)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "codespace-mcp: invalid CODESPACE_REGISTRY: %v\n", err)
 			os.Exit(1)
@@ -112,6 +127,7 @@ func runMCPServer() {
 			os.Exit(1)
 		}
 		sshClient := ssh.NewClient(codespaceName)
+		sshClient.SetGitHubAuthMode(authMode)
 		ctx := context.Background()
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing setup warning: %v\n", err)
@@ -129,7 +145,7 @@ func runMCPServer() {
 		}
 	}
 
-	mcpServer := mcp.NewServer(reg)
+	mcpServer := mcp.NewServer(reg, mcp.LifecycleConfig{GitHubAuthMode: authMode})
 
 	log.SetOutput(os.Stderr)
 	log.Printf("codespace-mcp: starting with %d codespace(s)", reg.Len())
@@ -149,13 +165,14 @@ type registryEntry struct {
 }
 
 // registryFromJSON deserializes CODESPACE_REGISTRY env var and creates SSH clients.
-func registryFromJSON(data string) (*registry.Registry, error) {
+func registryFromJSON(data string, authMode codespaceenv.GitHubAuthMode) (*registry.Registry, error) {
 	var entries []registryEntry
 	if err := json.Unmarshal([]byte(data), &entries); err != nil {
 		return nil, fmt.Errorf("parsing registry: %w", err)
 	}
 	return registryFromEntries(context.Background(), entries, func(ctx context.Context, e registryEntry) (*registry.ManagedCodespace, error) {
 		sshClient := ssh.NewClient(e.Name)
+		sshClient.SetGitHubAuthMode(authMode)
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing warning for %s: %v\n", e.Alias, err)
 		}
@@ -190,6 +207,8 @@ func registryFromEntries(ctx context.Context, entries []registryEntry, build fun
 type launcherOptions struct {
 	codespaceNames  []string
 	noCodespace     bool
+	githubAuth      string
+	githubAuthSet   bool
 	workdirOverride string
 	sessionName     string
 	resumeSession   string
@@ -205,6 +224,16 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 			opts.localTools = true
 		case args[i] == "--no-codespace":
 			opts.noCodespace = true
+		case args[i] == "--github-auth":
+			if i+1 >= len(args) {
+				return launcherOptions{}, fmt.Errorf("--github-auth requires a value")
+			}
+			opts.githubAuth = args[i+1]
+			opts.githubAuthSet = true
+			i++
+		case strings.HasPrefix(args[i], "--github-auth="):
+			opts.githubAuth = strings.TrimPrefix(args[i], "--github-auth=")
+			opts.githubAuthSet = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
 			// Support comma-separated: -c cs1,cs2
 			for _, name := range strings.Split(args[i+1], ",") {
@@ -238,6 +267,26 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 	return opts, nil
 }
 
+func resolveGitHubAuthMode(raw string, explicit bool, saved string) (codespaceenv.GitHubAuthMode, error) {
+	if explicit {
+		return codespaceenv.ParseGitHubAuthMode(raw)
+	}
+	if saved != "" {
+		return codespaceenv.ParseGitHubAuthMode(saved)
+	}
+	return codespaceenv.GitHubAuthCodespace, nil
+}
+
+func validateGitHubAuthMode(mode codespaceenv.GitHubAuthMode) error {
+	if mode != codespaceenv.GitHubAuthLocal {
+		return nil
+	}
+	if _, err := codespaceenv.ResolveLocalGitHubAuth(); err != nil {
+		return fmt.Errorf("--github-auth %s: %w", mode, err)
+	}
+	return nil
+}
+
 func runLauncher(args []string) error {
 	opts, err := parseLauncherArgs(args)
 	if err != nil {
@@ -246,8 +295,17 @@ func runLauncher(args []string) error {
 
 	// Handle --resume: load workspace and reconnect to codespaces
 	if opts.resumeSession != "" {
-		return runResume(opts.resumeSession, opts.copilotArgs)
+		return runResume(opts.resumeSession, opts.githubAuth, opts.githubAuthSet, opts.copilotArgs)
 	}
+
+	authMode, err := resolveGitHubAuthMode(opts.githubAuth, opts.githubAuthSet, "")
+	if err != nil {
+		return err
+	}
+	if err := validateGitHubAuthMode(authMode); err != nil {
+		return err
+	}
+	_ = os.Setenv(codespaceenv.GitHubAuthModeEnvVar, string(authMode))
 
 	// The binary serves as both launcher and MCP server
 	self, err := os.Executable()
@@ -303,6 +361,7 @@ func runLauncher(args []string) error {
 
 		// Set up SSH multiplexing early for fast file fetching
 		sshClient := ssh.NewClient(selected.Name)
+		sshClient.SetGitHubAuthMode(authMode)
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: SSH multiplexing failed for %s: %v\n", selected.Name, err)
 		}
@@ -345,7 +404,7 @@ func runLauncher(args []string) error {
 		primary := selectedList[0]
 
 		// Fetch instruction files into a deterministic dir that acts as the cwd
-		instructionsDir, allRemoteMCPServers, err = fetchInstructionFiles(firstSSHClient, primary.Name, firstWorkdir, firstRemoteBinary)
+		instructionsDir, allRemoteMCPServers, err = fetchInstructionFiles(self, authMode, firstSSHClient, primary.Name, firstWorkdir, firstRemoteBinary)
 		if err != nil {
 			return fmt.Errorf("fetching instructions: %w", err)
 		}
@@ -392,7 +451,7 @@ func runLauncher(args []string) error {
 	}
 
 	// Build MCP config with registry serialization for multi-CS support
-	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers)
+	mcpConfig := buildMCPConfigWithRegistry(self, authMode, reg, allRemoteMCPServers)
 
 	// Excluded tools
 	var excludedTools []string
@@ -414,6 +473,7 @@ func runLauncher(args []string) error {
 	}
 
 	if wsErr == nil {
+		ws.Manifest.GitHubAuth = string(authMode)
 		for _, cs := range reg.All() {
 			ws.AddCodespace(cs.Alias, workspace.CodespaceEntry{
 				Name:       cs.Name,
@@ -669,7 +729,7 @@ func execSSH(sshClient *ssh.Client, codespaceName, command string) (string, erro
 	return sshCommand(codespaceName, command)
 }
 
-func fetchInstructionFiles(sshClient *ssh.Client, codespaceName, workdir, remoteBinary string) (string, map[string]any, error) {
+func fetchInstructionFiles(selfBinary string, authMode codespaceenv.GitHubAuthMode, sshClient *ssh.Client, codespaceName, workdir, remoteBinary string) (string, map[string]any, error) {
 	// Use a deterministic directory so copilot only needs to trust it once per codespace
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -754,7 +814,7 @@ echo "$SEP"
 			// Rewrite hook commands to execute on the codespace via SSH.
 			// If rewriting fails, skip the file — writing the original would
 			// leave hooks that try to run scripts locally (which don't exist).
-			rewritten := rewriteHooksForSSH(content, codespaceName, workdir, remoteBinary)
+			rewritten := rewriteHooksForSSH(selfBinary, authMode, content, codespaceName, workdir, remoteBinary)
 			if rewritten != nil {
 				content = rewritten
 				fmt.Printf("  ✓ %s (hooks forwarded over SSH)\n", relPath)
@@ -925,15 +985,16 @@ func ensureTrustedFolder(dir string) error {
 	return os.WriteFile(configPath, out, 0o644)
 }
 
-func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers map[string]any, remoteBinary string) string {
+func buildMCPConfig(selfBinary string, authMode codespaceenv.GitHubAuthMode, codespaceName, workdir string, remoteMCPServers map[string]any, remoteBinary string) string {
 	servers := map[string]any{
 		"codespace": map[string]any{
 			"type":    "local",
 			"command": selfBinary,
 			"args":    []string{"mcp"},
 			"env": map[string]string{
-				"CODESPACE_NAME":    codespaceName,
-				"CODESPACE_WORKDIR": workdir,
+				"CODESPACE_NAME":                  codespaceName,
+				"CODESPACE_WORKDIR":               workdir,
+				codespaceenv.GitHubAuthModeEnvVar: string(authMode),
 			},
 			"tools": []string{"*"},
 		},
@@ -945,7 +1006,7 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 			continue // don't override our own server
 		}
 		if server, ok := serverConfig.(map[string]any); ok {
-			rewritten := rewriteMCPServerForSSH(server, codespaceName, workdir, remoteBinary)
+			rewritten := rewriteMCPServerForSSH(selfBinary, authMode, server, codespaceName, workdir, remoteBinary)
 			if rewritten != nil {
 				servers[name] = rewritten
 			}
@@ -961,7 +1022,7 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 
 // buildMCPConfigWithRegistry creates the MCP config JSON using the full registry.
 // Uses CODESPACE_REGISTRY env var (JSON array) for zero-, single-, or multi-codespace support.
-func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any) string {
+func buildMCPConfigWithRegistry(selfBinary string, authMode codespaceenv.GitHubAuthMode, reg *registry.Registry, remoteMCPServers map[string]any) string {
 	// Serialize registry entries for the MCP server process
 	var entries []registryEntry
 	for _, cs := range reg.All() {
@@ -981,7 +1042,8 @@ func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remot
 			"command": selfBinary,
 			"args":    []string{"mcp"},
 			"env": map[string]string{
-				"CODESPACE_REGISTRY": string(registryJSON),
+				"CODESPACE_REGISTRY":              string(registryJSON),
+				codespaceenv.GitHubAuthModeEnvVar: string(authMode),
 			},
 			"tools": []string{"*"},
 		},
@@ -995,7 +1057,7 @@ func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remot
 				continue
 			}
 			if server, ok := serverConfig.(map[string]any); ok {
-				rewritten := rewriteMCPServerForSSH(server, primary.Name, primary.Workdir, primary.ExecAgent)
+				rewritten := rewriteMCPServerForSSH(selfBinary, authMode, server, primary.Name, primary.Workdir, primary.ExecAgent)
 				if rewritten != nil {
 					servers[name] = rewritten
 				}
@@ -1076,76 +1138,56 @@ You are not connected to any remote GitHub Codespaces yet, so project source cod
 	os.WriteFile(instructionsPath, []byte(preamble+string(existing)), 0o644)
 }
 
-// rewriteMCPServerForSSH rewrites an MCP server config to forward its stdio over SSH.
-// When remoteBinary is available, uses structured exec args instead of shell assembly.
-func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir, remoteBinary string) map[string]any {
+// rewriteMCPServerForSSH rewrites an MCP server config to forward its stdio over SSH
+// via the local proxy helper. The helper resolves session auth mode at runtime so
+// token values are never serialized into the generated MCP config.
+func rewriteMCPServerForSSH(selfBinary string, authMode codespaceenv.GitHubAuthMode, server map[string]any, codespaceName, workdir, remoteBinary string) map[string]any {
 	command, _ := server["command"].(string)
 	if command == "" {
 		return nil
 	}
 
-	// When remote binary is deployed, use structured exec (no shell escaping needed)
+	args := []string{"proxy", "--codespace", codespaceName, "--github-auth", string(authMode)}
+	if workdir != "" {
+		args = append(args, "--workdir", workdir)
+	}
 	if remoteBinary != "" {
-		args := []string{"codespace", "ssh", "-c", codespaceName, "--",
-			remoteBinary, "exec", "--workdir", workdir}
-
-		// Add env vars as structured flags
-		if env, ok := server["env"].(map[string]any); ok {
-			for k, v := range env {
-				if s, ok := v.(string); ok {
-					args = append(args, "--env", k+"="+s)
-				}
-			}
-		}
-
-		// Add command and its args after --
-		args = append(args, "--", command)
-		if cmdArgs, ok := server["args"].([]any); ok {
-			for _, arg := range cmdArgs {
-				if s, ok := arg.(string); ok {
-					args = append(args, s)
-				}
-			}
-		}
-
-		return map[string]any{
-			"type":    "local",
-			"command": "gh",
-			"args":    args,
-		}
+		args = append(args, "--remote-binary", remoteBinary)
 	}
 
-	// Fallback: shell assembly (when remote binary not available)
-	remoteCmd := command
-	if args, ok := server["args"].([]any); ok {
-		for _, arg := range args {
-			if s, ok := arg.(string); ok {
-				remoteCmd += " " + s
-			}
-		}
-	}
-
-	envPrefix := fmt.Sprintf("cd %s", workdir)
 	if env, ok := server["env"].(map[string]any); ok {
-		for k, v := range env {
+		var keys []string
+		for k := range env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := env[k]
 			if s, ok := v.(string); ok {
-				envPrefix += fmt.Sprintf(" && export %s=%s", k, s)
+				args = append(args, "--env", k+"="+s)
 			}
 		}
 	}
-	remoteCmd = codespaceenv.BuildShellBootstrap() + " && " + envPrefix + " && exec " + remoteCmd
+
+	args = append(args, "--", command)
+	if cmdArgs, ok := server["args"].([]any); ok {
+		for _, arg := range cmdArgs {
+			if s, ok := arg.(string); ok {
+				args = append(args, s)
+			}
+		}
+	}
 
 	return map[string]any{
 		"type":    "local",
-		"command": "gh",
-		"args":    []string{"codespace", "ssh", "-c", codespaceName, "--", "bash", "-c", shellQuote(remoteCmd)},
+		"command": selfBinary,
+		"args":    args,
 	}
 }
 
 // rewriteHooksForSSH rewrites hook commands in a hooks JSON file to execute
-// on the codespace via SSH. When remoteBinary is available, uses structured
-// exec args. Otherwise falls back to shell assembly.
-func rewriteHooksForSSH(content []byte, codespaceName, workdir, remoteBinary string) []byte {
+// on the codespace via the local proxy helper.
+func rewriteHooksForSSH(selfBinary string, authMode codespaceenv.GitHubAuthMode, content []byte, codespaceName, workdir, remoteBinary string) []byte {
 	var config map[string]any
 	if err := json.Unmarshal(content, &config); err != nil {
 		return nil
@@ -1178,33 +1220,27 @@ func rewriteHooksForSSH(content []byte, codespaceName, workdir, remoteBinary str
 				remoteCwd = workdir + "/" + cwd
 			}
 
-			if remoteBinary != "" {
-				// Structured exec via remote binary (no shell escaping)
-				// Double-quote the bash command: once for local shell (which consumes
-				// the hook's bash field), once for the remote shell (SSH).
-				execArgs := remoteBinary + " exec --workdir " + shellQuote(remoteCwd)
-				if env, ok := h["env"].(map[string]any); ok {
-					for k, v := range env {
-						if s, ok := v.(string); ok {
-							execArgs += " --env " + shellQuote(k+"="+s)
-						}
-					}
-				}
-				execArgs += " -- bash -c " + shellQuote(shellQuote(bashCmd))
-				h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- %s", codespaceName, execArgs)
-			} else {
-				// Fallback: shell assembly
-				envPrefix := ""
-				if env, ok := h["env"].(map[string]any); ok {
-					for k, v := range env {
-						if s, ok := v.(string); ok {
-							envPrefix += fmt.Sprintf("export %s=%s && ", k, shellQuote(s))
-						}
-					}
-				}
-				remoteCmd := fmt.Sprintf("%s && cd %s && %s%s", codespaceenv.BuildShellBootstrap(), shellQuote(remoteCwd), envPrefix, bashCmd)
-				h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- bash -c %s", codespaceName, shellQuote(shellQuote(remoteCmd)))
+			proxyArgs := []string{selfBinary, "proxy", "--codespace", codespaceName, "--github-auth", string(authMode)}
+			if remoteCwd != "" {
+				proxyArgs = append(proxyArgs, "--workdir", remoteCwd)
 			}
+			if remoteBinary != "" {
+				proxyArgs = append(proxyArgs, "--remote-binary", remoteBinary)
+			}
+			if env, ok := h["env"].(map[string]any); ok {
+				var keys []string
+				for k := range env {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					if s, ok := env[k].(string); ok {
+						proxyArgs = append(proxyArgs, "--env", k+"="+s)
+					}
+				}
+			}
+			proxyArgs = append(proxyArgs, "--", "bash", "-lc", bashCmd)
+			h["bash"] = shellJoinArgs(proxyArgs)
 
 			// Clear cwd and env since they're baked into the SSH command
 			delete(h, "cwd")
@@ -1293,6 +1329,14 @@ func selectWorkdir(dirs []string) (string, error) {
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func shellJoinArgs(args []string) string {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		quoted[i] = shellQuote(arg)
+	}
+	return strings.Join(quoted, " ")
 }
 
 func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) error {
@@ -1419,11 +1463,20 @@ Use these remote tools to explore the codespace:
 }
 
 // runResume loads a workspace session and reconnects to its codespaces.
-func runResume(sessionName string, copilotArgs []string) error {
+func runResume(sessionName, authOverride string, authOverrideSet bool, copilotArgs []string) error {
 	ws, err := workspace.Load(sessionName)
 	if err != nil {
 		return fmt.Errorf("loading workspace %q: %w", sessionName, err)
 	}
+
+	authMode, err := resolveGitHubAuthMode(authOverride, authOverrideSet, ws.Manifest.GitHubAuth)
+	if err != nil {
+		return err
+	}
+	if err := validateGitHubAuthMode(authMode); err != nil {
+		return err
+	}
+	_ = os.Setenv(codespaceenv.GitHubAuthModeEnvVar, string(authMode))
 
 	fmt.Printf("Resuming workspace %q...\n", sessionName)
 
@@ -1446,6 +1499,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 		}
 
 		sshClient := ssh.NewClient(entry.Name)
+		sshClient.SetGitHubAuthMode(authMode)
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "  ⚠ SSH failed for %s: %v (skipping)\n", alias, err)
 			continue
@@ -1476,7 +1530,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 	if all := reg.All(); len(all) > 0 {
 		primary := all[0]
 		remoteBinary, _ := deployBinary(primary.Executor.(*ssh.Client), primary.Name)
-		fetchInstructionFiles(primary.Executor.(*ssh.Client), primary.Name, primary.Workdir, remoteBinary)
+		fetchInstructionFiles(self, authMode, primary.Executor.(*ssh.Client), primary.Name, primary.Workdir, remoteBinary)
 
 		if reg.Len() > 1 {
 			writeMultiCodespaceInstructionsPreamble(instructionsDir, reg)
@@ -1491,13 +1545,18 @@ func runResume(sessionName string, copilotArgs []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: could not auto-trust directory: %v\n", err)
 	}
 
+	ws.Manifest.GitHubAuth = string(authMode)
+	if err := ws.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not update workspace manifest: %v\n", err)
+	}
+
 	generateRemoteExplorerAgent(instructionsDir)
 
 	if err := os.Chdir(instructionsDir); err != nil {
 		return fmt.Errorf("changing to workspace dir: %w", err)
 	}
 
-	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil)
+	mcpConfig := buildMCPConfigWithRegistry(self, authMode, reg, nil)
 
 	excludedTools := []string{
 		"bash", "write_bash", "read_bash",

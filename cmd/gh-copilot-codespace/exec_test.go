@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 )
 
 func TestRewriteMCPServerForSSH_WithRemoteBinary(t *testing.T) {
@@ -18,7 +20,9 @@ func TestRewriteMCPServerForSSH_WithRemoteBinary(t *testing.T) {
 		},
 	}
 
-	result := rewriteMCPServerForSSH(server, "my-cs", "/workspaces/repo", "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace")
+	t.Setenv("GITHUB_TOKEN", "local-token")
+
+	result := rewriteMCPServerForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthLocal, server, "my-cs", "/workspaces/repo", "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace")
 
 	if result == nil {
 		t.Fatal("rewriteMCPServerForSSH returned nil")
@@ -29,9 +33,9 @@ func TestRewriteMCPServerForSSH_WithRemoteBinary(t *testing.T) {
 		t.Fatal("args not []string")
 	}
 
-	// Should use structured exec, not bash -c
-	if args[0] != "codespace" || args[1] != "ssh" {
-		t.Errorf("args should start with [codespace ssh], got %v", args[:2])
+	// Rewritten server should invoke the local proxy helper, not gh directly.
+	if args[0] != "proxy" {
+		t.Errorf("args should start with [proxy], got %v", args[0])
 	}
 
 	// Should contain the remote binary path
@@ -46,22 +50,13 @@ func TestRewriteMCPServerForSSH_WithRemoteBinary(t *testing.T) {
 		t.Errorf("args should contain remote binary path, got %v", args)
 	}
 
-	// Should contain "exec" subcommand
-	foundExec := false
-	for _, a := range args {
-		if a == "exec" {
-			foundExec = true
-			break
-		}
-	}
-	if !foundExec {
-		t.Errorf("args should contain 'exec', got %v", args)
+	if got := result["command"]; got != "/usr/local/bin/self" {
+		t.Fatalf("command = %v, want /usr/local/bin/self", got)
 	}
 
-	// Should NOT contain "bash -c" (that's the old pattern)
-	for i, a := range args {
-		if a == "bash" && i+1 < len(args) && args[i+1] == "-c" {
-			t.Errorf("should not use 'bash -c' with remote binary, got %v", args)
+	for _, forbidden := range []string{"local-token", "GITHUB_TOKEN=local-token"} {
+		if contains(strings.Join(args, " "), forbidden) {
+			t.Fatalf("rewritten args should not serialize local token %q: %v", forbidden, args)
 		}
 	}
 
@@ -77,16 +72,11 @@ func TestRewriteMCPServerForSSH_WithRemoteBinary(t *testing.T) {
 		t.Errorf("args should contain '--workdir /workspaces/repo', got %v", args)
 	}
 
-	// Should contain --env for API_KEY
-	foundEnv := false
-	for i, a := range args {
-		if a == "--env" && i+1 < len(args) && args[i+1] == "API_KEY=secret" {
-			foundEnv = true
-			break
+	// Should contain mode and env forwarding through the helper
+	for _, want := range []string{"--github-auth", "local", "--env", "API_KEY=secret"} {
+		if !contains(strings.Join(args, "\n"), want) {
+			t.Errorf("args should contain %q, got %v", want, args)
 		}
-	}
-	if !foundEnv {
-		t.Errorf("args should contain '--env API_KEY=secret', got %v", args)
 	}
 
 	// Command should appear after --
@@ -111,7 +101,7 @@ func TestRewriteMCPServerForSSH_FallbackWithoutBinary(t *testing.T) {
 		"args":    []any{"server.py"},
 	}
 
-	result := rewriteMCPServerForSSH(server, "cs", "/workspaces/repo", "")
+	result := rewriteMCPServerForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, server, "cs", "/workspaces/repo", "")
 
 	if result == nil {
 		t.Fatal("rewriteMCPServerForSSH returned nil")
@@ -119,23 +109,11 @@ func TestRewriteMCPServerForSSH_FallbackWithoutBinary(t *testing.T) {
 
 	args := result["args"].([]string)
 
-	// Should use bash -c fallback with quoted command
-	foundBash := false
-	for i, a := range args {
-		if a == "bash" && i+1 < len(args) && args[i+1] == "-c" {
-			foundBash = true
-			// The command after -c should be shell-quoted (single quotes)
-			if i+2 < len(args) && !strings.HasPrefix(args[i+2], "'") {
-				t.Errorf("bash -c command should be shell-quoted, got %q", args[i+2])
-			}
-			break
-		}
+	if got := result["command"]; got != "/usr/local/bin/self" {
+		t.Fatalf("command = %v, want /usr/local/bin/self", got)
 	}
-	if !foundBash {
-		t.Errorf("should use 'bash -c' fallback without remote binary, got %v", args)
-	}
-	if bashCmd := args[len(args)-1]; !contains(bashCmd, ".env-secrets") {
-		t.Errorf("fallback command should bootstrap codespace auth env, got %q", bashCmd)
+	if !contains(strings.Join(args, " "), "proxy") {
+		t.Errorf("fallback rewrite should still use proxy helper, got %v", args)
 	}
 }
 
@@ -154,7 +132,9 @@ func TestRewriteHooksForSSH_WithRemoteBinary(t *testing.T) {
 		}
 	}`
 
-	result := rewriteHooksForSSH([]byte(hooksJSON), "my-cs", "/workspaces/repo", "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace")
+	t.Setenv("GITHUB_TOKEN", "local-token")
+
+	result := rewriteHooksForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthLocal, []byte(hooksJSON), "my-cs", "/workspaces/repo", "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace")
 	if result == nil {
 		t.Fatal("rewriteHooksForSSH returned nil")
 	}
@@ -169,15 +149,21 @@ func TestRewriteHooksForSSH_WithRemoteBinary(t *testing.T) {
 	hook := preToolUse[0].(map[string]any)
 	bash := hook["bash"].(string)
 
-	// Should contain the remote binary path and exec subcommand
+	// Should contain the proxy helper, mode, and remote binary path.
+	if !contains(bash, "/usr/local/bin/self") {
+		t.Errorf("should contain self binary path, got %q", bash)
+	}
+	if !contains(bash, "proxy") {
+		t.Errorf("should contain proxy subcommand, got %q", bash)
+	}
 	if !contains(bash, "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace") {
 		t.Errorf("should contain remote binary path, got %q", bash)
 	}
-	if !contains(bash, "exec") {
-		t.Errorf("should contain 'exec', got %q", bash)
+	if !contains(bash, "--github-auth") || !contains(bash, "local") {
+		t.Errorf("should contain auth mode, got %q", bash)
 	}
-	if !contains(bash, "--workdir") {
-		t.Errorf("should contain '--workdir', got %q", bash)
+	if contains(bash, "local-token") {
+		t.Errorf("hook rewrite should not serialize local token, got %q", bash)
 	}
 
 	// cwd and env should be removed from the hook object
@@ -192,7 +178,7 @@ func TestRewriteHooksForSSH_WithRemoteBinary(t *testing.T) {
 func TestRewriteHooksForSSH_FallbackWithoutBinary(t *testing.T) {
 	hooksJSON := `{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"echo hi","cwd":"."}]}}`
 
-	result := rewriteHooksForSSH([]byte(hooksJSON), "cs", "/workspaces/repo", "")
+	result := rewriteHooksForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, []byte(hooksJSON), "cs", "/workspaces/repo", "")
 	if result == nil {
 		t.Fatal("rewriteHooksForSSH returned nil")
 	}
@@ -204,12 +190,11 @@ func TestRewriteHooksForSSH_FallbackWithoutBinary(t *testing.T) {
 	hook := ss[0].(map[string]any)
 	bash := hook["bash"].(string)
 
-	// Fallback should use bash -c
-	if !contains(bash, "bash -c") {
-		t.Errorf("fallback should use 'bash -c', got %q", bash)
+	if !contains(bash, "proxy") {
+		t.Errorf("fallback should use proxy helper, got %q", bash)
 	}
-	if !contains(bash, ".env-secrets") {
-		t.Errorf("fallback hook should bootstrap codespace auth env, got %q", bash)
+	if contains(bash, ".env-secrets") {
+		t.Errorf("fallback hook should not bake bootstrap snippet into the hook file, got %q", bash)
 	}
 }
 
@@ -268,6 +253,47 @@ func TestRunExecExplicitEnvOverridesBootstrap(t *testing.T) {
 	}
 	if gotEnv["GITHUB_TOKEN"] != "flag-token" {
 		t.Fatalf("GITHUB_TOKEN = %q, want flag-token", gotEnv["GITHUB_TOKEN"])
+	}
+}
+
+func TestRunExecExplicitEnvOverridesBootstrapHostValues(t *testing.T) {
+	originalApply := applyCodespaceEnv
+	originalExec := execProcess
+	t.Cleanup(func() {
+		applyCodespaceEnv = originalApply
+		execProcess = originalExec
+	})
+
+	applyCodespaceEnv = func() {
+		_ = os.Setenv("GITHUB_TOKEN", "bootstrap-token")
+		_ = os.Setenv("GITHUB_API_URL", "https://api.github.com")
+		_ = os.Setenv("GITHUB_SERVER_URL", "https://github.com")
+	}
+
+	var gotEnv map[string]string
+	execProcess = func(_ string, _ []string, env []string) error {
+		gotEnv = envSliceToMap(env)
+		return errors.New("stop exec")
+	}
+
+	err := runExec([]string{
+		"--env", "GITHUB_TOKEN=flag-token",
+		"--env", "GH_TOKEN=flag-token",
+		"--env", "GITHUB_API_URL=https://ghe.example.com/api/v3",
+		"--env", "GITHUB_SERVER_URL=https://ghe.example.com",
+		"--", "sh",
+	})
+	if err == nil || err.Error() != "stop exec" {
+		t.Fatalf("runExec() error = %v, want stop exec", err)
+	}
+	if gotEnv["GITHUB_TOKEN"] != "flag-token" || gotEnv["GH_TOKEN"] != "flag-token" {
+		t.Fatalf("token env = %#v, want explicit flag-token overrides", gotEnv)
+	}
+	if gotEnv["GITHUB_API_URL"] != "https://ghe.example.com/api/v3" {
+		t.Fatalf("GITHUB_API_URL = %q, want https://ghe.example.com/api/v3", gotEnv["GITHUB_API_URL"])
+	}
+	if gotEnv["GITHUB_SERVER_URL"] != "https://ghe.example.com" {
+		t.Fatalf("GITHUB_SERVER_URL = %q, want https://ghe.example.com", gotEnv["GITHUB_SERVER_URL"])
 	}
 }
 

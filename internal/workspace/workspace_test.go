@@ -22,6 +22,9 @@ func TestNewWorkspace(t *testing.T) {
 	if ws.Manifest == nil {
 		t.Error("expected non-nil manifest")
 	}
+	if ws.Manifest.GitHubAuth != "codespace" {
+		t.Errorf("GitHubAuth = %q, want codespace", ws.Manifest.GitHubAuth)
+	}
 
 	// Verify directory exists
 	if _, err := os.Stat(ws.Dir); err != nil {
@@ -90,6 +93,31 @@ func TestLoadWorkspace(t *testing.T) {
 	entry := loaded.Manifest.Codespaces["github"]
 	if entry.Name != "cs-abc" {
 		t.Errorf("got codespace name %q, want %q", entry.Name, "cs-abc")
+	}
+	if loaded.Manifest.GitHubAuth != "codespace" {
+		t.Errorf("GitHubAuth = %q, want codespace", loaded.Manifest.GitHubAuth)
+	}
+}
+
+func TestLoadWorkspaceBackfillsDefaultGitHubAuth(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	dir := WorkspacePath("legacy")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	data := `{"created":"2026-03-10T00:00:00Z","codespaces":{"github":{"name":"cs-abc","repository":"github/github"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "workspace.json"), []byte(data), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ws, err := Load("legacy")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if ws.Manifest.GitHubAuth != "codespace" {
+		t.Fatalf("GitHubAuth = %q, want codespace", ws.Manifest.GitHubAuth)
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 )
 
 func TestParseInput(t *testing.T) {
@@ -202,6 +204,18 @@ func TestSetGetWorkdir(t *testing.T) {
 	}
 }
 
+func TestSetGetGitHubAuthMode(t *testing.T) {
+	c := NewClient("demo")
+	if got := c.GitHubAuthMode(); got != codespaceenv.GitHubAuthCodespace {
+		t.Fatalf("GitHubAuthMode() = %q, want %q", got, codespaceenv.GitHubAuthCodespace)
+	}
+
+	c.SetGitHubAuthMode(codespaceenv.GitHubAuthLocal)
+	if got := c.GitHubAuthMode(); got != codespaceenv.GitHubAuthLocal {
+		t.Fatalf("GitHubAuthMode() = %q, want %q", got, codespaceenv.GitHubAuthLocal)
+	}
+}
+
 func TestResolveWorkdir(t *testing.T) {
 	c := NewClient("demo")
 	c.SetWorkdir("/workspaces/default")
@@ -353,6 +367,40 @@ func TestRunBashUsesExplicitCwd(t *testing.T) {
 	}
 }
 
+func TestRunBashLocalGitHubAuthOverridesCodespaceBootstrap(t *testing.T) {
+	t.Setenv("GH_TOKEN", "local-gh-token")
+	t.Setenv("GITHUB_SERVER_URL", "https://github.example.com")
+
+	client := NewClient("demo")
+	client.SetGitHubAuthMode(codespaceenv.GitHubAuthLocal)
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "ok\n"},
+	})
+
+	if _, _, _, err := client.RunBash(context.Background(), "pwd", "/workspaces/repo/app"); err != nil {
+		t.Fatalf("RunBash() error = %v", err)
+	}
+
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1", len(calls))
+	}
+	command := calls[0].args[len(calls[0].args)-1]
+	for _, want := range []string{
+		envSecretsLoader,
+		"export GITHUB_TOKEN='local-gh-token'",
+		"export GH_TOKEN='local-gh-token'",
+		"export GITHUB_API_URL='https://github.example.com/api/v3'",
+		"export GITHUB_SERVER_URL='https://github.example.com'",
+		"cd '/workspaces/repo/app' && pwd",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("wrapped command missing %q in %q", want, command)
+		}
+	}
+}
+
 func TestGrepUsesExplicitCwd(t *testing.T) {
 	client := NewClient("demo")
 
@@ -426,6 +474,40 @@ func TestStartSessionBootstrapsAuthInsideTmuxCommand(t *testing.T) {
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestStartSessionUsesLocalGitHubAuthMode(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "local-token")
+	t.Setenv("GITHUB_API_URL", "https://ghe.example.com/api/v3")
+
+	client := NewClient("demo")
+	client.SetGitHubAuthMode(codespaceenv.GitHubAuthLocal)
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "/usr/bin/tmux\n"},
+		{stdout: ""},
+	})
+
+	if err := client.StartSession(context.Background(), "session-1", "git fetch origin", "/workspaces/repo"); err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("got %d calls, want 2", len(calls))
+	}
+	command := calls[1].args[len(calls[1].args)-1]
+	for _, want := range []string{
+		"export GITHUB_TOKEN='local-token'",
+		"export GH_TOKEN='local-token'",
+		"export GITHUB_API_URL='https://ghe.example.com/api/v3'",
+		"export GITHUB_SERVER_URL='https://ghe.example.com'",
+		"tmux new-session",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("tmux command missing %q in %q", want, command)
+		}
 	}
 }
 

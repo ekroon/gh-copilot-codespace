@@ -21,6 +21,7 @@ import (
 // Client manages SSH connections to a GitHub Codespace via gh CLI.
 type Client struct {
 	codespaceName  string
+	gitHubAuthMode codespaceenv.GitHubAuthMode
 	mu             sync.Mutex
 	sshConfigPath  string // path to generated SSH config with ControlMaster
 	sshHost        string // SSH host alias (e.g., "cs.develop-xxx")
@@ -50,6 +51,7 @@ type Executor interface {
 func NewClient(codespaceName string) *Client {
 	return &Client{
 		codespaceName:  codespaceName,
+		gitHubAuthMode: codespaceenv.GitHubAuthCodespace,
 		commandContext: exec.CommandContext,
 	}
 }
@@ -81,6 +83,27 @@ func (c *Client) GetWorkdir() string {
 		return wd
 	}
 	return "/workspaces"
+}
+
+// SetGitHubAuthMode sets the session-wide GitHub auth mode used when wrapping
+// remote commands.
+func (c *Client) SetGitHubAuthMode(mode codespaceenv.GitHubAuthMode) {
+	if mode == "" {
+		mode = codespaceenv.GitHubAuthCodespace
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gitHubAuthMode = mode
+}
+
+// GitHubAuthMode returns the session-wide GitHub auth mode used by the client.
+func (c *Client) GitHubAuthMode() codespaceenv.GitHubAuthMode {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gitHubAuthMode == "" {
+		return codespaceenv.GitHubAuthCodespace
+	}
+	return c.gitHubAuthMode
 }
 
 func (c *Client) sshState() (sshConfigPath, sshHost, controlSocket string) {
@@ -322,13 +345,19 @@ func (c *Client) probeMultiplexing(ctx context.Context) bool {
 // Exec runs a command on the codespace and returns stdout, stderr, and exit code.
 func (c *Client) Exec(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
 	// Ensure codespace-injected secrets are available for git auth etc.
-	wrapped := envSecretsLoader + " && " + command
+	wrapped, err := codespaceenv.WrapShellCommand(c.GitHubAuthMode(), command)
+	if err != nil {
+		return "", "", -1, fmt.Errorf("prepare auth env: %w", err)
+	}
 	sshConfigPath, _, _ := c.sshState()
 	return c.runRemoteCommand(ctx, wrapped, sshConfigPath != "")
 }
 
 func (c *Client) execReadOnly(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
-	wrapped := envSecretsLoader + " && " + command
+	wrapped, err := codespaceenv.WrapShellCommand(c.GitHubAuthMode(), command)
+	if err != nil {
+		return "", "", -1, fmt.Errorf("prepare auth env: %w", err)
+	}
 	sshConfigPath, _, _ := c.sshState()
 	useMultiplex := sshConfigPath != ""
 	stdout, stderr, exitCode, err = c.runRemoteCommand(ctx, wrapped, useMultiplex)
@@ -539,7 +568,10 @@ func (c *Client) StartSession(ctx context.Context, sessionID, command, cwd strin
 		return err
 	}
 
-	wrappedCommand := envSecretsLoader + " && " + wrapCommandInWorkdir(command, c.resolveWorkdir(cwd))
+	wrappedCommand, err := codespaceenv.WrapShellCommand(c.GitHubAuthMode(), wrapCommandInWorkdir(command, c.resolveWorkdir(cwd)))
+	if err != nil {
+		return fmt.Errorf("prepare auth env: %w", err)
+	}
 
 	// Create session with remain-on-exit so we can read output after command finishes
 	cmd := fmt.Sprintf(

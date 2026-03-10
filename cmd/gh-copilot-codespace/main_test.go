@@ -9,12 +9,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
 
 func TestBuildMCPConfig(t *testing.T) {
-	result := buildMCPConfig("/usr/local/bin/self", "my-codespace", "/workspaces/repo", nil, "")
+	result := buildMCPConfig("/usr/local/bin/self", codespaceenv.GitHubAuthLocal, "my-codespace", "/workspaces/repo", nil, "")
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -49,6 +50,9 @@ func TestBuildMCPConfig(t *testing.T) {
 	if got := env["CODESPACE_WORKDIR"]; got != "/workspaces/repo" {
 		t.Errorf("CODESPACE_WORKDIR = %v, want /workspaces/repo", got)
 	}
+	if got := env[codespaceenv.GitHubAuthModeEnvVar]; got != "local" {
+		t.Errorf("%s = %v, want local", codespaceenv.GitHubAuthModeEnvVar, got)
+	}
 }
 
 func TestBuildMCPConfigWithRemoteServers(t *testing.T) {
@@ -60,7 +64,7 @@ func TestBuildMCPConfigWithRemoteServers(t *testing.T) {
 		},
 	}
 
-	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "")
+	result := buildMCPConfig("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, "cs", "/workspaces/repo", remoteMCP, "")
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -87,7 +91,7 @@ func TestBuildMCPConfigRemoteCannotOverrideCodespace(t *testing.T) {
 		},
 	}
 
-	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "")
+	result := buildMCPConfig("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, "cs", "/workspaces/repo", remoteMCP, "")
 
 	var parsed map[string]any
 	json.Unmarshal([]byte(result), &parsed)
@@ -111,14 +115,16 @@ func TestRewriteMCPServerForSSH(t *testing.T) {
 		},
 	}
 
-	result := rewriteMCPServerForSSH(server, "my-cs", "/workspaces/repo", "")
+	t.Setenv("GITHUB_TOKEN", "local-token")
+
+	result := rewriteMCPServerForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthLocal, server, "my-cs", "/workspaces/repo", "")
 
 	if result == nil {
 		t.Fatal("rewriteMCPServerForSSH returned nil")
 	}
 
-	if got := result["command"]; got != "gh" {
-		t.Errorf("command = %v, want gh", got)
+	if got := result["command"]; got != "/usr/local/bin/self" {
+		t.Errorf("command = %v, want /usr/local/bin/self", got)
 	}
 
 	args, ok := result["args"].([]string)
@@ -126,24 +132,24 @@ func TestRewriteMCPServerForSSH(t *testing.T) {
 		t.Fatal("args not []string")
 	}
 
-	// Should contain: codespace ssh -c my-cs -- bash -c <remote-cmd>
+	// Should contain: proxy --codespace my-cs --github-auth local -- ...
 	if len(args) < 6 {
 		t.Fatalf("args too short: %v", args)
 	}
-	if args[0] != "codespace" || args[1] != "ssh" {
-		t.Errorf("args should start with [codespace ssh], got %v", args[:2])
+	if args[0] != "proxy" {
+		t.Errorf("args should start with [proxy], got %v", args[0])
 	}
-
-	// The remote command should contain the original command
-	remoteCmd := args[len(args)-1]
-	if !contains(remoteCmd, "/usr/local/bin/test-mcp") {
-		t.Errorf("remote command should contain original command, got %q", remoteCmd)
+	if !contains(strings.Join(args, " "), "--github-auth") || !contains(strings.Join(args, " "), "local") {
+		t.Errorf("args should contain auth mode, got %v", args)
 	}
-	if !contains(remoteCmd, "--mode") {
-		t.Errorf("remote command should contain args, got %q", remoteCmd)
+	if contains(strings.Join(args, " "), "local-token") {
+		t.Errorf("args should not serialize local tokens, got %v", args)
 	}
-	if !contains(remoteCmd, ".env-secrets") {
-		t.Errorf("remote command should bootstrap codespace auth env, got %q", remoteCmd)
+	if !contains(strings.Join(args, " "), "/usr/local/bin/test-mcp") {
+		t.Errorf("args should contain original command, got %v", args)
+	}
+	if !contains(strings.Join(args, " "), "--mode") {
+		t.Errorf("args should contain original args, got %v", args)
 	}
 }
 
@@ -343,7 +349,9 @@ func TestRewriteHooksForSSH(t *testing.T) {
 		}
 	}`
 
-	result := rewriteHooksForSSH([]byte(hooksJSON), "my-cs", "/workspaces/repo", "")
+	t.Setenv("GITHUB_TOKEN", "local-token")
+
+	result := rewriteHooksForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthLocal, []byte(hooksJSON), "my-cs", "/workspaces/repo", "")
 	if result == nil {
 		t.Fatal("rewriteHooksForSSH returned nil")
 	}
@@ -362,8 +370,8 @@ func TestRewriteHooksForSSH(t *testing.T) {
 	}
 	hook0 := sessionStart[0].(map[string]any)
 	bash0 := hook0["bash"].(string)
-	if !contains(bash0, "gh codespace ssh") {
-		t.Errorf("sessionStart bash should contain 'gh codespace ssh', got %q", bash0)
+	if !contains(bash0, "/usr/local/bin/self") || !contains(bash0, "proxy") {
+		t.Errorf("sessionStart bash should contain proxy helper, got %q", bash0)
 	}
 	if !contains(bash0, "my-cs") {
 		t.Errorf("sessionStart bash should contain codespace name, got %q", bash0)
@@ -371,8 +379,8 @@ func TestRewriteHooksForSSH(t *testing.T) {
 	if !contains(bash0, "echo") {
 		t.Errorf("sessionStart bash should contain original command, got %q", bash0)
 	}
-	if !contains(bash0, ".env-secrets") {
-		t.Errorf("sessionStart bash should bootstrap codespace auth env, got %q", bash0)
+	if contains(bash0, "local-token") {
+		t.Errorf("sessionStart bash should not serialize local tokens, got %q", bash0)
 	}
 	// cwd should be removed (baked into SSH command)
 	if _, ok := hook0["cwd"]; ok {
@@ -386,8 +394,8 @@ func TestRewriteHooksForSSH(t *testing.T) {
 	if !contains(bash1, "./scripts/policy-check.sh") {
 		t.Errorf("preToolUse bash should contain original command, got %q", bash1)
 	}
-	if !contains(bash1, ".env-secrets") {
-		t.Errorf("preToolUse bash should bootstrap codespace auth env, got %q", bash1)
+	if !contains(bash1, "--env") || !contains(bash1, "LOG_LEVEL") {
+		t.Errorf("preToolUse bash should preserve explicit env forwarding, got %q", bash1)
 	}
 	// Env should be removed (baked into SSH command)
 	if _, ok := hook1["env"]; ok {
@@ -466,14 +474,14 @@ func TestChooseWorkdir(t *testing.T) {
 }
 
 func TestRewriteHooksForSSH_NoHooks(t *testing.T) {
-	result := rewriteHooksForSSH([]byte(`{"version": 1}`), "cs", "/workspaces/repo", "")
+	result := rewriteHooksForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, []byte(`{"version": 1}`), "cs", "/workspaces/repo", "")
 	if result != nil {
 		t.Error("expected nil for config with no hooks")
 	}
 }
 
 func TestRewriteHooksForSSH_InvalidJSON(t *testing.T) {
-	result := rewriteHooksForSSH([]byte(`{invalid`), "cs", "/workspaces/repo", "")
+	result := rewriteHooksForSSH("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, []byte(`{invalid`), "cs", "/workspaces/repo", "")
 	if result != nil {
 		t.Error("expected nil for invalid JSON")
 	}
@@ -532,12 +540,22 @@ func TestParseLauncherArgs(t *testing.T) {
 		},
 		{
 			name: "parses existing launcher flags",
-			args: []string{"--local-tools", "-w", "/workspaces/repo", "-c", "cs-1,cs-2", "--theme", "dark"},
+			args: []string{"--local-tools", "--github-auth", "local", "-w", "/workspaces/repo", "-c", "cs-1,cs-2", "--theme", "dark"},
 			want: launcherOptions{
 				codespaceNames:  []string{"cs-1", "cs-2"},
+				githubAuth:      "local",
+				githubAuthSet:   true,
 				workdirOverride: "/workspaces/repo",
 				localTools:      true,
 				copilotArgs:     []string{"--theme", "dark"},
+			},
+		},
+		{
+			name: "parses equals form github auth flag",
+			args: []string{"--github-auth=local"},
+			want: launcherOptions{
+				githubAuth:    "local",
+				githubAuthSet: true,
 			},
 		},
 		{
@@ -556,6 +574,11 @@ func TestParseLauncherArgs(t *testing.T) {
 			name:    "no-codespace conflicts with resume",
 			args:    []string{"--no-codespace", "--resume", "saved-session"},
 			wantErr: "--no-codespace and --resume are mutually exclusive",
+		},
+		{
+			name:    "github auth requires value",
+			args:    []string{"--github-auth"},
+			wantErr: "--github-auth requires a value",
 		},
 	}
 
@@ -622,7 +645,7 @@ func TestBuildMCPConfigWithRegistry(t *testing.T) {
 		Workdir:    "/workspaces/github",
 	})
 
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", codespaceenv.GitHubAuthLocal, reg, nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -645,6 +668,9 @@ func TestBuildMCPConfigWithRegistry(t *testing.T) {
 	if !ok || registryJSON == "" {
 		t.Fatal("missing CODESPACE_REGISTRY env var")
 	}
+	if got := env[codespaceenv.GitHubAuthModeEnvVar]; got != "local" {
+		t.Fatalf("%s = %v, want local", codespaceenv.GitHubAuthModeEnvVar, got)
+	}
 
 	var entries []registryEntry
 	if err := json.Unmarshal([]byte(registryJSON), &entries); err != nil {
@@ -661,7 +687,7 @@ func TestBuildMCPConfigWithRegistry(t *testing.T) {
 func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
 	reg := registry.New()
 
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", codespaceenv.GitHubAuthCodespace, reg, nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -683,6 +709,27 @@ func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("got %d entries, want 0", len(entries))
+	}
+}
+
+func TestRegistryFromJSONAppliesGitHubAuthMode(t *testing.T) {
+	registryJSON := `[{"alias":"github","name":"cs-abc","repository":"github/github","branch":"main","workdir":"/workspaces/github"}]`
+
+	reg, err := registryFromJSON(registryJSON, codespaceenv.GitHubAuthLocal)
+	if err != nil {
+		t.Fatalf("registryFromJSON() error = %v", err)
+	}
+
+	cs, err := reg.Resolve("github")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	client, ok := cs.Executor.(*ssh.Client)
+	if !ok {
+		t.Fatalf("executor = %T, want *ssh.Client", cs.Executor)
+	}
+	if got := client.GitHubAuthMode(); got != codespaceenv.GitHubAuthLocal {
+		t.Fatalf("GitHubAuthMode() = %q, want %q", got, codespaceenv.GitHubAuthLocal)
 	}
 }
 

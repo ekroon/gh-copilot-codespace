@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
@@ -835,7 +836,23 @@ func openShellHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 		codespaceName := cs.Name
 
-		sshCmd := fmt.Sprintf("gh codespace ssh -c %s", codespaceName)
+		authMode, err := codespaceenv.ParseGitHubAuthMode(os.Getenv(codespaceenv.GitHubAuthModeEnvVar))
+		if err != nil {
+			return toolError(fmt.Sprintf("invalid %s: %v", codespaceenv.GitHubAuthModeEnvVar, err)), nil
+		}
+		self, err := os.Executable()
+		if err != nil {
+			return toolError(fmt.Sprintf("finding executable: %v", err)), nil
+		}
+		args := []string{self, "proxy", "--codespace", codespaceName, "--github-auth", string(authMode), "--shell"}
+		if cs.Workdir != "" {
+			args = append(args, "--workdir", cs.Workdir)
+		}
+		quoted := make([]string, len(args))
+		for i, arg := range args {
+			quoted[i] = shellQuote(arg)
+		}
+		sshCmd := strings.Join(quoted, " ")
 
 		if err := openTerminalTab(sshCmd, "codespace: "+codespaceName); err != nil {
 			return toolError(fmt.Sprintf("Failed to open shell: %v", err)), nil

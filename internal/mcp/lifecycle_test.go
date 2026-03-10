@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 )
@@ -183,6 +184,13 @@ func TestConnectCodespaceHandler_DuplicateCodespaceName(t *testing.T) {
 	}
 	if !strings.Contains(resultText(res), `already connected as alias "graph-hopper"`) {
 		t.Fatalf("expected existing alias in error, got %q", resultText(res))
+	}
+}
+
+func TestNewLifecycleSSHClientAppliesGitHubAuthMode(t *testing.T) {
+	client := newLifecycleSSHClient("cs-abc", codespaceenv.GitHubAuthLocal)
+	if got := client.GitHubAuthMode(); got != codespaceenv.GitHubAuthLocal {
+		t.Fatalf("GitHubAuthMode() = %q, want %q", got, codespaceenv.GitHubAuthLocal)
 	}
 }
 

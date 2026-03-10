@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
 	"github.com/ekroon/gh-copilot-codespace/internal/provisioner"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
@@ -23,9 +24,16 @@ type DeployFunc func(sshClient *ssh.Client, codespaceName string) (string, error
 
 // LifecycleConfig holds dependencies for lifecycle tool handlers.
 type LifecycleConfig struct {
-	GHRunner     GHRunner
-	DeployFunc   DeployFunc                // optional: deploy exec agent after SSH setup
-	Provisioners []provisioner.Provisioner // optional: run after setup
+	GHRunner       GHRunner
+	DeployFunc     DeployFunc                // optional: deploy exec agent after SSH setup
+	Provisioners   []provisioner.Provisioner // optional: run after setup
+	GitHubAuthMode codespaceenv.GitHubAuthMode
+}
+
+func newLifecycleSSHClient(codespaceName string, authMode codespaceenv.GitHubAuthMode) *ssh.Client {
+	client := ssh.NewClient(codespaceName)
+	client.SetGitHubAuthMode(authMode)
+	return client
 }
 
 // --- create_codespace ---
@@ -153,7 +161,7 @@ func createCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.
 		}
 
 		// Setup SSH multiplexing
-		sshClient := ssh.NewClient(csName)
+		sshClient := newLifecycleSSHClient(csName, cfg.GitHubAuthMode)
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			return toolError(fmt.Sprintf("SSH multiplexing failed: %v", err)), nil
 		}
@@ -291,7 +299,7 @@ func connectCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server
 		repoInfo := lookupCSRepository(csName)
 
 		// Setup SSH
-		sshClient := ssh.NewClient(csName)
+		sshClient := newLifecycleSSHClient(csName, cfg.GitHubAuthMode)
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			return toolError(fmt.Sprintf("SSH setup failed: %v", err)), nil
 		}
