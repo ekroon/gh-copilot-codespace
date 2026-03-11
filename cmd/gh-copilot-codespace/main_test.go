@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
@@ -532,9 +533,10 @@ func TestParseLauncherArgs(t *testing.T) {
 		},
 		{
 			name: "parses existing launcher flags",
-			args: []string{"--local-tools", "-w", "/workspaces/repo", "-c", "cs-1,cs-2", "--theme", "dark"},
+			args: []string{"--selected-only", "--local-tools", "-w", "/workspaces/repo", "-c", "cs-1,cs-2", "--theme", "dark"},
 			want: launcherOptions{
 				codespaceNames:  []string{"cs-1", "cs-2"},
+				selectedOnly:    true,
 				workdirOverride: "/workspaces/repo",
 				localTools:      true,
 				copilotArgs:     []string{"--theme", "dark"},
@@ -612,6 +614,19 @@ func TestResolveSelectedCodespaces(t *testing.T) {
 	}
 }
 
+func TestSelectedCodespaceNames(t *testing.T) {
+	selected := []codespace{
+		{Name: "cs-1"},
+		{Name: "cs-1"},
+		{Name: ""},
+		{Name: "cs-2"},
+	}
+
+	if got := selectedCodespaceNames(selected); !reflect.DeepEqual(got, []string{"cs-1", "cs-2"}) {
+		t.Fatalf("selectedCodespaceNames() = %v, want [cs-1 cs-2]", got)
+	}
+}
+
 func TestBuildMCPConfigWithRegistry(t *testing.T) {
 	reg := registry.New()
 	reg.Register(&registry.ManagedCodespace{
@@ -622,7 +637,7 @@ func TestBuildMCPConfigWithRegistry(t *testing.T) {
 		Workdir:    "/workspaces/github",
 	})
 
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{})
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -661,7 +676,7 @@ func TestBuildMCPConfigWithRegistry(t *testing.T) {
 func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
 	reg := registry.New()
 
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{})
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -684,12 +699,61 @@ func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("got %d entries, want 0", len(entries))
 	}
+	if _, ok := env[codespaceLifecycleConfigEnv]; ok {
+		t.Fatalf("did not expect %s for empty lifecycle config", codespaceLifecycleConfigEnv)
+	}
+}
+
+func TestBuildMCPConfigWithRegistry_LifecycleConfigEnv(t *testing.T) {
+	reg := registry.New()
+
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{
+		AccessPolicy: mcp.CodespaceAccessPolicy{
+			SelectedOnly:          true,
+			AllowedCodespaceNames: []string{"cs-1", "cs-1", "cs-2"},
+		},
+		Workspace: mcp.WorkspaceSessionContext{
+			Name: "bootstrap",
+			Dir:  "/tmp/bootstrap",
+		},
+	})
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	servers := parsed["mcpServers"].(map[string]any)
+	cs := servers["codespace"].(map[string]any)
+	env := cs["env"].(map[string]any)
+
+	lifecycleJSON, ok := env[codespaceLifecycleConfigEnv].(string)
+	if !ok || lifecycleJSON == "" {
+		t.Fatalf("missing %s env var", codespaceLifecycleConfigEnv)
+	}
+	if !strings.Contains(lifecycleJSON, `"selectedOnly":true`) {
+		t.Fatalf("expected lifecycle config to serialize selectedOnly, got %q", lifecycleJSON)
+	}
+
+	cfg, err := lifecycleConfigFromEnv(lifecycleJSON)
+	if err != nil {
+		t.Fatalf("parse lifecycle config env: %v", err)
+	}
+	if !cfg.AccessPolicy.SelectedOnly {
+		t.Fatal("expected selected-only policy to be enabled")
+	}
+	if !reflect.DeepEqual(cfg.AccessPolicy.AllowedCodespaceNames, []string{"cs-1", "cs-2"}) {
+		t.Fatalf("allowed codespace names = %v, want [cs-1 cs-2]", cfg.AccessPolicy.AllowedCodespaceNames)
+	}
+	if cfg.Workspace.Name != "bootstrap" || cfg.Workspace.Dir != "/tmp/bootstrap" {
+		t.Fatalf("workspace = %+v, want bootstrap /tmp/bootstrap", cfg.Workspace)
+	}
 }
 
 func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
 	dir := t.TempDir()
 
-	writeZeroCodespaceInstructionsPreamble(dir)
+	writeZeroCodespaceInstructionsPreamble(dir, mcp.CodespaceAccessPolicy{})
 
 	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
 	if err != nil {
@@ -700,6 +764,94 @@ func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected %q in preamble, got %q", want, text)
 		}
+	}
+}
+
+func TestWriteZeroCodespaceInstructionsPreamble_SelectedOnlyCreateOnly(t *testing.T) {
+	dir := t.TempDir()
+
+	writeZeroCodespaceInstructionsPreamble(dir, mcp.CodespaceAccessPolicy{
+		SelectedOnly: true,
+	})
+
+	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
+	if err != nil {
+		t.Fatalf("reading instructions: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"--selected-only",
+		"no existing codespaces were selected at startup",
+		"create_codespace",
+		"list_available_codespaces",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in restricted preamble, got %q", want, text)
+		}
+	}
+	if strings.Contains(text, "Use `connect_codespace` to attach an existing codespace to this session.") {
+		t.Fatalf("did not expect unrestricted connect guidance in restricted create-only preamble, got %q", text)
+	}
+}
+
+func TestWriteZeroCodespaceInstructionsPreamble_SelectedOnlyAllowlist(t *testing.T) {
+	dir := t.TempDir()
+
+	writeZeroCodespaceInstructionsPreamble(dir, mcp.CodespaceAccessPolicy{
+		SelectedOnly:          true,
+		AllowedCodespaceNames: []string{"cs-selected", "cs-created"},
+	})
+
+	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
+	if err != nil {
+		t.Fatalf("reading instructions: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"selected at startup plus codespaces created from this session",
+		"Use `connect_codespace` to attach one of those allowlisted existing codespaces.",
+		"When you `--resume` this session, the allowlist keeps the existing codespaces selected at startup plus any codespaces created from this session.",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in restricted allowlist preamble, got %q", want, text)
+		}
+	}
+}
+
+func TestZeroCodespaceStartupMessage(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy mcp.CodespaceAccessPolicy
+		want   string
+	}{
+		{
+			name:   "unrestricted",
+			policy: mcp.CodespaceAccessPolicy{},
+			want:   "No codespaces selected. Start with create_codespace or connect_codespace from the agent.",
+		},
+		{
+			name: "restricted create only",
+			policy: mcp.CodespaceAccessPolicy{
+				SelectedOnly: true,
+			},
+			want: "No existing codespaces selected at startup are available in this selected-only session. Start with create_codespace from the agent.",
+		},
+		{
+			name: "restricted with allowlist",
+			policy: mcp.CodespaceAccessPolicy{
+				SelectedOnly:          true,
+				AllowedCodespaceNames: []string{"cs-selected", "cs-created"},
+			},
+			want: "No codespaces connected yet. Use list_available_codespaces for existing codespaces selected at startup or created from this session, or create_codespace to add a new one.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := zeroCodespaceStartupMessage(tt.policy); got != tt.want {
+				t.Fatalf("zeroCodespaceStartupMessage() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

@@ -31,6 +31,8 @@ type codespace struct {
 	State       string `json:"state"`
 }
 
+const codespaceLifecycleConfigEnv = "CODESPACE_LIFECYCLE_CONFIG"
+
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: gh copilot-codespace [flags] [-- copilot-args...]
 
@@ -39,6 +41,7 @@ Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 Flags:
   -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
       --no-codespace     Start without connecting to any codespace (skip picker)
+      --selected-only     Restrict existing-codespace connections to codespaces selected at startup
   -w, --workdir PATH     Override workspace directory on the codespace
       --name SESSION     Name for the local workspace session
       --resume SESSION   Re-attach to a previous workspace session
@@ -96,10 +99,14 @@ func runMCPServer() {
 	// Support multi-codespace via CODESPACE_REGISTRY env var (JSON)
 	// Falls back to single CODESPACE_NAME for backward compatibility
 	registryJSON := os.Getenv("CODESPACE_REGISTRY")
+	lifecycleCfg, err := lifecycleConfigFromEnv(os.Getenv(codespaceLifecycleConfigEnv))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "codespace-mcp: invalid %s: %v\n", codespaceLifecycleConfigEnv, err)
+		os.Exit(1)
+	}
 
 	var reg *registry.Registry
 	if registryJSON != "" {
-		var err error
 		reg, err = registryFromJSON(registryJSON)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "codespace-mcp: invalid CODESPACE_REGISTRY: %v\n", err)
@@ -129,7 +136,7 @@ func runMCPServer() {
 		}
 	}
 
-	mcpServer := mcp.NewServer(reg)
+	mcpServer := mcp.NewServer(reg, lifecycleCfg)
 
 	log.SetOutput(os.Stderr)
 	log.Printf("codespace-mcp: starting with %d codespace(s)", reg.Len())
@@ -146,6 +153,61 @@ type registryEntry struct {
 	Repository string `json:"repository"`
 	Branch     string `json:"branch"`
 	Workdir    string `json:"workdir"`
+}
+
+type lifecycleConfigEnvData struct {
+	AccessPolicy *mcp.CodespaceAccessPolicy   `json:"accessPolicy,omitempty"`
+	Workspace    *mcp.WorkspaceSessionContext `json:"workspace,omitempty"`
+}
+
+func lifecycleConfigFromEnv(data string) (mcp.LifecycleConfig, error) {
+	if strings.TrimSpace(data) == "" {
+		return mcp.LifecycleConfig{}, nil
+	}
+
+	var env lifecycleConfigEnvData
+	if err := json.Unmarshal([]byte(data), &env); err != nil {
+		return mcp.LifecycleConfig{}, fmt.Errorf("parsing lifecycle config: %w", err)
+	}
+
+	var cfg mcp.LifecycleConfig
+	if env.AccessPolicy != nil {
+		cfg.AccessPolicy = mcp.CodespaceAccessPolicy{
+			SelectedOnly:          env.AccessPolicy.SelectedOnly,
+			AllowedCodespaceNames: uniqueStrings(env.AccessPolicy.AllowedCodespaceNames),
+		}
+	}
+	if env.Workspace != nil {
+		cfg.Workspace = mcp.WorkspaceSessionContext{
+			Name: env.Workspace.Name,
+			Dir:  env.Workspace.Dir,
+		}
+	}
+	return cfg, nil
+}
+
+func lifecycleConfigEnvJSON(cfg mcp.LifecycleConfig) string {
+	var env lifecycleConfigEnvData
+	if cfg.AccessPolicy.SelectedOnly || len(cfg.AccessPolicy.AllowedCodespaceNames) > 0 {
+		env.AccessPolicy = &mcp.CodespaceAccessPolicy{
+			SelectedOnly:          cfg.AccessPolicy.SelectedOnly,
+			AllowedCodespaceNames: uniqueStrings(cfg.AccessPolicy.AllowedCodespaceNames),
+		}
+	}
+	if cfg.Workspace.Name != "" || cfg.Workspace.Dir != "" {
+		env.Workspace = &mcp.WorkspaceSessionContext{
+			Name: cfg.Workspace.Name,
+			Dir:  cfg.Workspace.Dir,
+		}
+	}
+	if env.AccessPolicy == nil && env.Workspace == nil {
+		return ""
+	}
+	out, err := json.Marshal(env)
+	if err != nil {
+		return ""
+	}
+	return string(out)
 }
 
 // registryFromJSON deserializes CODESPACE_REGISTRY env var and creates SSH clients.
@@ -190,6 +252,7 @@ func registryFromEntries(ctx context.Context, entries []registryEntry, build fun
 type launcherOptions struct {
 	codespaceNames  []string
 	noCodespace     bool
+	selectedOnly    bool
 	workdirOverride string
 	sessionName     string
 	resumeSession   string
@@ -205,6 +268,8 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 			opts.localTools = true
 		case args[i] == "--no-codespace":
 			opts.noCodespace = true
+		case args[i] == "--selected-only":
+			opts.selectedOnly = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
 			// Support comma-separated: -c cs1,cs2
 			for _, name := range strings.Split(args[i+1], ",") {
@@ -238,6 +303,30 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 	return opts, nil
 }
 
+func selectedCodespaceNames(selected []codespace) []string {
+	names := make([]string, 0, len(selected))
+	for _, cs := range selected {
+		names = append(names, cs.Name)
+	}
+	return uniqueStrings(names)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
 func runLauncher(args []string) error {
 	opts, err := parseLauncherArgs(args)
 	if err != nil {
@@ -269,6 +358,14 @@ func runLauncher(args []string) error {
 		selectedList, err = selectCodespaces()
 		if err != nil {
 			return err
+		}
+	}
+
+	lifecycleCfg := mcp.LifecycleConfig{}
+	if opts.selectedOnly {
+		lifecycleCfg.AccessPolicy = mcp.CodespaceAccessPolicy{
+			SelectedOnly:          true,
+			AllowedCodespaceNames: selectedCodespaceNames(selectedList),
 		}
 	}
 
@@ -361,8 +458,17 @@ func runLauncher(args []string) error {
 			return fmt.Errorf("creating workspace: %w", wsErr)
 		}
 		instructionsDir = ws.Dir
-		writeZeroCodespaceInstructionsPreamble(instructionsDir)
-		fmt.Println("No codespaces selected. Start with create_codespace or connect_codespace from the agent.")
+		writeZeroCodespaceInstructionsPreamble(instructionsDir, lifecycleCfg.AccessPolicy)
+		fmt.Println(zeroCodespaceStartupMessage(lifecycleCfg.AccessPolicy))
+	}
+
+	if wsErr == nil {
+		lifecycleCfg.Workspace = mcp.WorkspaceSessionContext{
+			Name: ws.Name,
+			Dir:  ws.Dir,
+		}
+		ws.Manifest.SelectedOnly = lifecycleCfg.AccessPolicy.SelectedOnly
+		ws.Manifest.AllowedCodespaceNames = append([]string(nil), lifecycleCfg.AccessPolicy.AllowedCodespaceNames...)
 	}
 
 	// Ensure the directory is trusted by copilot so it doesn't prompt each time
@@ -392,7 +498,7 @@ func runLauncher(args []string) error {
 	}
 
 	// Build MCP config with registry serialization for multi-CS support
-	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers)
+	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers, lifecycleCfg)
 
 	// Excluded tools
 	var excludedTools []string
@@ -961,7 +1067,7 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 
 // buildMCPConfigWithRegistry creates the MCP config JSON using the full registry.
 // Uses CODESPACE_REGISTRY env var (JSON array) for zero-, single-, or multi-codespace support.
-func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any) string {
+func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any, lifecycleCfg mcp.LifecycleConfig) string {
 	// Serialize registry entries for the MCP server process
 	var entries []registryEntry
 	for _, cs := range reg.All() {
@@ -974,16 +1080,22 @@ func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remot
 		})
 	}
 	registryJSON, _ := json.Marshal(entries)
+	lifecycleJSON := lifecycleConfigEnvJSON(lifecycleCfg)
+
+	env := map[string]string{
+		"CODESPACE_REGISTRY": string(registryJSON),
+	}
+	if lifecycleJSON != "" {
+		env[codespaceLifecycleConfigEnv] = lifecycleJSON
+	}
 
 	servers := map[string]any{
 		"codespace": map[string]any{
 			"type":    "local",
 			"command": selfBinary,
 			"args":    []string{"mcp"},
-			"env": map[string]string{
-				"CODESPACE_REGISTRY": string(registryJSON),
-			},
-			"tools": []string{"*"},
+			"env":     env,
+			"tools":   []string{"*"},
 		},
 	}
 
@@ -1048,20 +1160,8 @@ func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Reg
 
 // writeZeroCodespaceInstructionsPreamble bootstraps a local session before any
 // codespace has been connected, so the agent knows to use lifecycle tools first.
-func writeZeroCodespaceInstructionsPreamble(mirrorDir string) {
-	preamble := `# Codespace Lifecycle Session
-
-You are not connected to any remote GitHub Codespaces yet, so project source code is not available locally.
-
-## What to do first
-
-- Use ` + "`list_available_codespaces`" + ` to discover existing codespaces you can connect to.
-- Use ` + "`get_codespace_options`" + ` and then ` + "`create_codespace`" + ` to create a new codespace for the repository you need.
-- Use ` + "`connect_codespace`" + ` to attach an existing codespace to this session.
-- After at least one codespace is connected, use ` + "`list_codespaces`" + ` to confirm aliases, then use the ` + "`remote_*`" + ` tools for source-code work.
-- **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create).
-
-`
+func writeZeroCodespaceInstructionsPreamble(mirrorDir string, policy mcp.CodespaceAccessPolicy) {
+	preamble := zeroCodespaceInstructionsPreamble(policy)
 
 	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
 	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
@@ -1074,6 +1174,52 @@ You are not connected to any remote GitHub Codespaces yet, so project source cod
 		return
 	}
 	os.WriteFile(instructionsPath, []byte(preamble+string(existing)), 0o644)
+}
+
+func zeroCodespaceInstructionsPreamble(policy mcp.CodespaceAccessPolicy) string {
+	var sb strings.Builder
+	sb.WriteString(`# Codespace Lifecycle Session
+
+You are not connected to any remote GitHub Codespaces yet, so project source code is not available locally.
+
+## What to do first
+
+`)
+
+	switch {
+	case policy.SelectedOnly && len(policy.AllowedCodespaceNames) == 0:
+		sb.WriteString("- This session was launched with `--selected-only`, and no existing codespaces were selected at startup.\n")
+		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create the first codespace for this session.\n")
+		sb.WriteString("- `list_available_codespaces` will not show any existing codespaces for this session, and `connect_codespace` cannot attach an existing codespace until you create one from this session.\n")
+	case policy.SelectedOnly:
+		sb.WriteString("- This session was launched with `--selected-only`, so existing codespaces are limited to the ones selected at startup plus codespaces created from this session.\n")
+		sb.WriteString("- Use `list_available_codespaces` to discover which existing codespaces are currently allowlisted for this session.\n")
+		sb.WriteString("- Use `connect_codespace` to attach one of those allowlisted existing codespaces.\n")
+		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create a new codespace for the repository you need.\n")
+	default:
+		sb.WriteString("- Use `list_available_codespaces` to discover existing codespaces you can connect to.\n")
+		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create a new codespace for the repository you need.\n")
+		sb.WriteString("- Use `connect_codespace` to attach an existing codespace to this session.\n")
+	}
+
+	if policy.SelectedOnly {
+		sb.WriteString("- When you `--resume` this session, the allowlist keeps the existing codespaces selected at startup plus any codespaces created from this session.\n")
+	}
+
+	sb.WriteString("- After at least one codespace is connected, use `list_codespaces` to confirm aliases, then use the `remote_*` tools for source-code work.\n")
+	sb.WriteString("- **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create).\n\n")
+	return sb.String()
+}
+
+func zeroCodespaceStartupMessage(policy mcp.CodespaceAccessPolicy) string {
+	switch {
+	case policy.SelectedOnly && len(policy.AllowedCodespaceNames) == 0:
+		return "No existing codespaces selected at startup are available in this selected-only session. Start with create_codespace from the agent."
+	case policy.SelectedOnly:
+		return "No codespaces connected yet. Use list_available_codespaces for existing codespaces selected at startup or created from this session, or create_codespace to add a new one."
+	default:
+		return "No codespaces selected. Start with create_codespace or connect_codespace from the agent."
+	}
 }
 
 // rewriteMCPServerForSSH rewrites an MCP server config to forward its stdio over SSH.
@@ -1484,7 +1630,10 @@ func runResume(sessionName string, copilotArgs []string) error {
 			writeCodespaceInstructionsPreamble(instructionsDir, primary.Workdir)
 		}
 	} else {
-		writeZeroCodespaceInstructionsPreamble(instructionsDir)
+		writeZeroCodespaceInstructionsPreamble(instructionsDir, mcp.CodespaceAccessPolicy{
+			SelectedOnly:          ws.Manifest.SelectedOnly,
+			AllowedCodespaceNames: append([]string(nil), ws.Manifest.AllowedCodespaceNames...),
+		})
 	}
 
 	if err := ensureTrustedFolder(instructionsDir); err != nil {
@@ -1497,7 +1646,18 @@ func runResume(sessionName string, copilotArgs []string) error {
 		return fmt.Errorf("changing to workspace dir: %w", err)
 	}
 
-	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil)
+	lifecycleCfg := mcp.LifecycleConfig{
+		AccessPolicy: mcp.CodespaceAccessPolicy{
+			SelectedOnly:          ws.Manifest.SelectedOnly,
+			AllowedCodespaceNames: uniqueStrings(ws.Manifest.AllowedCodespaceNames),
+		},
+		Workspace: mcp.WorkspaceSessionContext{
+			Name: ws.Name,
+			Dir:  ws.Dir,
+		},
+	}
+
+	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil, lifecycleCfg)
 
 	excludedTools := []string{
 		"bash", "write_bash", "read_bash",

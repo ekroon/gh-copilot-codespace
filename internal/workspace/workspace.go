@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 )
@@ -21,8 +22,72 @@ type Workspace struct {
 
 // Manifest is the session state stored in workspace.json.
 type Manifest struct {
-	Created    time.Time                  `json:"created"`
-	Codespaces map[string]CodespaceEntry  `json:"codespaces"`
+	Created               time.Time                 `json:"created"`
+	Codespaces            map[string]CodespaceEntry `json:"codespaces"`
+	SelectedOnly          bool                      `json:"selectedOnly,omitempty"`
+	AllowedCodespaceNames []string                  `json:"allowedCodespaceNames,omitempty"`
+}
+
+// SetAccessPolicy updates the persisted access policy fields.
+func (m *Manifest) SetAccessPolicy(selectedOnly bool, allowedCodespaceNames []string) {
+	if m == nil {
+		return
+	}
+
+	m.SelectedOnly = selectedOnly
+	m.AllowedCodespaceNames = normalizeAllowedCodespaceNames(allowedCodespaceNames)
+}
+
+// NormalizeAccessPolicy removes empty and duplicate codespace names.
+func (m *Manifest) NormalizeAccessPolicy() {
+	if m == nil {
+		return
+	}
+
+	m.AllowedCodespaceNames = normalizeAllowedCodespaceNames(m.AllowedCodespaceNames)
+}
+
+// HasAllowedCodespaceName reports whether a codespace name is already allowlisted.
+func (m *Manifest) HasAllowedCodespaceName(name string) bool {
+	if m == nil || name == "" {
+		return false
+	}
+
+	return slices.Contains(normalizeAllowedCodespaceNames(m.AllowedCodespaceNames), name)
+}
+
+// AddAllowedCodespaceName adds a codespace name to the allowlist if needed.
+func (m *Manifest) AddAllowedCodespaceName(name string) bool {
+	if m == nil || name == "" {
+		return false
+	}
+
+	m.NormalizeAccessPolicy()
+	if slices.Contains(m.AllowedCodespaceNames, name) {
+		return false
+	}
+
+	m.AllowedCodespaceNames = append(m.AllowedCodespaceNames, name)
+	return true
+}
+
+// RemoveAllowedCodespaceName removes a codespace name from the allowlist.
+func (m *Manifest) RemoveAllowedCodespaceName(name string) bool {
+	if m == nil || name == "" {
+		return false
+	}
+
+	m.NormalizeAccessPolicy()
+	idx := slices.Index(m.AllowedCodespaceNames, name)
+	if idx < 0 {
+		return false
+	}
+
+	m.AllowedCodespaceNames = slices.Delete(m.AllowedCodespaceNames, idx, idx+1)
+	if len(m.AllowedCodespaceNames) == 0 {
+		m.AllowedCodespaceNames = nil
+	}
+	return true
 }
 
 // CodespaceEntry records a codespace that is part of this workspace session.
@@ -100,9 +165,7 @@ func Load(name string) (*Workspace, error) {
 		return nil, fmt.Errorf("parsing workspace manifest: %w", err)
 	}
 
-	if manifest.Codespaces == nil {
-		manifest.Codespaces = make(map[string]CodespaceEntry)
-	}
+	manifest.normalize()
 
 	return &Workspace{
 		Name:     name,
@@ -113,6 +176,8 @@ func Load(name string) (*Workspace, error) {
 
 // Save writes the manifest to workspace.json.
 func (w *Workspace) Save() error {
+	w.Manifest.normalize()
+
 	data, err := json.MarshalIndent(w.Manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling manifest: %w", err)
@@ -169,4 +234,40 @@ func generateName() string {
 	b := make([]byte, 3)
 	rand.Read(b)
 	return fmt.Sprintf("%s-%s", ts, hex.EncodeToString(b))
+}
+
+func (m *Manifest) normalize() {
+	if m == nil {
+		return
+	}
+
+	if m.Codespaces == nil {
+		m.Codespaces = make(map[string]CodespaceEntry)
+	}
+
+	m.NormalizeAccessPolicy()
+}
+
+func normalizeAllowedCodespaceNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(names))
+	normalized := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+	}
+
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
 }

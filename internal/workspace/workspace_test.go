@@ -3,6 +3,8 @@ package workspace
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -71,8 +73,16 @@ func TestLoadWorkspace(t *testing.T) {
 		Branch:     "main",
 		Workdir:    "/workspaces/github",
 	})
+	ws.Manifest.SetAccessPolicy(true, []string{"cs-abc"})
 	if err := ws.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(ws.Dir, "workspace.json"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(data), `"selectedOnly": true`) {
+		t.Fatalf("expected workspace.json to persist selectedOnly, got %q", string(data))
 	}
 
 	// Load it
@@ -90,6 +100,12 @@ func TestLoadWorkspace(t *testing.T) {
 	entry := loaded.Manifest.Codespaces["github"]
 	if entry.Name != "cs-abc" {
 		t.Errorf("got codespace name %q, want %q", entry.Name, "cs-abc")
+	}
+	if !loaded.Manifest.SelectedOnly {
+		t.Error("expected selected-only policy to round trip")
+	}
+	if !reflect.DeepEqual(loaded.Manifest.AllowedCodespaceNames, []string{"cs-abc"}) {
+		t.Errorf("allowed codespace names = %v, want [cs-abc]", loaded.Manifest.AllowedCodespaceNames)
 	}
 }
 
@@ -152,5 +168,70 @@ func TestAddRemoveCodespace(t *testing.T) {
 	ws.RemoveCodespace("github")
 	if len(ws.Manifest.Codespaces) != 0 {
 		t.Fatalf("got %d codespaces after remove, want 0", len(ws.Manifest.Codespaces))
+	}
+}
+
+func TestManifestSetAccessPolicy(t *testing.T) {
+	manifest := &Manifest{}
+
+	manifest.SetAccessPolicy(true, []string{"cs-1", "", "cs-1", "cs-2"})
+
+	if !manifest.SelectedOnly {
+		t.Fatal("expected selected-only policy to be enabled")
+	}
+	if !reflect.DeepEqual(manifest.AllowedCodespaceNames, []string{"cs-1", "cs-2"}) {
+		t.Fatalf("allowed codespace names = %v, want [cs-1 cs-2]", manifest.AllowedCodespaceNames)
+	}
+
+	manifest.SetAccessPolicy(false, []string{"", ""})
+	if manifest.SelectedOnly {
+		t.Fatal("expected selected-only policy to be disabled")
+	}
+	if len(manifest.AllowedCodespaceNames) != 0 {
+		t.Fatalf("allowed codespace names = %v, want empty", manifest.AllowedCodespaceNames)
+	}
+}
+
+func TestManifestAllowedCodespaceHelpers(t *testing.T) {
+	manifest := &Manifest{
+		AllowedCodespaceNames: []string{"cs-1", "", "cs-1", "cs-2"},
+	}
+
+	manifest.NormalizeAccessPolicy()
+	if !reflect.DeepEqual(manifest.AllowedCodespaceNames, []string{"cs-1", "cs-2"}) {
+		t.Fatalf("allowed codespace names after normalize = %v, want [cs-1 cs-2]", manifest.AllowedCodespaceNames)
+	}
+
+	if !manifest.HasAllowedCodespaceName("cs-1") {
+		t.Fatal("expected cs-1 to be allowlisted")
+	}
+	if manifest.HasAllowedCodespaceName("") {
+		t.Fatal("did not expect empty codespace name to be allowlisted")
+	}
+	if manifest.AddAllowedCodespaceName("cs-2") {
+		t.Fatal("did not expect duplicate codespace name to be added")
+	}
+	if !manifest.AddAllowedCodespaceName("cs-3") {
+		t.Fatal("expected cs-3 to be added")
+	}
+	if !reflect.DeepEqual(manifest.AllowedCodespaceNames, []string{"cs-1", "cs-2", "cs-3"}) {
+		t.Fatalf("allowed codespace names after add = %v, want [cs-1 cs-2 cs-3]", manifest.AllowedCodespaceNames)
+	}
+
+	if !manifest.RemoveAllowedCodespaceName("cs-1") {
+		t.Fatal("expected cs-1 to be removed")
+	}
+	if manifest.RemoveAllowedCodespaceName("missing") {
+		t.Fatal("did not expect missing codespace name to be removed")
+	}
+	if !reflect.DeepEqual(manifest.AllowedCodespaceNames, []string{"cs-2", "cs-3"}) {
+		t.Fatalf("allowed codespace names after remove = %v, want [cs-2 cs-3]", manifest.AllowedCodespaceNames)
+	}
+
+	if !manifest.RemoveAllowedCodespaceName("cs-2") || !manifest.RemoveAllowedCodespaceName("cs-3") {
+		t.Fatal("expected remaining codespace names to be removed")
+	}
+	if len(manifest.AllowedCodespaceNames) != 0 {
+		t.Fatalf("allowed codespace names = %v, want empty", manifest.AllowedCodespaceNames)
 	}
 }

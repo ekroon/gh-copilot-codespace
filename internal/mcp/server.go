@@ -28,6 +28,7 @@ func NewServer(reg *registry.Registry, lcfg ...LifecycleConfig) *server.MCPServe
 	if cfg.GHRunner == nil {
 		cfg.GHRunner = &RealGHRunner{}
 	}
+	state := newLifecycleState(cfg)
 
 	s.AddTool(viewTool(), viewHandler(reg))
 	s.AddTool(editTool(), editHandler(reg))
@@ -43,11 +44,11 @@ func NewServer(reg *registry.Registry, lcfg ...LifecycleConfig) *server.MCPServe
 	s.AddTool(cdTool(), cdHandler(reg))
 	s.AddTool(cwdTool(), cwdHandler(reg))
 	s.AddTool(listCodespacesTool(), listCodespacesHandler(reg))
-	s.AddTool(listAvailableCodespacesTool(), listAvailableCodespacesHandler(cfg.GHRunner))
-	s.AddTool(getCodespaceOptionsTool(), getCodespaceOptionsHandler(cfg.GHRunner))
-	s.AddTool(createCodespaceTool(), createCodespaceHandler(reg, cfg))
-	s.AddTool(connectCodespaceTool(), connectCodespaceHandler(reg, cfg))
-	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandler(reg, cfg.GHRunner))
+	s.AddTool(listAvailableCodespacesTool(), listAvailableCodespacesHandlerWithState(state))
+	s.AddTool(getCodespaceOptionsTool(), getCodespaceOptionsHandler(state.cfg.GHRunner))
+	s.AddTool(createCodespaceTool(), createCodespaceHandlerWithState(reg, state))
+	s.AddTool(connectCodespaceTool(), connectCodespaceHandlerWithState(reg, state))
+	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandlerWithState(reg, state))
 
 	return s
 }
@@ -997,9 +998,16 @@ func listAvailableCodespacesTool() mcpsdk.Tool {
 	}
 }
 
-func listAvailableCodespacesHandler(ghRunner GHRunner) server.ToolHandlerFunc {
+func listAvailableCodespacesHandler(ghRunner GHRunner, policy CodespaceAccessPolicy) server.ToolHandlerFunc {
+	return listAvailableCodespacesHandlerWithState(newLifecycleState(LifecycleConfig{
+		GHRunner:     ghRunner,
+		AccessPolicy: policy,
+	}))
+}
+
+func listAvailableCodespacesHandlerWithState(state *lifecycleState) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
-		output, err := ghRunner.Run(ctx, "codespace", "list",
+		output, err := state.cfg.GHRunner.Run(ctx, "codespace", "list",
 			"--json", "name,displayName,repository,state",
 			"--limit", "50")
 		if err != nil {
@@ -1016,8 +1024,18 @@ func listAvailableCodespacesHandler(ghRunner GHRunner) server.ToolHandlerFunc {
 			return toolError(fmt.Sprintf("parsing codespace list: %v", err)), nil
 		}
 
+		policy := state.accessPolicy()
+		filtered := codespaces[:0]
+		for _, cs := range codespaces {
+			if !policy.allowsExistingCodespace(cs.Name) {
+				continue
+			}
+			filtered = append(filtered, cs)
+		}
+		codespaces = filtered
+
 		if len(codespaces) == 0 {
-			return toolSuccess("No codespaces found. Use create_codespace to create one."), nil
+			return toolSuccess(policy.emptyAvailableCodespacesMessage()), nil
 		}
 
 		var sb strings.Builder

@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/provisioner"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/workspace"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -21,11 +24,159 @@ import (
 // Returns the remote path to the deployed binary, or error.
 type DeployFunc func(sshClient *ssh.Client, codespaceName string) (string, error)
 
-// LifecycleConfig holds dependencies for lifecycle tool handlers.
+// CodespaceAccessPolicy carries launcher-selected connection policy state.
+type CodespaceAccessPolicy struct {
+	SelectedOnly          bool     `json:"selectedOnly,omitempty"`
+	AllowedCodespaceNames []string `json:"allowedCodespaceNames,omitempty"`
+}
+
+// WorkspaceSessionContext identifies the local workspace session backing the MCP server.
+type WorkspaceSessionContext struct {
+	Name string `json:"name,omitempty"`
+	Dir  string `json:"dir,omitempty"`
+}
+
+// LifecycleConfig holds dependencies and launcher context for lifecycle tool handlers.
 type LifecycleConfig struct {
 	GHRunner     GHRunner
 	DeployFunc   DeployFunc                // optional: deploy exec agent after SSH setup
 	Provisioners []provisioner.Provisioner // optional: run after setup
+	AccessPolicy CodespaceAccessPolicy
+	Workspace    WorkspaceSessionContext
+}
+
+type lifecycleState struct {
+	mu  sync.RWMutex
+	cfg LifecycleConfig
+}
+
+func newLifecycleState(cfg LifecycleConfig) *lifecycleState {
+	if cfg.GHRunner == nil {
+		cfg.GHRunner = &RealGHRunner{}
+	}
+	cfg.AccessPolicy.AllowedCodespaceNames = normalizeAllowedCodespaceNames(cfg.AccessPolicy.AllowedCodespaceNames)
+	return &lifecycleState{cfg: cfg}
+}
+
+func (s *lifecycleState) accessPolicy() CodespaceAccessPolicy {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneAccessPolicy(s.cfg.AccessPolicy)
+}
+
+func (s *lifecycleState) syncWorkspace(mutator func(*workspace.Workspace, *CodespaceAccessPolicy)) error {
+	if s.cfg.Workspace.Name == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ws, err := workspace.Load(s.cfg.Workspace.Name)
+	if err != nil {
+		return fmt.Errorf("loading workspace manifest %q: %w", s.cfg.Workspace.Name, err)
+	}
+
+	oldPolicy := cloneAccessPolicy(s.cfg.AccessPolicy)
+	ws.Manifest.SetAccessPolicy(oldPolicy.SelectedOnly, oldPolicy.AllowedCodespaceNames)
+
+	mutator(ws, &s.cfg.AccessPolicy)
+	ws.Manifest.SetAccessPolicy(s.cfg.AccessPolicy.SelectedOnly, s.cfg.AccessPolicy.AllowedCodespaceNames)
+
+	if err := ws.Save(); err != nil {
+		s.cfg.AccessPolicy = oldPolicy
+		return fmt.Errorf("saving workspace manifest %q: %w", s.cfg.Workspace.Name, err)
+	}
+
+	return nil
+}
+
+func cloneAccessPolicy(p CodespaceAccessPolicy) CodespaceAccessPolicy {
+	return CodespaceAccessPolicy{
+		SelectedOnly:          p.SelectedOnly,
+		AllowedCodespaceNames: append([]string(nil), p.AllowedCodespaceNames...),
+	}
+}
+
+func normalizeAllowedCodespaceNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(names))
+	normalized := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func (p *CodespaceAccessPolicy) addAllowedCodespaceName(name string) bool {
+	if p == nil || name == "" {
+		return false
+	}
+
+	p.AllowedCodespaceNames = normalizeAllowedCodespaceNames(p.AllowedCodespaceNames)
+	if slices.Contains(p.AllowedCodespaceNames, name) {
+		return false
+	}
+
+	p.AllowedCodespaceNames = append(p.AllowedCodespaceNames, name)
+	return true
+}
+
+func (p *CodespaceAccessPolicy) removeAllowedCodespaceName(name string) bool {
+	if p == nil || name == "" {
+		return false
+	}
+
+	p.AllowedCodespaceNames = normalizeAllowedCodespaceNames(p.AllowedCodespaceNames)
+	idx := slices.Index(p.AllowedCodespaceNames, name)
+	if idx < 0 {
+		return false
+	}
+
+	p.AllowedCodespaceNames = slices.Delete(p.AllowedCodespaceNames, idx, idx+1)
+	if len(p.AllowedCodespaceNames) == 0 {
+		p.AllowedCodespaceNames = nil
+	}
+	return true
+}
+
+func (p CodespaceAccessPolicy) allowsExistingCodespace(name string) bool {
+	if !p.SelectedOnly {
+		return true
+	}
+	for _, allowed := range p.AllowedCodespaceNames {
+		if allowed == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (p CodespaceAccessPolicy) emptyAvailableCodespacesMessage() string {
+	if p.SelectedOnly {
+		return "No codespaces selected at startup are available to connect in this selected-only session. Use create_codespace to create one."
+	}
+	return "No codespaces found. Use create_codespace to create one."
+}
+
+func (p CodespaceAccessPolicy) deniedConnectMessage(csName string) string {
+	if len(p.AllowedCodespaceNames) == 0 {
+		return fmt.Sprintf("codespace %q can't be connected in this selected-only session because no existing codespaces were selected at startup. Use create_codespace to create a new one.", csName)
+	}
+	return fmt.Sprintf("codespace %q wasn't selected at startup for this selected-only session. Use list_available_codespaces to see which existing codespaces you can connect to, or create_codespace to create a new one.", csName)
 }
 
 // --- create_codespace ---
@@ -72,6 +223,10 @@ func createCodespaceTool() mcpsdk.Tool {
 }
 
 func createCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.ToolHandlerFunc {
+	return createCodespaceHandlerWithState(reg, newLifecycleState(cfg))
+}
+
+func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleState) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		repo, err := requiredString(req, "repository")
 		if err != nil {
@@ -118,7 +273,7 @@ func createCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.
 		}
 
 		// Create the codespace
-		output, err := cfg.GHRunner.Run(ctx, args...)
+		output, err := state.cfg.GHRunner.Run(ctx, args...)
 		if err != nil {
 			errMsg := err.Error()
 			// Check for permissions authorization required — extract URL for user
@@ -142,7 +297,7 @@ func createCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.
 
 		// Wait for SSH readiness
 		for i := 0; i < 30; i++ {
-			checkOut, err := cfg.GHRunner.Run(ctx, "codespace", "ssh", "-c", csName, "--", "echo ready")
+			checkOut, err := state.cfg.GHRunner.Run(ctx, "codespace", "ssh", "-c", csName, "--", "echo ready")
 			if err == nil && strings.Contains(checkOut, "ready") {
 				break
 			}
@@ -160,8 +315,8 @@ func createCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.
 
 		// Deploy exec agent binary
 		var execAgent string
-		if cfg.DeployFunc != nil {
-			remotePath, err := cfg.DeployFunc(sshClient, csName)
+		if state.cfg.DeployFunc != nil {
+			remotePath, err := state.cfg.DeployFunc(sshClient, csName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed: %v\n", err)
 			} else {
@@ -194,15 +349,28 @@ func createCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
 		}
 
+		if err := state.syncWorkspace(func(ws *workspace.Workspace, policy *CodespaceAccessPolicy) {
+			ws.AddCodespace(alias, workspace.CodespaceEntry{
+				Name:       csName,
+				Repository: repo,
+				Branch:     branch,
+				Workdir:    workdir,
+			})
+			policy.addAllowedCodespaceName(csName)
+		}); err != nil {
+			reg.Deregister(alias)
+			return toolError(fmt.Sprintf("codespace %q was created and connected as alias %q, but failed to persist workspace state: %v. The local session entry was rolled back.", csName, alias, err)), nil
+		}
+
 		// Run provisioners
-		if len(cfg.Provisioners) > 0 {
+		if len(state.cfg.Provisioners) > 0 {
 			target := &csTarget{name: csName, repo: repo, workdir: workdir, client: sshClient}
 			rctx := provisioner.RunContext{
 				Terminal:       os.Getenv("TERM"),
 				Repository:     repo,
 				IsNewCodespace: true,
 			}
-			provisioner.RunAll(ctx, cfg.Provisioners, rctx, target)
+			provisioner.RunAll(ctx, state.cfg.Provisioners, rctx, target)
 		}
 
 		return toolSuccess(fmt.Sprintf("Created and connected codespace %q (alias: %s)\nRepository: %s\nWorkdir: %s",
@@ -269,6 +437,10 @@ func connectCodespaceTool() mcpsdk.Tool {
 }
 
 func connectCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.ToolHandlerFunc {
+	return connectCodespaceHandlerWithState(reg, newLifecycleState(cfg))
+}
+
+func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleState) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		csName, err := requiredString(req, "name")
 		if err != nil {
@@ -276,6 +448,10 @@ func connectCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server
 		}
 		if existing := reg.FindByName(csName); existing != nil {
 			return toolError(fmt.Sprintf("codespace %q already connected as alias %q", csName, existing.Alias)), nil
+		}
+		policy := state.accessPolicy()
+		if !policy.allowsExistingCodespace(csName) {
+			return toolError(policy.deniedConnectMessage(csName)), nil
 		}
 		alias := optionalString(req, "alias")
 		if alias == "" {
@@ -298,8 +474,8 @@ func connectCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server
 
 		// Deploy exec agent binary
 		var execAgent string
-		if cfg.DeployFunc != nil {
-			remotePath, err := cfg.DeployFunc(sshClient, csName)
+		if state.cfg.DeployFunc != nil {
+			remotePath, err := state.cfg.DeployFunc(sshClient, csName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed for %s: %v\n", csName, err)
 			} else {
@@ -321,15 +497,26 @@ func connectCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
 		}
 
+		if err := state.syncWorkspace(func(ws *workspace.Workspace, policy *CodespaceAccessPolicy) {
+			ws.AddCodespace(alias, workspace.CodespaceEntry{
+				Name:       csName,
+				Repository: repoInfo,
+				Workdir:    workdir,
+			})
+		}); err != nil {
+			reg.Deregister(alias)
+			return toolError(fmt.Sprintf("codespace %q was connected as alias %q, but failed to persist workspace state: %v. The local session entry was rolled back.", csName, alias, err)), nil
+		}
+
 		// Run provisioners
-		if len(cfg.Provisioners) > 0 {
+		if len(state.cfg.Provisioners) > 0 {
 			target := &csTarget{name: csName, repo: repoInfo, workdir: workdir, client: sshClient}
 			rctx := provisioner.RunContext{
 				Terminal:       os.Getenv("TERM"),
 				Repository:     repoInfo,
 				IsNewCodespace: false,
 			}
-			provisioner.RunAll(ctx, cfg.Provisioners, rctx, target)
+			provisioner.RunAll(ctx, state.cfg.Provisioners, rctx, target)
 		}
 
 		return toolSuccess(fmt.Sprintf("Connected to codespace %q (alias: %s)\nWorkdir: %s", csName, alias, workdir)), nil
@@ -380,6 +567,10 @@ func deleteCodespaceTool() mcpsdk.Tool {
 }
 
 func deleteCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.ToolHandlerFunc {
+	return deleteCodespaceHandlerWithState(reg, newLifecycleState(LifecycleConfig{GHRunner: ghRunner}))
+}
+
+func deleteCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleState) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		alias, err := requiredString(req, "codespace")
 		if err != nil {
@@ -399,10 +590,19 @@ func deleteCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 			}
 		}
 
+		if err := state.syncWorkspace(func(ws *workspace.Workspace, policy *CodespaceAccessPolicy) {
+			ws.RemoveCodespace(alias)
+			if shouldDelete {
+				policy.removeAllowedCodespaceName(csName)
+			}
+		}); err != nil {
+			return toolError(fmt.Sprintf("failed to update workspace state while disconnecting %q: %v. The codespace remains connected in this session.", alias, err)), nil
+		}
+
 		reg.Deregister(alias)
 
 		if shouldDelete {
-			if _, err := ghRunner.Run(ctx, "codespace", "delete", "-c", csName, "--force"); err != nil {
+			if _, err := state.cfg.GHRunner.Run(ctx, "codespace", "delete", "-c", csName, "--force"); err != nil {
 				return toolError(fmt.Sprintf("disconnected %q but failed to delete: %v", alias, err)), nil
 			}
 			return toolSuccess(fmt.Sprintf("Disconnected and deleted codespace %q (%s)", alias, csName)), nil

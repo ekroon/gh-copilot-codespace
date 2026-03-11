@@ -1,6 +1,6 @@
 # gh-copilot-codespace
 
-Launch Copilot CLI with all file/bash operations executing on remote GitHub Codespace(s) via SSH. Supports multiple codespaces, session resume, and on-demand codespace creation.
+Launch Copilot CLI with all file/bash operations executing on remote GitHub Codespace(s) via SSH. Supports multiple codespaces, session resume, selected-only restrictions, and on-demand codespace creation.
 
 ## How it works
 
@@ -56,6 +56,12 @@ gh copilot-codespace -c codespace-1,codespace-2
 # Start non-interactively with no codespaces, then create/connect from the agent
 gh copilot-codespace --no-codespace --name bootstrap-session
 
+# Restrict existing-codespace access to the codespaces selected at startup
+gh copilot-codespace --selected-only
+
+# Start a restricted bootstrap session with no existing codespaces selected
+gh copilot-codespace --no-codespace --selected-only --name restricted-bootstrap
+
 # Name the session for later resume
 gh copilot-codespace --name my-session
 
@@ -69,7 +75,19 @@ gh copilot-codespace workspaces
 gh copilot-codespace --model claude-sonnet-4.5
 ```
 
-If you launch without `-c/--codespace` or `--no-codespace`, the interactive picker supports selecting multiple codespaces. Press Enter without toggling any codespaces to start with no codespaces connected, or use `--no-codespace` to skip the picker entirely for non-interactive launches. From there, use `list_available_codespaces`, `create_codespace`, or `connect_codespace` from the agent.
+If you launch without `-c/--codespace` or `--no-codespace`, the interactive picker supports selecting multiple codespaces. Press Enter without toggling any codespaces to start with no codespaces connected, or use `--no-codespace` to skip the picker entirely for non-interactive launches. In unrestricted sessions, you can then use `list_available_codespaces`, `create_codespace`, or `connect_codespace` from the agent. In `--selected-only` sessions, existing-codespace access is limited to the codespaces selected at startup, and a zero-selection launch becomes create-only until you create a codespace.
+
+## Selected-only sessions
+
+`--selected-only` restricts access to **existing** codespaces. It does not disable `create_codespace`; it narrows which already-existing codespaces the agent can discover or attach to.
+
+| Tool | Behavior in `--selected-only` sessions |
+|---|---|
+| `list_available_codespaces` | Shows only the existing codespaces selected at startup. After `--resume`, it also shows codespaces that were created from inside that session and preserved in the session allowlist. |
+| `connect_codespace` | Can attach only existing codespaces on that allowlist. Other existing codespaces stay hidden from `list_available_codespaces` and are rejected if you try to connect to them directly. |
+| `create_codespace` | Always remains available. Newly created codespaces are connected immediately and added to the allowlist for future `--resume` sessions. |
+
+If you start with `--no-codespace --selected-only` (or leave the picker empty with the flag enabled), no existing codespaces are allowlisted. That session is **create-only** for adding codespaces: `list_available_codespaces` returns no connectable existing codespaces, and `connect_codespace` rejects existing codespaces until you create one with `create_codespace`.
 
 ## What gets fetched from the codespace
 
@@ -98,7 +116,7 @@ When connecting to multiple codespaces, all `remote_*` MCP tools accept an optio
 
 For `remote_bash`, `remote_grep`, and `remote_glob`, prefer passing `cwd` explicitly when you need predictable behavior across parallel tool calls. `remote_cd` still updates the default cwd for later sequential calls, but it should not be treated as an ordering dependency inside a parallel batch.
 
-The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools. Starting with zero connected codespaces is supported, so you can bootstrap a brand-new session and create the first codespace from inside the agent.
+The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools. Starting with zero connected codespaces is supported, so you can bootstrap a brand-new session and create the first codespace from inside the agent. With `--selected-only`, that zero-codespace bootstrap flow stays create-first unless you already preserved codespaces selected at startup or created from the session in the resumed allowlist.
 
 ## Session resume
 
@@ -113,6 +131,8 @@ gh copilot-codespace --resume my-feature
 ```
 
 Local files created in the workspace `files/` directory persist across sessions.
+
+When `--selected-only` was enabled, resume preserves the allowlist too: the **existing** codespaces selected at startup stay eligible, and any codespaces created from inside that session stay eligible as well. Resuming does not reopen access to other pre-existing codespaces that were not selected at startup.
 
 ## Custom provisioners
 
