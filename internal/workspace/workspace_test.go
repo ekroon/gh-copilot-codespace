@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewWorkspace(t *testing.T) {
@@ -148,6 +149,67 @@ func TestListWorkspaces(t *testing.T) {
 	}
 	if len(list) != 2 {
 		t.Fatalf("got %d workspaces, want 2", len(list))
+	}
+}
+
+func TestListWorkspacesIncludesSummaryMetadata(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	ws, err := New("session-a")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ws.AddCodespace("repo", CodespaceEntry{
+		Name:       "cs-abc",
+		Repository: "github/github",
+		Branch:     "main",
+	})
+	ws.AddCodespace("docs", CodespaceEntry{
+		Name:       "cs-docs",
+		Repository: "github/docs",
+		Branch:     "feature/planning",
+	})
+	ws.Manifest.SetAccessPolicy(true, []string{"cs-abc"})
+	if err := ws.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	manifestPath := filepath.Join(ws.Dir, "workspace.json")
+	lastUsed := time.Date(2026, 3, 19, 12, 34, 0, 0, time.UTC)
+	if err := os.Chtimes(manifestPath, lastUsed, lastUsed); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	list, err := List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("got %d workspaces, want 1", len(list))
+	}
+
+	got := list[0]
+	if got.Name != "session-a" {
+		t.Fatalf("Name = %q, want session-a", got.Name)
+	}
+	if got.Path != ws.Dir {
+		t.Fatalf("Path = %q, want %q", got.Path, ws.Dir)
+	}
+	if !got.LastUsed.Equal(lastUsed) {
+		t.Fatalf("LastUsed = %v, want %v", got.LastUsed, lastUsed)
+	}
+	if !got.SelectedOnly {
+		t.Fatal("expected SelectedOnly to be true")
+	}
+	if !reflect.DeepEqual(got.Repositories, []string{"github/docs", "github/github"}) {
+		t.Fatalf("Repositories = %v, want [github/docs github/github]", got.Repositories)
+	}
+	if !reflect.DeepEqual(got.CodespaceNames, []string{"cs-abc", "cs-docs"}) {
+		t.Fatalf("CodespaceNames = %v, want [cs-abc cs-docs]", got.CodespaceNames)
+	}
+	if !reflect.DeepEqual(got.Branches, []string{"feature/planning", "main"}) {
+		t.Fatalf("Branches = %v, want [feature/planning main]", got.Branches)
 	}
 }
 

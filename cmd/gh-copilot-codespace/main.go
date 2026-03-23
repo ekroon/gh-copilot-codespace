@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -14,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
@@ -729,51 +732,18 @@ func selectWorkspaceSession(list []workspace.WorkspaceSummary) (string, error) {
 		return list[0].Name, nil
 	}
 
-	lines := make([]string, len(list))
-	byChoice := make(map[string]workspace.WorkspaceSummary, len(list))
-	for i, ws := range list {
-		line := formatWorkspaceSummary(ws)
-		lines[i] = line
-		byChoice[line] = ws
-	}
-
-	if gumPath, err := exec.LookPath("gum"); err == nil {
-		cmd := exec.Command(gumPath, "choose", "--header", "Choose workspace session to resume")
-		cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
-		cmd.Stderr = os.Stderr
-		selected, err := cmd.Output()
+	if interactiveTerminalFunc() {
+		selected, err := workspacePickerFunc(list, os.Stdin, os.Stdout)
 		if err == nil {
-			choice := strings.TrimSpace(string(selected))
-			if ws, ok := byChoice[choice]; ok {
-				return ws.Name, nil
-			}
-			if choice == "" {
-				return "", fmt.Errorf("no workspace session selected")
-			}
+			return selected, nil
 		}
+		if errors.Is(err, errWorkspaceSelectionCancelled) {
+			return "", err
+		}
+		fmt.Fprintf(os.Stderr, "Warning: workspace picker failed, falling back to text prompt: %v\n", err)
 	}
 
-	fmt.Println("Available workspace sessions:")
-	for i, line := range lines {
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) == 2 {
-			fmt.Printf("  %2d) %s\n", i+1, parts[1])
-			continue
-		}
-		fmt.Printf("  %2d) %s\n", i+1, line)
-	}
-
-	fmt.Printf("\nSelect [1-%d]: ", len(list))
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("reading input: %w", err)
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(input))
-	if err != nil || n < 1 || n > len(list) {
-		return "", fmt.Errorf("invalid selection")
-	}
-	return list[n-1].Name, nil
+	return selectWorkspaceSessionFallback(list, os.Stdin, os.Stdout)
 }
 
 func formatWorkspaceSummary(ws workspace.WorkspaceSummary) string {
@@ -781,7 +751,172 @@ func formatWorkspaceSummary(ws workspace.WorkspaceSummary) string {
 	if ws.CodespaceCount == 1 {
 		label = "codespace"
 	}
-	return fmt.Sprintf("%s\tcreated %s · %d %s", ws.Name, ws.Created.Format("2006-01-02 15:04"), ws.CodespaceCount, label)
+
+	parts := []string{
+		fmt.Sprintf("repos %s", joinWorkspaceValues(ws.Repositories, "-")),
+		fmt.Sprintf("codespaces %s", joinWorkspaceValues(ws.CodespaceNames, "-")),
+		fmt.Sprintf("branches %s", joinWorkspaceValues(ws.Branches, "-")),
+		fmt.Sprintf("%d %s", ws.CodespaceCount, label),
+	}
+	if !ws.LastUsed.IsZero() {
+		parts = append(parts, "last used "+ws.LastUsed.Format("2006-01-02 15:04"))
+	}
+	if ws.Path != "" {
+		parts = append(parts, "path "+shortenHomePath(ws.Path))
+	}
+	if ws.SelectedOnly {
+		parts = append(parts, "selected-only")
+	}
+	return fmt.Sprintf("%s\t%s", ws.Name, strings.Join(parts, " · "))
+}
+
+func selectWorkspaceSessionFallback(list []workspace.WorkspaceSummary, input io.Reader, output io.Writer) (string, error) {
+	reader := bufio.NewReader(input)
+	filtered := list
+
+	for {
+		fmt.Fprintln(output, "Available workspace sessions:")
+		for i, ws := range filtered {
+			fmt.Fprintf(output, "  %2d) %s\n", i+1, workspaceSummaryDetails(ws))
+		}
+
+		fmt.Fprintf(output, "\nSelect [1-%d] or enter a search term: ", len(filtered))
+		raw, err := reader.ReadString('\n')
+		if err != nil {
+			return "", fmt.Errorf("reading input: %w", err)
+		}
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			if len(filtered) == 1 {
+				return filtered[0].Name, nil
+			}
+			return "", fmt.Errorf("invalid selection")
+		}
+
+		if n, err := strconv.Atoi(value); err == nil {
+			if n < 1 || n > len(filtered) {
+				return "", fmt.Errorf("invalid selection")
+			}
+			return filtered[n-1].Name, nil
+		}
+
+		matches := filterWorkspaceSummaries(list, value)
+		if len(matches) == 0 {
+			fmt.Fprintf(output, "\nNo workspace sessions match %q.\n\n", value)
+			filtered = list
+			continue
+		}
+		filtered = matches
+		fmt.Fprintf(output, "\nSearch %q matched %d workspace session(s).\n\n", value, len(filtered))
+	}
+}
+
+func filterWorkspaceSummaries(list []workspace.WorkspaceSummary, query string) []workspace.WorkspaceSummary {
+	terms := strings.Fields(strings.ToLower(query))
+	if len(terms) == 0 {
+		return append([]workspace.WorkspaceSummary(nil), list...)
+	}
+
+	result := make([]workspace.WorkspaceSummary, 0, len(list))
+	for _, ws := range list {
+		searchText := strings.ToLower(workspaceSearchText(ws))
+		matched := true
+		for _, term := range terms {
+			if !strings.Contains(searchText, term) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			result = append(result, ws)
+		}
+	}
+	return result
+}
+
+func workspaceSearchText(ws workspace.WorkspaceSummary) string {
+	label := "codespaces"
+	if ws.CodespaceCount == 1 {
+		label = "codespace"
+	}
+
+	parts := []string{
+		ws.Name,
+		strings.Join(ws.Repositories, " "),
+		strings.Join(ws.CodespaceNames, " "),
+		strings.Join(ws.Branches, " "),
+		strconv.Itoa(ws.CodespaceCount),
+		label,
+		ws.Created.Format("2006-01-02 15:04"),
+		shortenHomePath(ws.Path),
+		ws.Path,
+	}
+	parts = append(parts, legacyCodespaceWorkdirSearchTerms(ws.CodespaceNames)...)
+	if !ws.LastUsed.IsZero() {
+		parts = append(parts, ws.LastUsed.Format("2006-01-02 15:04"))
+	}
+	if ws.SelectedOnly {
+		parts = append(parts, "selected-only", "selected only")
+	}
+	return strings.Join(parts, " ")
+}
+
+func legacyCodespaceWorkdirSearchTerms(codespaceNames []string) []string {
+	if len(codespaceNames) == 0 {
+		return nil
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		return nil
+	}
+
+	terms := make([]string, 0, len(codespaceNames)*2)
+	for _, name := range codespaceNames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+
+		path := filepath.Join(homeDir, ".copilot", "codespace-workdirs", name)
+		terms = append(terms, path, shortenHomePath(path))
+	}
+	return terms
+}
+
+func workspaceSummaryDetails(ws workspace.WorkspaceSummary) string {
+	parts := strings.SplitN(formatWorkspaceSummary(ws), "\t", 2)
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return formatWorkspaceSummary(ws)
+}
+
+func joinWorkspaceValues(values []string, empty string) string {
+	if len(values) == 0 {
+		return empty
+	}
+	return strings.Join(values, ", ")
+}
+
+func shortenHomePath(path string) string {
+	if path == "" {
+		return ""
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" || !strings.HasPrefix(path, homeDir) {
+		return path
+	}
+
+	rel := strings.TrimPrefix(path, homeDir)
+	if rel == "" {
+		return "~"
+	}
+	if strings.HasPrefix(rel, string(filepath.Separator)) {
+		return "~" + rel
+	}
+	return path
 }
 
 func startCodespace(name string) error {
@@ -1745,6 +1880,10 @@ func runResume(sessionName string, copilotArgs []string) error {
 		},
 	}
 
+	if err := ws.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not refresh workspace last-used time: %v\n", err)
+	}
+
 	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil, lifecycleCfg)
 
 	excludedTools := []string{
@@ -1798,11 +1937,23 @@ func runWorkspaces(args []string) error {
 		return nil
 	}
 
-	fmt.Printf("%-30s %-20s %s\n", "Name", "Created", "Codespaces")
-	fmt.Println(strings.Repeat("-", 60))
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "Name\tLast Used\tRepositories\tCodespaces\tBranches\tPath")
 	for _, ws := range list {
-		fmt.Printf("%-30s %-20s %d\n", ws.Name, ws.Created.Format("2006-01-02 15:04"), ws.CodespaceCount)
+		lastUsed := ws.LastUsed
+		if lastUsed.IsZero() {
+			lastUsed = ws.Created
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			ws.Name,
+			lastUsed.Format("2006-01-02 15:04"),
+			joinWorkspaceValues(ws.Repositories, "-"),
+			fmt.Sprintf("%d (%s)", ws.CodespaceCount, joinWorkspaceValues(ws.CodespaceNames, "-")),
+			joinWorkspaceValues(ws.Branches, "-"),
+			shortenHomePath(ws.Path),
+		)
 	}
+	w.Flush()
 	fmt.Printf("\nResume with: gh copilot-codespace --resume\n")
 	fmt.Printf("         or: gh copilot-codespace --resume <name>\n")
 	fmt.Printf("Delete with: gh copilot-codespace workspaces --delete <name>\n")

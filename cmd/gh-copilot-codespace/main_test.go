@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
@@ -652,6 +655,198 @@ func TestSelectWorkspaceSession(t *testing.T) {
 			t.Fatalf("got %q, want %q", got, "second")
 		}
 	})
+}
+
+func TestSelectWorkspaceSessionFallbackSupportsSearch(t *testing.T) {
+	input := strings.NewReader("github/docs\n1\n")
+	var output bytes.Buffer
+
+	got, err := selectWorkspaceSessionFallback([]workspace.WorkspaceSummary{
+		{
+			Name:           "first",
+			LastUsed:       mustParseTime(t, "2026-03-17 09:00"),
+			CodespaceCount: 1,
+			Repositories:   []string{"github/github"},
+			CodespaceNames: []string{"cs-abc"},
+			Branches:       []string{"main"},
+			Path:           "/tmp/workspaces/first",
+		},
+		{
+			Name:           "second",
+			LastUsed:       mustParseTime(t, "2026-03-18 10:30"),
+			CodespaceCount: 2,
+			Repositories:   []string{"github/docs"},
+			CodespaceNames: []string{"cs-docs", "cs-preview"},
+			Branches:       []string{"feature/planning"},
+			Path:           "/tmp/workspaces/second",
+		},
+	}, input, &output)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "second" {
+		t.Fatalf("got %q, want %q", got, "second")
+	}
+	if !strings.Contains(output.String(), "Search") {
+		t.Fatalf("expected search prompt in output, got %q", output.String())
+	}
+}
+
+func TestFormatWorkspaceSummaryIncludesMetadata(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	got := formatWorkspaceSummary(workspace.WorkspaceSummary{
+		Name:           "2026-03-18_104209-8774e7",
+		LastUsed:       mustParseTime(t, "2026-03-19 11:22"),
+		CodespaceCount: 2,
+		Repositories:   []string{"github/graph-hopper"},
+		CodespaceNames: []string{"cs-router", "cs-gatekeeper"},
+		Branches:       []string{"feature/searchable-resume"},
+		Path:           filepath.Join(homeDir, ".copilot", "workspaces", "2026-03-18_104209-8774e7"),
+	})
+
+	for _, want := range []string{
+		"2026-03-18_104209-8774e7",
+		"github/graph-hopper",
+		"cs-router, cs-gatekeeper",
+		"feature/searchable-resume",
+		"2 codespaces",
+		"last used 2026-03-19 11:22",
+		"~/.copilot/workspaces/2026-03-18_104209-8774e7",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in summary %q", want, got)
+		}
+	}
+}
+
+func TestSelectWorkspaceSessionPickerCancelDoesNotFallback(t *testing.T) {
+	originalInteractive := interactiveTerminalFunc
+	originalPicker := workspacePickerFunc
+	interactiveTerminalFunc = func() bool { return true }
+	workspacePickerFunc = func([]workspace.WorkspaceSummary, *os.File, *os.File) (string, error) {
+		return "", errWorkspaceSelectionCancelled
+	}
+	t.Cleanup(func() {
+		interactiveTerminalFunc = originalInteractive
+		workspacePickerFunc = originalPicker
+	})
+
+	stdinFile := writeTempInputFile(t, "1\n")
+	originalStdin := os.Stdin
+	os.Stdin = stdinFile
+	defer func() { os.Stdin = originalStdin }()
+
+	_, err := selectWorkspaceSession([]workspace.WorkspaceSummary{
+		{Name: "first"},
+		{Name: "second"},
+	})
+	if !errors.Is(err, errWorkspaceSelectionCancelled) {
+		t.Fatalf("got err %v, want errWorkspaceSelectionCancelled", err)
+	}
+}
+
+func TestSelectWorkspaceSessionPickerErrorFallsBack(t *testing.T) {
+	originalInteractive := interactiveTerminalFunc
+	originalPicker := workspacePickerFunc
+	interactiveTerminalFunc = func() bool { return true }
+	workspacePickerFunc = func([]workspace.WorkspaceSummary, *os.File, *os.File) (string, error) {
+		return "", errors.New("picker failed")
+	}
+	t.Cleanup(func() {
+		interactiveTerminalFunc = originalInteractive
+		workspacePickerFunc = originalPicker
+	})
+
+	stdinFile := writeTempInputFile(t, "github/docs\n1\n")
+	originalStdin := os.Stdin
+	os.Stdin = stdinFile
+	defer func() { os.Stdin = originalStdin }()
+
+	originalStdout := os.Stdout
+	stdoutFile, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	os.Stdout = stdoutFile
+	defer func() { os.Stdout = originalStdout }()
+
+	got, err := selectWorkspaceSession([]workspace.WorkspaceSummary{
+		{Name: "first", Repositories: []string{"github/github"}},
+		{Name: "second", Repositories: []string{"github/docs"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "second" {
+		t.Fatalf("got %q, want %q", got, "second")
+	}
+}
+
+func TestWorkspacePickerModelFiltersOnMetadata(t *testing.T) {
+	model := newWorkspacePickerModel([]workspace.WorkspaceSummary{
+		{
+			Name:           "first",
+			Repositories:   []string{"github/github"},
+			CodespaceNames: []string{"cs-app"},
+			Branches:       []string{"main"},
+			Path:           "/tmp/workspaces/first",
+		},
+		{
+			Name:           "second",
+			Repositories:   []string{"github/docs"},
+			CodespaceNames: []string{"cs-docs"},
+			Branches:       []string{"feature/search"},
+			Path:           "/tmp/workspaces/second",
+		},
+	})
+
+	model.setQuery("github/docs")
+
+	if len(model.filtered) != 1 {
+		t.Fatalf("filtered len = %d, want 1", len(model.filtered))
+	}
+	if model.filtered[0].Name != "second" {
+		t.Fatalf("got %q, want %q", model.filtered[0].Name, "second")
+	}
+}
+
+func TestWorkspacePickerModelFiltersOnLegacyCodespaceWorkdirPath(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	model := newWorkspacePickerModel([]workspace.WorkspaceSummary{
+		{
+			Name:           "graph-hopper-session",
+			Repositories:   []string{"github/graph-hopper"},
+			CodespaceNames: []string{"graph-hopper-plan-4jxr59475hqrj5"},
+			Branches:       []string{"main"},
+			Path:           filepath.Join(homeDir, ".copilot", "workspaces", "graph-hopper-session"),
+		},
+	})
+
+	model.setQuery("~/.copilot/codespace-workdirs/graph-hopper-plan-4jxr59475hqrj5")
+
+	if len(model.filtered) != 1 {
+		t.Fatalf("filtered len = %d, want 1", len(model.filtered))
+	}
+	if model.filtered[0].Name != "graph-hopper-session" {
+		t.Fatalf("got %q, want %q", model.filtered[0].Name, "graph-hopper-session")
+	}
+}
+
+func TestWorkspacePickerModelCtrlCCancels(t *testing.T) {
+	model := newWorkspacePickerModel([]workspace.WorkspaceSummary{
+		{Name: "first"},
+	})
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	got := updated.(workspacePickerModel)
+
+	if !got.cancelled {
+		t.Fatal("expected picker model to be cancelled")
+	}
 }
 
 func writeTempInputFile(t *testing.T, input string) *os.File {

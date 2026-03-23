@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -101,8 +102,14 @@ type CodespaceEntry struct {
 // WorkspaceSummary is returned by List().
 type WorkspaceSummary struct {
 	Name           string
+	Path           string
 	Created        time.Time
+	LastUsed       time.Time
 	CodespaceCount int
+	Repositories   []string
+	CodespaceNames []string
+	Branches       []string
+	SelectedOnly   bool
 }
 
 // basePath returns the root directory for all workspaces.
@@ -215,15 +222,36 @@ func List() ([]WorkspaceSummary, error) {
 		if err != nil {
 			continue
 		}
+		manifestInfo, err := os.Stat(filepath.Join(ws.Dir, "workspace.json"))
+		if err != nil {
+			continue
+		}
 		result = append(result, WorkspaceSummary{
 			Name:           ws.Name,
+			Path:           ws.Dir,
 			Created:        ws.Manifest.Created,
+			LastUsed:       manifestInfo.ModTime(),
 			CodespaceCount: len(ws.Manifest.Codespaces),
+			Repositories:   summarizeWorkspaceRepositories(ws.Manifest.Codespaces),
+			CodespaceNames: summarizeWorkspaceCodespaceNames(ws.Manifest.Codespaces),
+			Branches:       summarizeWorkspaceBranches(ws.Manifest.Codespaces),
+			SelectedOnly:   ws.Manifest.SelectedOnly,
 		})
 	}
 
 	sort.Slice(result, func(i, j int) bool {
-		return result[i].Created.After(result[j].Created)
+		left := result[i].LastUsed
+		if left.IsZero() {
+			left = result[i].Created
+		}
+		right := result[j].LastUsed
+		if right.IsZero() {
+			right = result[j].Created
+		}
+		if left.Equal(right) {
+			return result[i].Created.After(result[j].Created)
+		}
+		return left.After(right)
 	})
 
 	return result, nil
@@ -269,5 +297,56 @@ func normalizeAllowedCodespaceNames(names []string) []string {
 	if len(normalized) == 0 {
 		return nil
 	}
+	return normalized
+}
+
+func summarizeWorkspaceRepositories(entries map[string]CodespaceEntry) []string {
+	values := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		values = append(values, entry.Repository)
+	}
+	return normalizeSummaryValues(values)
+}
+
+func summarizeWorkspaceCodespaceNames(entries map[string]CodespaceEntry) []string {
+	values := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		values = append(values, entry.Name)
+	}
+	return normalizeSummaryValues(values)
+}
+
+func summarizeWorkspaceBranches(entries map[string]CodespaceEntry) []string {
+	values := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		values = append(values, entry.Branch)
+	}
+	return normalizeSummaryValues(values)
+}
+
+func normalizeSummaryValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+
+	if len(normalized) == 0 {
+		return nil
+	}
+
+	sort.Strings(normalized)
 	return normalized
 }

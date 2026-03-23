@@ -136,6 +136,8 @@ gh copilot-codespace --resume my-feature
 gh copilot-codespace --resume
 ```
 
+`gh copilot-codespace workspaces` now shows richer workspace metadata including repositories, codespace names, branches, the local workspace path, and recent activity time. The interactive `--resume` picker also includes that metadata in each entry so you can search on it directly.
+
 Local files created in the workspace `files/` directory persist across sessions.
 
 When `--selected-only` was enabled, resume preserves the allowlist too: the **existing** codespaces selected at startup stay eligible, and any codespaces created from inside that session stay eligible as well. Resuming does not reopen access to other pre-existing codespaces that were not selected at startup.
