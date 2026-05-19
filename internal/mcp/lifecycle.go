@@ -43,6 +43,7 @@ type LifecycleConfig struct {
 	Provisioners []provisioner.Provisioner // optional: run after setup
 	AccessPolicy CodespaceAccessPolicy
 	Workspace    WorkspaceSessionContext
+	LocalWorkdir string // optional local root for tools that bridge local and remote files
 }
 
 type lifecycleState struct {

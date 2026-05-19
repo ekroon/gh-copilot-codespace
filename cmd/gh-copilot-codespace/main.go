@@ -35,6 +35,7 @@ type codespace struct {
 }
 
 const codespaceLifecycleConfigEnv = "CODESPACE_LIFECYCLE_CONFIG"
+const codespaceLocalWorkdirEnv = "CODESPACE_LOCAL_WORKDIR"
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: gh copilot-codespace [flags] [-- copilot-args...]
@@ -47,6 +48,7 @@ Flags:
       --selected-only[=BOOL]
                          Restrict existing-codespace connections to codespaces selected at startup
   -w, --workdir PATH     Override workspace directory on the codespace
+      --here             Launch Copilot from the current local directory while adding remote tools
       --name SESSION     Name for the local workspace session
       --resume [SESSION] Re-attach to a previous workspace session, or choose one interactively
       --local-tools[=BOOL]
@@ -109,6 +111,7 @@ func runMCPServer() {
 		fmt.Fprintf(os.Stderr, "codespace-mcp: invalid %s: %v\n", codespaceLifecycleConfigEnv, err)
 		os.Exit(1)
 	}
+	lifecycleCfg.LocalWorkdir = os.Getenv(codespaceLocalWorkdirEnv)
 	lifecycleCfg.Provisioners = loadProvisioners()
 
 	var reg *registry.Registry
@@ -258,6 +261,7 @@ func registryFromEntries(ctx context.Context, entries []registryEntry, build fun
 type launcherOptions struct {
 	codespaceNames    []string
 	noCodespace       bool
+	hereMode          bool
 	selectedOnly      optionalBool
 	workdirOverride   string
 	sessionName       string
@@ -291,6 +295,12 @@ type resolvedResumeConfig struct {
 	accessPolicy mcp.CodespaceAccessPolicy
 }
 
+type launchContext struct {
+	copilotCWD       string
+	instructionsDir  string
+	fetchRemoteFiles bool
+}
+
 func parseOptionalBoolFlag(arg string, flagName string) (optionalBool, bool, error) {
 	if arg == flagName {
 		return optionalBool{set: true, value: true}, true, nil
@@ -309,6 +319,10 @@ func parseOptionalBoolFlag(arg string, flagName string) (optionalBool, bool, err
 func parseLauncherArgs(args []string) (launcherOptions, error) {
 	var opts launcherOptions
 	for i := 0; i < len(args); i++ {
+		if args[i] == "--" {
+			opts.copilotArgs = append(opts.copilotArgs, args[i+1:]...)
+			break
+		}
 		if parsed, ok, err := parseOptionalBoolFlag(args[i], "--local-tools"); err != nil {
 			return launcherOptions{}, err
 		} else if ok {
@@ -325,6 +339,8 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 		switch {
 		case args[i] == "--no-codespace":
 			opts.noCodespace = true
+		case args[i] == "--here":
+			opts.hereMode = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
 			// Support comma-separated: -c cs1,cs2
 			for _, name := range strings.Split(args[i+1], ",") {
@@ -355,6 +371,9 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 	if opts.noCodespace && len(opts.codespaceNames) > 0 {
 		return launcherOptions{}, fmt.Errorf("--no-codespace and --codespace are mutually exclusive")
 	}
+	if opts.hereMode && (opts.resumeSession != "" || opts.resumeInteractive) {
+		return launcherOptions{}, fmt.Errorf("--here and --resume are mutually exclusive; use -- --resume to pass Copilot resume arguments")
+	}
 	if opts.noCodespace && (opts.resumeSession != "" || opts.resumeInteractive) {
 		return launcherOptions{}, fmt.Errorf("--no-codespace and --resume are mutually exclusive")
 	}
@@ -370,6 +389,25 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 	}
 
 	return opts, nil
+}
+
+func resolveLaunchContext(hereMode bool, originalCWD, instructionsDir string) launchContext {
+	if hereMode {
+		return launchContext{
+			copilotCWD:       originalCWD,
+			instructionsDir:  instructionsDir,
+			fetchRemoteFiles: false,
+		}
+	}
+	return launchContext{
+		copilotCWD:       instructionsDir,
+		instructionsDir:  instructionsDir,
+		fetchRemoteFiles: true,
+	}
+}
+
+func effectiveLocalTools(opts launcherOptions) bool {
+	return opts.localTools.resolve(opts.hereMode)
 }
 
 func newResumeConfig(opts launcherOptions) (resumeConfig, error) {
@@ -441,6 +479,11 @@ func uniqueStrings(values []string) []string {
 }
 
 func runLauncher(args []string) error {
+	originalCWD, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting current directory: %w", err)
+	}
+
 	opts, err := parseLauncherArgs(args)
 	if err != nil {
 		return err
@@ -563,7 +606,9 @@ func runLauncher(args []string) error {
 	// directory as the local bootstrap workspace until a codespace is connected.
 	ws, wsErr := workspace.New(opts.sessionName)
 
-	if len(selectedList) > 0 {
+	if opts.hereMode {
+		instructionsDir = originalCWD
+	} else if len(selectedList) > 0 {
 		primary := selectedList[0]
 
 		// Fetch instruction files into a deterministic dir that acts as the cwd
@@ -592,47 +637,57 @@ func runLauncher(args []string) error {
 			Name: ws.Name,
 			Dir:  ws.Dir,
 		}
-		ws.Manifest.Settings.LocalTools = opts.localTools.resolve(false)
+		ws.Manifest.Settings.LocalTools = effectiveLocalTools(opts)
 		ws.Manifest.SelectedOnly = lifecycleCfg.AccessPolicy.SelectedOnly
 		ws.Manifest.AllowedCodespaceNames = append([]string(nil), lifecycleCfg.AccessPolicy.AllowedCodespaceNames...)
 	}
 
+	launchCtx := resolveLaunchContext(opts.hereMode, originalCWD, instructionsDir)
+	if opts.hereMode {
+		lifecycleCfg.LocalWorkdir = originalCWD
+		fmt.Printf("  Local cwd:  %s\n", originalCWD)
+	}
+
 	// Ensure the directory is trusted by copilot so it doesn't prompt each time
-	if err := ensureTrustedFolder(instructionsDir); err != nil {
+	if err := ensureTrustedFolder(launchCtx.copilotCWD); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not auto-trust directory: %v\n", err)
 	}
 
 	// Initialize as git repo so copilot treats it as a repo root and loads instructions
-	exec.Command("git", "-C", instructionsDir, "init", "-q").Run()
+	if !opts.hereMode {
+		exec.Command("git", "-C", launchCtx.instructionsDir, "init", "-q").Run()
+	}
 
 	// Set local branch to match the primary codespace's current branch
-	if all := reg.All(); len(all) > 0 && all[0].Branch != "" {
-		exec.Command("git", "-C", instructionsDir, "symbolic-ref", "HEAD", "refs/heads/"+all[0].Branch).Run()
+	if all := reg.All(); !opts.hereMode && len(all) > 0 && all[0].Branch != "" {
+		exec.Command("git", "-C", launchCtx.instructionsDir, "symbolic-ref", "HEAD", "refs/heads/"+all[0].Branch).Run()
 	}
 
 	// Generate a postToolUse hook to keep the branch in sync
-	if len(selectedList) > 0 {
-		generateBranchSyncHook(instructionsDir, selectedList[0].Name, firstWorkdir, firstSSHClient)
+	if !opts.hereMode && len(selectedList) > 0 {
+		generateBranchSyncHook(launchCtx.instructionsDir, selectedList[0].Name, firstWorkdir, firstSSHClient)
 	}
 
 	// Generate remote-explorer custom agent for codespace file exploration
-	generateRemoteExplorerAgent(instructionsDir)
+	if !opts.hereMode {
+		generateRemoteExplorerAgent(launchCtx.instructionsDir)
+	}
 
 	// Change to the instructions dir so copilot finds the instruction files
-	if err := os.Chdir(instructionsDir); err != nil {
-		return fmt.Errorf("changing to instructions dir: %w", err)
+	if err := os.Chdir(launchCtx.copilotCWD); err != nil {
+		return fmt.Errorf("changing to copilot directory: %w", err)
 	}
 
 	// Build MCP config with registry serialization for multi-CS support
 	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers, lifecycleCfg)
 
 	// Excluded tools
-	excludedTools := launcherExcludedTools(opts.localTools.resolve(false))
+	excludedTools := launcherExcludedTools(effectiveLocalTools(opts))
 
 	// Forward IDE connections from all connected codespaces
 	for _, cs := range reg.All() {
 		if sshClient, ok := cs.Executor.(*ssh.Client); ok && sshClient.SSHConfigPath() != "" {
-			_, err = forwardIDEConnections(sshClient, cs.Name, instructionsDir, cs.Workdir)
+			_, err = forwardIDEConnections(sshClient, cs.Name, launchCtx.copilotCWD, cs.Workdir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: IDE forwarding failed for %s: %v\n", cs.Alias, err)
 			}
@@ -1407,6 +1462,9 @@ func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remot
 
 	env := map[string]string{
 		"CODESPACE_REGISTRY": string(registryJSON),
+	}
+	if lifecycleCfg.LocalWorkdir != "" {
+		env[codespaceLocalWorkdirEnv] = lifecycleCfg.LocalWorkdir
 	}
 	if lifecycleJSON != "" {
 		env[codespaceLifecycleConfigEnv] = lifecycleJSON

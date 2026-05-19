@@ -53,6 +53,12 @@ gh copilot-codespace -c my-codespace-name
 # Connect to multiple codespaces
 gh copilot-codespace -c codespace-1,codespace-2
 
+# Keep Copilot in the current local directory while adding remote tools
+gh copilot-codespace --here -c my-codespace-name
+
+# Same, while passing Copilot CLI flags such as conversation resume
+gh copilot-codespace --here -c my-codespace-name -- --resume <copilot-session>
+
 # Start non-interactively with no codespaces, then create/connect from the agent
 gh copilot-codespace --no-codespace --name bootstrap-session
 
@@ -82,6 +88,21 @@ gh copilot-codespace --model claude-sonnet-4.5
 ```
 
 If you launch without `-c/--codespace` or `--no-codespace`, the interactive picker supports selecting multiple codespaces. Press Enter without toggling any codespaces to start with no codespaces connected, or use `--no-codespace` to skip the picker entirely for non-interactive launches. In unrestricted sessions, you can then use `list_available_codespaces`, `create_codespace`, or `connect_codespace` from the agent. In `--selected-only` sessions, existing-codespace access is limited to the codespaces selected at startup, and a zero-selection launch becomes create-only until you create a codespace.
+
+## Current-directory mode
+
+Use `--here` when you already have useful local context (local WIP, a plan, local instructions, or an existing Copilot conversation) and want to add Codespaces tools without moving Copilot into the generated mirror directory.
+
+In `--here` mode, Copilot starts in the current local directory, local tools stay enabled by default, and remote tools are still available through the Codespaces MCP server. Remote project instructions, hooks, skills, and forwarded remote MCP configs are **not** mirrored into the current repository in this mode, so generated files are not written into your worktree.
+
+The local and remote checkouts are separate worktrees. Copying between them is explicit with `remote_copy`:
+
+```text
+remote_copy(source="src/app.go", destination="cs://github/src/app.go")
+remote_copy(source="cs://github/src/generated.go", destination="src/generated.go")
+```
+
+The `github` segment is the connected codespace alias shown by `list_codespaces`. `remote_copy` refuses to overwrite destination files unless `overwrite=true`; each copy is a one-time transfer, not synchronization.
 
 ## Selected-only sessions
 
@@ -116,11 +137,15 @@ The launcher fetches all project-level Copilot CLI components in a single SSH ca
 
 **MCP servers** are rewritten to forward stdio over SSH, so remote MCP tools appear as local tools to Copilot.
 
+With `--here`, this remote component mirroring is skipped to avoid writing generated instructions, hooks, agents, or skills into the current repository.
+
 ## Multi-codespace support
 
 When connecting to multiple codespaces, all `remote_*` MCP tools accept an optional `codespace` parameter (the alias). When only one codespace is connected, this parameter is optional.
 
 For `remote_bash`, `remote_grep`, and `remote_glob`, prefer passing `cwd` explicitly when you need predictable behavior across parallel tool calls. `remote_cd` still updates the default cwd for later sequential calls, but it should not be treated as an ordering dependency inside a parallel batch.
+
+`remote_copy` uses aliases in `cs://<alias>/<path>` endpoints. For example, `cs://api/src/server.go` copies to or from the codespace connected as alias `api`.
 
 The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools. Starting with zero connected codespaces is supported, so you can bootstrap a brand-new session and create the first codespace from inside the agent. With `--selected-only`, that zero-codespace bootstrap flow stays create-first unless you already preserved codespaces selected at startup or created from the session in the resumed allowlist.
 

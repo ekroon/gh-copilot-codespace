@@ -19,6 +19,7 @@ This project provides MCP tools that execute on a remote GitHub Codespace via SS
 | View/edit/create **source code** | `remote_view`, `remote_edit`, `remote_create` | Source code lives on the codespace |
 | Run **shell commands** (build, test, lint) | `remote_bash` | Commands must execute where the code is |
 | **Search** code (grep, find files) | `remote_grep`, `remote_glob` | Files are on the codespace |
+| Copy files between local and remote | `remote_copy` | Explicit one-time transfer between local cwd and a codespace workdir |
 | Edit **local session files** (plan.md, notes) | `view`, `edit`, `create` (built-in local) | Session state lives locally |
 | **Change directory** on codespace | `remote_cd` | Affects all subsequent remote commands |
 | **Interactive/long-running** commands | `remote_bash` or `remote_bash mode=async` + `remote_write_bash`/`remote_read_bash` | Backed by tmux sessions on the codespace |
@@ -57,6 +58,23 @@ Create a new file on the codespace. Parent directories are created automatically
 **Parameters:**
 - `path` (required) — Path for the new file
 - `file_text` (required) — Content of the file
+
+### `remote_copy`
+
+Copy one file between the local working directory and a connected codespace. Use local paths for local files and `cs://<alias>/<path>` for remote files under a codespace workdir. Aliases come from `list_codespaces`.
+
+**Parameters:**
+- `source` (required) — Local path or remote URI, e.g. `src/app.go` or `cs://github/src/app.go`
+- `destination` (required) — Local path or remote URI
+- `overwrite` (optional) — Set `true` to replace an existing destination file. Defaults to `false`.
+
+**Examples:**
+```
+remote_copy(source="src/app.go", destination="cs://github/src/app.go")
+remote_copy(source="cs://github/src/generated.go", destination="src/generated.go")
+```
+
+`remote_copy` is a one-time copy, not synchronization. In `--here` sessions, use it when local WIP should move to the codespace or when a selected remote result should be brought back locally.
 
 ## Shell Commands
 
@@ -185,6 +203,22 @@ Open an interactive SSH shell to the codespace in a new terminal window. Useful 
 4. remote_bash(command="go vet ./...")                    — verify
 ```
 
+### Local WIP Handoff in `--here`
+
+When launched with `--here`, Copilot is running in the user's local repo and remote codespace tools are also available. Local and remote are separate worktrees.
+
+Recommended flow:
+```
+1. Use local git status / file tools to inspect local WIP
+2. remote_bash(command="git status --short && git branch --show-current") to inspect remote state
+3. remote_bash(command="git switch -c handoff/<name>") or switch to the intended remote branch
+4. remote_copy selected local files to cs://<alias>/... paths
+5. remote_bash(command="git status --short && go test ./...") to continue remotely
+6. Use remote_copy in reverse only for selected remote files that should return to local
+```
+
+For broad tracked changes, prefer a deliberate patch workflow (`git diff --binary`, transfer, `git apply --check`, then `git apply`) rather than copying many files blindly.
+
 ## Tips
 
 - **All remote paths are absolute** on the codespace (e.g., `/workspaces/repo/...`)
@@ -194,3 +228,4 @@ Open an interactive SSH shell to the codespace in a new terminal window. Useful 
 - **grep falls back gracefully** — if ripgrep isn't installed, it uses grep
 - **Don't use local `bash`** for project commands — it won't find the source code
 - **Use local `view`/`edit`/`create`** only for session state files (plan.md, notes under `~/.copilot/`)
+- **In `--here` mode**, local tools operate on the current repo and `remote_*` tools operate on the codespace; use `remote_copy` for explicit one-time transfers.

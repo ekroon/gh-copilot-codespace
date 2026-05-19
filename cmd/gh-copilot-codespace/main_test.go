@@ -559,6 +559,31 @@ func TestParseLauncherArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "here mode with copilot args after separator",
+			args: []string{"--here", "-c", "cs-1", "--", "--resume", "copilot-session"},
+			want: launcherOptions{
+				hereMode:       true,
+				codespaceNames: []string{"cs-1"},
+				copilotArgs:    []string{"--resume", "copilot-session"},
+			},
+		},
+		{
+			name: "bare separator is not forwarded",
+			args: []string{"--here", "--", "--model", "claude-sonnet-4.5"},
+			want: launcherOptions{
+				hereMode:    true,
+				copilotArgs: []string{"--model", "claude-sonnet-4.5"},
+			},
+		},
+		{
+			name: "here mode supports explicit false local tools override",
+			args: []string{"--here", "--local-tools=false"},
+			want: launcherOptions{
+				hereMode:   true,
+				localTools: setBoolFlag(false),
+			},
+		},
+		{
 			name: "explicit resume session consumes following value",
 			args: []string{"--resume", "saved-session", "--model", "claude-sonnet-4.5"},
 			want: launcherOptions{
@@ -638,6 +663,11 @@ func TestParseLauncherArgs(t *testing.T) {
 			args:    []string{"--resume", "saved-session", "--name", "other-session"},
 			wantErr: "--name and --resume are mutually exclusive",
 		},
+		{
+			name:    "here conflicts with wrapper resume",
+			args:    []string{"--here", "--resume", "saved-session"},
+			wantErr: "--here and --resume are mutually exclusive; use -- --resume to pass Copilot resume arguments",
+		},
 	}
 
 	for _, tt := range tests {
@@ -657,6 +687,48 @@ func TestParseLauncherArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("got %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveLaunchContext(t *testing.T) {
+	t.Run("default uses instruction dir as copilot cwd", func(t *testing.T) {
+		got := resolveLaunchContext(false, "/local/repo", "/mirror")
+		if got.copilotCWD != "/mirror" {
+			t.Fatalf("copilotCWD = %q, want /mirror", got.copilotCWD)
+		}
+		if !got.fetchRemoteFiles {
+			t.Fatal("expected default mode to fetch remote files")
+		}
+	})
+
+	t.Run("here uses original cwd", func(t *testing.T) {
+		got := resolveLaunchContext(true, "/local/repo", "/mirror")
+		if got.copilotCWD != "/local/repo" {
+			t.Fatalf("copilotCWD = %q, want /local/repo", got.copilotCWD)
+		}
+		if got.fetchRemoteFiles {
+			t.Fatal("did not expect here mode to fetch remote files")
+		}
+	})
+}
+
+func TestEffectiveLocalTools(t *testing.T) {
+	tests := []struct {
+		name string
+		opts launcherOptions
+		want bool
+	}{
+		{name: "default mode disables local tools", opts: launcherOptions{}, want: false},
+		{name: "default mode explicit true", opts: launcherOptions{localTools: setBoolFlag(true)}, want: true},
+		{name: "here mode enables local tools", opts: launcherOptions{hereMode: true}, want: true},
+		{name: "here mode explicit false", opts: launcherOptions{hereMode: true, localTools: setBoolFlag(false)}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectiveLocalTools(tt.opts); got != tt.want {
+				t.Fatalf("effectiveLocalTools() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -1236,6 +1308,26 @@ func TestBuildMCPConfigWithRegistry_LifecycleConfigEnv(t *testing.T) {
 	}
 	if cfg.Workspace.Name != "bootstrap" || cfg.Workspace.Dir != "/tmp/bootstrap" {
 		t.Fatalf("workspace = %+v, want bootstrap /tmp/bootstrap", cfg.Workspace)
+	}
+}
+
+func TestBuildMCPConfigWithRegistry_LocalWorkdirEnv(t *testing.T) {
+	reg := registry.New()
+
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{
+		LocalWorkdir: "/local/repo",
+	})
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	servers := parsed["mcpServers"].(map[string]any)
+	cs := servers["codespace"].(map[string]any)
+	env := cs["env"].(map[string]any)
+	if got := env[codespaceLocalWorkdirEnv]; got != "/local/repo" {
+		t.Fatalf("%s = %v, want /local/repo", codespaceLocalWorkdirEnv, got)
 	}
 }
 

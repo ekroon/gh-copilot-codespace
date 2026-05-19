@@ -2,10 +2,13 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	pathpkg "path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -40,6 +43,7 @@ func NewServer(reg *registry.Registry, lcfg ...LifecycleConfig) *server.MCPServe
 	s.AddTool(readBashTool(), readBashHandler(reg))
 	s.AddTool(stopBashTool(), stopBashHandler(reg))
 	s.AddTool(listBashTool(), listBashHandler(reg))
+	s.AddTool(remoteCopyTool(), remoteCopyHandler(reg, cfg.LocalWorkdir))
 	s.AddTool(openShellTool(), openShellHandler(reg))
 	s.AddTool(cdTool(), cdHandler(reg))
 	s.AddTool(cwdTool(), cwdHandler(reg))
@@ -78,6 +82,256 @@ func resolveExecutor(reg *registry.Registry, req mcpsdk.CallToolRequest) (ssh.Ex
 var codespaceParam = map[string]any{
 	"type":        "string",
 	"description": "Codespace alias (optional if only one connected). Use list_codespaces to see available aliases.",
+}
+
+// --- remote_copy ---
+
+type copyEndpoint struct {
+	remote bool
+	alias  string
+	path   string
+}
+
+func remoteCopyTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "remote_copy",
+		Description: "Copy one file between the local working directory and a connected codespace. Use local paths for local files and cs://<alias>/<path> for remote files under that codespace's workdir (aliases come from list_codespaces). Direction is inferred from source and destination. This is a one-time copy, not synchronization; destination files are not overwritten unless overwrite=true.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"source": map[string]any{
+					"type":        "string",
+					"description": "Local file path or remote URI like cs://github/src/app.go. Remote paths are relative to the codespace workdir.",
+				},
+				"destination": map[string]any{
+					"type":        "string",
+					"description": "Local file path or remote URI like cs://github/src/app.go. One side must be local and the other remote.",
+				},
+				"overwrite": map[string]any{
+					"type":        "boolean",
+					"description": "Overwrite the destination if it already exists (default: false).",
+				},
+			},
+			Required: []string{"source", "destination"},
+		},
+	}
+}
+
+func remoteCopyHandler(reg *registry.Registry, localRoot string) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		source, err := requiredString(req, "source")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		destination, err := requiredString(req, "destination")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		overwrite := optionalBoolArg(req, "overwrite", false)
+
+		src, err := parseCopyEndpoint(source)
+		if err != nil {
+			return toolError(fmt.Sprintf("source: %v", err)), nil
+		}
+		dst, err := parseCopyEndpoint(destination)
+		if err != nil {
+			return toolError(fmt.Sprintf("destination: %v", err)), nil
+		}
+		if src.remote == dst.remote {
+			return toolError("remote_copy requires exactly one local path and one cs:// remote path"), nil
+		}
+
+		root, err := resolveLocalRoot(localRoot)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		if src.remote {
+			return copyFromRemote(ctx, reg, root, src, dst, overwrite)
+		}
+		return copyToRemote(ctx, reg, root, src, dst, overwrite)
+	}
+}
+
+func optionalBoolArg(req mcpsdk.CallToolRequest, key string, defaultValue bool) bool {
+	raw, ok := req.GetArguments()[key]
+	if !ok {
+		return defaultValue
+	}
+	value, ok := raw.(bool)
+	if !ok {
+		return defaultValue
+	}
+	return value
+}
+
+func parseCopyEndpoint(value string) (copyEndpoint, error) {
+	if strings.TrimSpace(value) == "" {
+		return copyEndpoint{}, fmt.Errorf("path is required")
+	}
+	if !strings.HasPrefix(value, "cs://") {
+		return copyEndpoint{path: value}, nil
+	}
+
+	rest := strings.TrimPrefix(value, "cs://")
+	slash := strings.Index(rest, "/")
+	if slash < 0 {
+		return copyEndpoint{}, fmt.Errorf("remote URI must be cs://<alias>/<path>")
+	}
+	alias := rest[:slash]
+	remotePath := rest[slash+1:]
+	if remotePath == "" {
+		return copyEndpoint{}, fmt.Errorf("remote URI must include a path")
+	}
+	return copyEndpoint{remote: true, alias: alias, path: remotePath}, nil
+}
+
+func resolveLocalRoot(localRoot string) (string, error) {
+	if localRoot == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("getting local workdir: %w", err)
+		}
+		localRoot = wd
+	}
+	abs, err := filepath.Abs(localRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving local workdir: %w", err)
+	}
+	return filepath.Clean(abs), nil
+}
+
+func resolveLocalCopyPath(root, value string) (string, error) {
+	var candidate string
+	if filepath.IsAbs(value) {
+		candidate = filepath.Clean(value)
+	} else {
+		candidate = filepath.Clean(filepath.Join(root, value))
+	}
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return "", fmt.Errorf("resolving local path: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("local path %q escapes local workdir %q", value, root)
+	}
+	return candidate, nil
+}
+
+func resolveRemoteCopyPath(cs *registry.ManagedCodespace, value string) (string, error) {
+	for _, segment := range strings.Split(value, "/") {
+		if segment == ".." {
+			return "", fmt.Errorf("remote path %q escapes codespace workdir", value)
+		}
+	}
+	clean := pathpkg.Clean("/" + strings.TrimPrefix(value, "/"))
+	rel := strings.TrimPrefix(clean, "/")
+	if rel == "" || rel == "." {
+		return "", fmt.Errorf("remote path is required")
+	}
+	return pathpkg.Join(cs.Workdir, rel), nil
+}
+
+func copyToRemote(ctx context.Context, reg *registry.Registry, localRoot string, src, dst copyEndpoint, overwrite bool) (*mcpsdk.CallToolResult, error) {
+	localPath, err := resolveLocalCopyPath(localRoot, src.path)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return toolError(fmt.Sprintf("reading local source: %v", err)), nil
+	}
+	if info.IsDir() {
+		return toolError("remote_copy currently supports files only, not directories"), nil
+	}
+
+	cs, err := reg.Resolve(dst.alias)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	remotePath, err := resolveRemoteCopyPath(cs, dst.path)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	if !overwrite {
+		exists, err := remotePathExists(ctx, cs.Executor, remotePath)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		if exists {
+			return toolError(fmt.Sprintf("destination %s already exists on codespace %q; set overwrite=true to replace it", remotePath, cs.Alias)), nil
+		}
+	}
+	content, err := os.ReadFile(localPath)
+	if err != nil {
+		return toolError(fmt.Sprintf("reading local source: %v", err)), nil
+	}
+	if err := cs.Executor.CreateFile(ctx, remotePath, string(content)); err != nil {
+		return toolError(fmt.Sprintf("copy to codespace: %v", err)), nil
+	}
+	return toolSuccess(fmt.Sprintf("Copied %s to cs://%s/%s", localPath, cs.Alias, strings.TrimPrefix(dst.path, "/"))), nil
+}
+
+func copyFromRemote(ctx context.Context, reg *registry.Registry, localRoot string, src, dst copyEndpoint, overwrite bool) (*mcpsdk.CallToolResult, error) {
+	cs, err := reg.Resolve(src.alias)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	remotePath, err := resolveRemoteCopyPath(cs, src.path)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	localPath, err := resolveLocalCopyPath(localRoot, dst.path)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	if !overwrite {
+		if _, err := os.Stat(localPath); err == nil {
+			return toolError(fmt.Sprintf("destination %s already exists locally; set overwrite=true to replace it", localPath)), nil
+		} else if !os.IsNotExist(err) {
+			return toolError(fmt.Sprintf("checking local destination: %v", err)), nil
+		}
+	}
+	content, err := readRemoteFile(ctx, cs.Executor, remotePath)
+	if err != nil {
+		return toolError(fmt.Sprintf("copy from codespace: %v", err)), nil
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return toolError(fmt.Sprintf("creating local parent directory: %v", err)), nil
+	}
+	if err := os.WriteFile(localPath, content, 0o644); err != nil {
+		return toolError(fmt.Sprintf("writing local destination: %v", err)), nil
+	}
+	return toolSuccess(fmt.Sprintf("Copied cs://%s/%s to %s", cs.Alias, strings.TrimPrefix(src.path, "/"), localPath)), nil
+}
+
+func remotePathExists(ctx context.Context, executor ssh.Executor, path string) (bool, error) {
+	_, stderr, exitCode, err := executor.RunBash(ctx, fmt.Sprintf("test -e %s", shellQuote(path)), "/")
+	if err != nil {
+		return false, fmt.Errorf("checking remote destination: %w", err)
+	}
+	switch exitCode {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		return false, fmt.Errorf("checking remote destination failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+	}
+}
+
+func readRemoteFile(ctx context.Context, executor ssh.Executor, path string) ([]byte, error) {
+	stdout, stderr, exitCode, err := executor.RunBash(ctx, fmt.Sprintf("base64 < %s", shellQuote(path)), "/")
+	if err != nil {
+		return nil, fmt.Errorf("read remote source: %w", err)
+	}
+	if exitCode != 0 {
+		return nil, fmt.Errorf("read remote source failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+	}
+	content, err := base64.StdEncoding.DecodeString(strings.TrimSpace(stdout))
+	if err != nil {
+		return nil, fmt.Errorf("decode remote source: %w", err)
+	}
+	return content, nil
 }
 
 // --- remote_view ---

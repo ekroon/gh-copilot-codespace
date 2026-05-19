@@ -1,8 +1,12 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -184,6 +188,179 @@ func TestToolSuccess(t *testing.T) {
 	}
 }
 
+func TestParseCopyEndpoint(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		want      copyEndpoint
+		wantError string
+	}{
+		{name: "local path", input: "src/app.go", want: copyEndpoint{path: "src/app.go"}},
+		{name: "remote path with alias", input: "cs://github/src/app.go", want: copyEndpoint{remote: true, alias: "github", path: "src/app.go"}},
+		{name: "remote path without alias", input: "cs:///src/app.go", want: copyEndpoint{remote: true, path: "src/app.go"}},
+		{name: "remote missing path", input: "cs://github", wantError: "remote URI must be cs://<alias>/<path>"},
+		{name: "blank", input: "", wantError: "path is required"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseCopyEndpoint(tt.input)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("err = %v, want containing %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRemoteCopy_LocalToCodespace(t *testing.T) {
+	localRoot := t.TempDir()
+	content := []byte{'h', 'e', 0x00, 0xff, 'o'}
+	if err := os.WriteFile(filepath.Join(localRoot, "src.txt"), content, 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	mock := &mockExecutor{runBashExit: 1}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "src.txt",
+		"destination": "cs://github/copied.txt",
+	}))
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	if mock.lastCreatePath != "/workspaces/repo/copied.txt" {
+		t.Fatalf("create path = %q, want /workspaces/repo/copied.txt", mock.lastCreatePath)
+	}
+	if got := []byte(mock.lastCreateContent); !bytes.Equal(got, content) {
+		t.Fatalf("create content bytes = %v, want %v", got, content)
+	}
+	if !strings.Contains(mock.lastRunBashCommand, "test -e") {
+		t.Fatalf("expected remote existence check, got %q", mock.lastRunBashCommand)
+	}
+}
+
+func TestRemoteCopy_CodespaceToLocal(t *testing.T) {
+	localRoot := t.TempDir()
+	mock := &mockExecutor{
+		runBashStdout: base64.StdEncoding.EncodeToString([]byte("remote")),
+	}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "cs://github/remote.txt",
+		"destination": "local/remote.txt",
+	}))
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	got, err := os.ReadFile(filepath.Join(localRoot, "local", "remote.txt"))
+	if err != nil {
+		t.Fatalf("read copied file: %v", err)
+	}
+	if string(got) != "remote" {
+		t.Fatalf("copied content = %q, want remote", got)
+	}
+	if !strings.Contains(mock.lastRunBashCommand, "base64 <") {
+		t.Fatalf("expected remote read, got %q", mock.lastRunBashCommand)
+	}
+}
+
+func TestRemoteCopy_RefusesOverwrite(t *testing.T) {
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "existing.txt"), []byte("local"), 0o644); err != nil {
+		t.Fatalf("write existing: %v", err)
+	}
+	mock := &mockExecutor{
+		runBashStdout: base64.StdEncoding.EncodeToString([]byte("remote")),
+	}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "cs://github/remote.txt",
+		"destination": "existing.txt",
+	}))
+	if !res.IsError {
+		t.Fatal("expected overwrite refusal")
+	}
+	if !strings.Contains(resultText(res), "already exists locally") {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+}
+
+func TestRemoteCopy_RejectsTraversal(t *testing.T) {
+	localRoot := t.TempDir()
+	reg := registry.New()
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "../secret.txt",
+		"destination": "cs://github/secret.txt",
+	}))
+	if !res.IsError {
+		t.Fatal("expected traversal error")
+	}
+	if !strings.Contains(resultText(res), "escapes local workdir") {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+}
+
+func TestRemoteCopy_RejectsRemoteTraversal(t *testing.T) {
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "src.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: &mockExecutor{runBashExit: 1},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "src.txt",
+		"destination": "cs://github/../secret.txt",
+	}))
+	if !res.IsError {
+		t.Fatal("expected remote traversal error")
+	}
+	if !strings.Contains(resultText(res), "escapes codespace workdir") {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+}
+
 func TestToolError(t *testing.T) {
 	result := toolError("fail")
 	if !result.IsError {
@@ -221,6 +398,8 @@ type mockExecutor struct {
 	viewFileErr         error
 	editFileErr         error
 	createFileErr       error
+	lastCreatePath      string
+	lastCreateContent   string
 	runBashCalls        int
 	lastRunBashCommand  string
 	lastRunBashCwd      string
@@ -264,7 +443,9 @@ func (m *mockExecutor) EditFile(_ context.Context, _, _, _ string) error {
 	return m.editFileErr
 }
 
-func (m *mockExecutor) CreateFile(_ context.Context, _, _ string) error {
+func (m *mockExecutor) CreateFile(_ context.Context, path, content string) error {
+	m.lastCreatePath = path
+	m.lastCreateContent = content
 	return m.createFileErr
 }
 
