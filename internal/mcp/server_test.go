@@ -188,6 +188,60 @@ func TestToolSuccess(t *testing.T) {
 	}
 }
 
+func TestToolRuntimeDefinitionsAndCall(t *testing.T) {
+	mock := &mockExecutor{}
+	mock.workdir = "/workspaces/repo"
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	runtime := NewToolRuntime(reg, LifecycleConfig{})
+	defs := runtime.Definitions()
+	if len(defs) == 0 {
+		t.Fatal("expected tool definitions")
+	}
+	var found bool
+	for _, def := range defs {
+		if def.Name == "remote_cwd" {
+			found = true
+			if def.Description == "" {
+				t.Fatal("remote_cwd description is empty")
+			}
+			if def.Parameters.Type != "object" {
+				t.Fatalf("remote_cwd parameters type = %q, want object", def.Parameters.Type)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("remote_cwd definition not found")
+	}
+
+	result, err := runtime.Call(context.Background(), "remote_cwd", map[string]any{"codespace": "github"})
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	if result.ResultType != "success" {
+		t.Fatalf("result type = %q, want success", result.ResultType)
+	}
+	if result.TextResultForLlm != "/workspaces/repo" {
+		t.Fatalf("result text = %q, want /workspaces/repo", result.TextResultForLlm)
+	}
+
+	result, err = runtime.Call(context.Background(), "remote_view", map[string]any{})
+	if err != nil {
+		t.Fatalf("runtime call missing arg: %v", err)
+	}
+	if result.ResultType != "failure" || !strings.Contains(result.TextResultForLlm, "missing required parameter") {
+		t.Fatalf("missing arg result = %+v, want failure with validation message", result)
+	}
+}
+
 func TestParseCopyEndpoint(t *testing.T) {
 	tests := []struct {
 		name      string

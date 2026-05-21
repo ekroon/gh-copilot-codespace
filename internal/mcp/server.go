@@ -23,36 +23,11 @@ import (
 func NewServer(reg *registry.Registry, lcfg ...LifecycleConfig) *server.MCPServer {
 	s := server.NewMCPServer("codespace-mcp", "0.2.0")
 
-	// Default lifecycle config
 	var cfg LifecycleConfig
 	if len(lcfg) > 0 {
 		cfg = lcfg[0]
 	}
-	if cfg.GHRunner == nil {
-		cfg.GHRunner = &RealGHRunner{}
-	}
-	state := newLifecycleState(cfg)
-
-	s.AddTool(viewTool(), viewHandler(reg))
-	s.AddTool(editTool(), editHandler(reg))
-	s.AddTool(createTool(), createHandler(reg))
-	s.AddTool(bashTool(), bashHandler(reg))
-	s.AddTool(grepTool(), grepHandler(reg))
-	s.AddTool(globTool(), globHandler(reg))
-	s.AddTool(writeBashTool(), writeBashHandler(reg))
-	s.AddTool(readBashTool(), readBashHandler(reg))
-	s.AddTool(stopBashTool(), stopBashHandler(reg))
-	s.AddTool(listBashTool(), listBashHandler(reg))
-	s.AddTool(remoteCopyTool(), remoteCopyHandler(reg, cfg.LocalWorkdir))
-	s.AddTool(openShellTool(), openShellHandler(reg))
-	s.AddTool(cdTool(), cdHandler(reg))
-	s.AddTool(cwdTool(), cwdHandler(reg))
-	s.AddTool(listCodespacesTool(), listCodespacesHandler(reg))
-	s.AddTool(listAvailableCodespacesTool(), listAvailableCodespacesHandlerWithState(state))
-	s.AddTool(getCodespaceOptionsTool(), getCodespaceOptionsHandler(state.cfg.GHRunner))
-	s.AddTool(createCodespaceTool(), createCodespaceHandlerWithState(reg, state))
-	s.AddTool(connectCodespaceTool(), connectCodespaceHandlerWithState(reg, state))
-	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandlerWithState(reg, state))
+	NewToolRuntime(reg, cfg).AddToServer(s)
 
 	return s
 }

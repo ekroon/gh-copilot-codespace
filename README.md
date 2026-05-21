@@ -7,8 +7,8 @@ Launch Copilot CLI with all file/bash operations executing on remote GitHub Code
 A single Go binary (`gh-copilot-codespace`) serves four roles:
 
 1. **Launcher mode** (default) — Lists your codespaces, lets you pick one or more, starts them if needed, deploys the exec agent, fetches instruction files and project-level components, then launches `copilot` with:
-   - `--excluded-tools` — disables local shell/search tools
-   - `--additional-mcp-config` — adds itself as the MCP server (plus any remote MCP configs)
+    - `--excluded-tools` — disables local shell/search tools
+    - `--additional-mcp-config` — adds itself as the MCP server (plus any remote MCP configs), unless first-party tools are supplied by the experimental extension mode
 
 2. **MCP server mode** (`gh-copilot-codespace mcp`) — Spawned by copilot, provides 17 remote tools over SSH:
     - `remote_view`, `remote_edit`, `remote_create` — file operations
@@ -20,7 +20,9 @@ A single Go binary (`gh-copilot-codespace`) serves four roles:
 
 3. **Exec agent** (`gh-copilot-codespace exec`) — Deployed to the codespace at startup. Provides structured command execution with workdir/env setup, replacing fragile shell escaping in SSH forwarding.
 
-4. **Workspace management** (`gh-copilot-codespace workspaces`) — Lists and manages workspace sessions for `--resume`.
+4. **Extension host** (`gh-copilot-codespace extension-host`) — Used by generated Copilot CLI extensions when `--extension-tools` is enabled. It exposes the same first-party remote tools through the extension API while keeping tool state in one long-lived helper process.
+
+5. **Workspace management** (`gh-copilot-codespace workspaces`) — Lists and manages workspace sessions for `--resume`.
 
 ## Prerequisites
 
@@ -76,6 +78,9 @@ gh copilot-codespace --resume my-session
 
 # Resume and keep local bash/grep/glob tools enabled too
 gh copilot-codespace --resume my-session --local-tools
+
+# Experimental: register first-party remote tools through a generated Copilot extension
+gh copilot-codespace -c my-codespace-name --extension-tools
 
 # Resume by choosing from saved sessions
 gh copilot-codespace --resume
@@ -139,9 +144,15 @@ The launcher fetches all project-level Copilot CLI components in a single SSH ca
 
 With `--here`, this remote component mirroring is skipped to avoid writing generated instructions, hooks, agents, or skills into the current repository.
 
+## Experimental extension tools
+
+`--extension-tools` registers this project’s first-party Codespaces tools through a generated Copilot CLI extension instead of the first-party `codespace` MCP server. The user-facing tool names stay the same (`remote_bash`, `remote_view`, `create_codespace`, and the rest of the first-party remote tools), and the generated extension delegates calls to a long-lived `gh-copilot-codespace extension-host` helper so working-directory changes, connected codespaces, and lifecycle state persist across calls.
+
+Remote project MCP configs are still forwarded through `--additional-mcp-config`; extension mode only replaces this project’s built-in Codespaces tool server. In normal mirrored-workspace launches, the generated extension is written under the mirror’s `.github/extensions/copilot-codespace/`. In `--here` mode, the launcher installs or updates one stable user-scoped wrapper extension at `~/.copilot/extensions/copilot-codespace/extension.mjs`, then passes a per-session manifest path and token through the Copilot process environment. The wrapper registers tools only when that manifest/token pair validates, so unrelated Copilot sessions load no tools from it. Legacy per-session generated user extension directories older than 24 hours are cleaned up on later `--extension-tools --here` launches.
+
 ## Multi-codespace support
 
-When connecting to multiple codespaces, all `remote_*` MCP tools accept an optional `codespace` parameter (the alias). When only one codespace is connected, this parameter is optional.
+When connecting to multiple codespaces, all first-party `remote_*` tools accept an optional `codespace` parameter (the alias), whether they are supplied by MCP or by the generated extension. When only one codespace is connected, this parameter is optional.
 
 For `remote_bash`, `remote_grep`, and `remote_glob`, prefer passing `cwd` explicitly when you need predictable behavior across parallel tool calls. `remote_cd` still updates the default cwd for later sequential calls, but it should not be treated as an ordering dependency inside a parallel batch.
 

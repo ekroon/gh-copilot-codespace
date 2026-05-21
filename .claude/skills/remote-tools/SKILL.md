@@ -1,7 +1,7 @@
 ---
 name: remote-tools
 description: >-
-  Explain how all remote MCP tools work for codespace development. Use this skill when the user asks
+  Explain how all remote Codespace tools work for codespace development. Use this skill when the user asks
   about "remote tools", "remote commands", "codespace tools", "how do I run commands on a codespace",
   "remote_bash", "remote_view", "remote_edit", "remote_grep", "remote_glob", "how do remote tools work",
   "what tools are available on the codespace", or mentions working "on a codespace", "remotely",
@@ -10,7 +10,7 @@ description: >-
 
 # Remote Codespace Tools Reference
 
-This project provides MCP tools that execute on a remote GitHub Codespace via SSH. These tools replace the built-in local tools for all source-code and shell operations.
+This project provides remote tools that execute on a GitHub Codespace via SSH. By default they are supplied by MCP; with `--extension-tools` they are supplied by a generated Copilot extension. In both modes, these tools replace the built-in local tools for source-code and shell operations.
 
 ## Tool Routing — When to Use What
 

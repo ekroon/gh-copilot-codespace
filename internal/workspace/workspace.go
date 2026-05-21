@@ -33,12 +33,13 @@ type Manifest struct {
 // SessionSettings are persisted session-level launcher defaults that should
 // survive resume.
 type SessionSettings struct {
-	LocalTools bool `json:"localTools,omitempty"`
+	LocalTools     bool `json:"localTools,omitempty"`
+	ExtensionTools bool `json:"extensionTools,omitempty"`
 }
 
 // IsZero allows json omitempty to drop empty settings blocks.
 func (s SessionSettings) IsZero() bool {
-	return !s.LocalTools
+	return !s.LocalTools && !s.ExtensionTools
 }
 
 // SetAccessPolicy updates the persisted access policy fields.

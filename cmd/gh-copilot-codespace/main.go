@@ -53,6 +53,8 @@ Flags:
       --resume [SESSION] Re-attach to a previous workspace session, or choose one interactively
       --local-tools[=BOOL]
                          Keep all local tools (bash, grep, glob) enabled alongside remote_* tools
+      --extension-tools[=BOOL]
+                         Register first-party remote tools through a generated Copilot extension (experimental)
 
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
@@ -86,6 +88,15 @@ func main() {
 		return
 	}
 
+	// If first arg is "extension-host", run the JSON bridge used by generated extensions
+	if len(os.Args) > 1 && os.Args[1] == "extension-host" {
+		if err := runExtensionHost(); err != nil {
+			fmt.Fprintf(os.Stderr, "extension-host: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// If first arg is "workspaces", list/manage workspace sessions
 	if len(os.Args) > 1 && os.Args[1] == "workspaces" {
 		if err := runWorkspaces(os.Args[2:]); err != nil {
@@ -103,13 +114,29 @@ func main() {
 }
 
 func runMCPServer() {
+	reg, lifecycleCfg, err := toolRuntimeInputsFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "codespace-mcp: %v\n", err)
+		os.Exit(1)
+	}
+
+	mcpServer := mcp.NewServer(reg, lifecycleCfg)
+
+	log.SetOutput(os.Stderr)
+	log.Printf("codespace-mcp: starting with %d codespace(s)", reg.Len())
+
+	if err := server.ServeStdio(mcpServer); err != nil {
+		log.Fatalf("codespace-mcp: server error: %v", err)
+	}
+}
+
+func toolRuntimeInputsFromEnv() (*registry.Registry, mcp.LifecycleConfig, error) {
 	// Support multi-codespace via CODESPACE_REGISTRY env var (JSON)
 	// Falls back to single CODESPACE_NAME for backward compatibility
 	registryJSON := os.Getenv("CODESPACE_REGISTRY")
 	lifecycleCfg, err := lifecycleConfigFromEnv(os.Getenv(codespaceLifecycleConfigEnv))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "codespace-mcp: invalid %s: %v\n", codespaceLifecycleConfigEnv, err)
-		os.Exit(1)
+		return nil, mcp.LifecycleConfig{}, fmt.Errorf("invalid %s: %w", codespaceLifecycleConfigEnv, err)
 	}
 	lifecycleCfg.LocalWorkdir = os.Getenv(codespaceLocalWorkdirEnv)
 	lifecycleCfg.Provisioners = loadProvisioners()
@@ -118,14 +145,12 @@ func runMCPServer() {
 	if registryJSON != "" {
 		reg, err = registryFromJSON(registryJSON)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "codespace-mcp: invalid CODESPACE_REGISTRY: %v\n", err)
-			os.Exit(1)
+			return nil, mcp.LifecycleConfig{}, fmt.Errorf("invalid CODESPACE_REGISTRY: %w", err)
 		}
 	} else {
 		codespaceName := os.Getenv("CODESPACE_NAME")
 		if codespaceName == "" {
-			fmt.Fprintln(os.Stderr, "CODESPACE_NAME or CODESPACE_REGISTRY environment variable is required")
-			os.Exit(1)
+			return nil, mcp.LifecycleConfig{}, fmt.Errorf("CODESPACE_NAME or CODESPACE_REGISTRY environment variable is required")
 		}
 		sshClient := ssh.NewClient(codespaceName)
 		ctx := context.Background()
@@ -140,19 +165,10 @@ func runMCPServer() {
 			Workdir:  workdir,
 			Executor: sshClient,
 		}); err != nil {
-			fmt.Fprintf(os.Stderr, "codespace-mcp: invalid single-codespace registry: %v\n", err)
-			os.Exit(1)
+			return nil, mcp.LifecycleConfig{}, fmt.Errorf("invalid single-codespace registry: %w", err)
 		}
 	}
-
-	mcpServer := mcp.NewServer(reg, lifecycleCfg)
-
-	log.SetOutput(os.Stderr)
-	log.Printf("codespace-mcp: starting with %d codespace(s)", reg.Len())
-
-	if err := server.ServeStdio(mcpServer); err != nil {
-		log.Fatalf("codespace-mcp: server error: %v", err)
-	}
+	return reg, lifecycleCfg, nil
 }
 
 // registryEntry is the JSON-serializable form of a codespace for MCP config env.
@@ -268,6 +284,7 @@ type launcherOptions struct {
 	resumeSession     string
 	resumeInteractive bool
 	localTools        optionalBool
+	extensionTools    optionalBool
 	copilotArgs       []string
 }
 
@@ -284,15 +301,17 @@ func (b optionalBool) resolve(defaultValue bool) bool {
 }
 
 type resumeConfig struct {
-	sessionName  string
-	localTools   optionalBool
-	selectedOnly optionalBool
-	copilotArgs  []string
+	sessionName    string
+	localTools     optionalBool
+	extensionTools optionalBool
+	selectedOnly   optionalBool
+	copilotArgs    []string
 }
 
 type resolvedResumeConfig struct {
-	localTools   bool
-	accessPolicy mcp.CodespaceAccessPolicy
+	localTools     bool
+	extensionTools bool
+	accessPolicy   mcp.CodespaceAccessPolicy
 }
 
 type launchContext struct {
@@ -327,6 +346,12 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 			return launcherOptions{}, err
 		} else if ok {
 			opts.localTools = parsed
+			continue
+		}
+		if parsed, ok, err := parseOptionalBoolFlag(args[i], "--extension-tools"); err != nil {
+			return launcherOptions{}, err
+		} else if ok {
+			opts.extensionTools = parsed
 			continue
 		}
 		if parsed, ok, err := parseOptionalBoolFlag(args[i], "--selected-only"); err != nil {
@@ -410,6 +435,10 @@ func effectiveLocalTools(opts launcherOptions) bool {
 	return opts.localTools.resolve(opts.hereMode)
 }
 
+func effectiveExtensionTools(opts launcherOptions) bool {
+	return opts.extensionTools.resolve(false)
+}
+
 func newResumeConfig(opts launcherOptions) (resumeConfig, error) {
 	if opts.resumeSession == "" && !opts.resumeInteractive {
 		return resumeConfig{}, fmt.Errorf("resume config requires --resume")
@@ -428,10 +457,11 @@ func newResumeConfig(opts launcherOptions) (resumeConfig, error) {
 	}
 
 	return resumeConfig{
-		sessionName:  opts.resumeSession,
-		localTools:   opts.localTools,
-		selectedOnly: opts.selectedOnly,
-		copilotArgs:  append([]string(nil), opts.copilotArgs...),
+		sessionName:    opts.resumeSession,
+		localTools:     opts.localTools,
+		extensionTools: opts.extensionTools,
+		selectedOnly:   opts.selectedOnly,
+		copilotArgs:    append([]string(nil), opts.copilotArgs...),
 	}, nil
 }
 
@@ -446,7 +476,8 @@ func resolveResumeConfig(manifest *workspace.Manifest, cfg resumeConfig) resolve
 	}
 
 	return resolvedResumeConfig{
-		localTools: cfg.localTools.resolve(stored.LocalTools),
+		localTools:     cfg.localTools.resolve(stored.LocalTools),
+		extensionTools: cfg.extensionTools.resolve(stored.ExtensionTools),
 		accessPolicy: mcp.CodespaceAccessPolicy{
 			SelectedOnly:          cfg.selectedOnly.resolve(selectedOnly),
 			AllowedCodespaceNames: uniqueStrings(allowedCodespaceNames),
@@ -638,6 +669,7 @@ func runLauncher(args []string) error {
 			Dir:  ws.Dir,
 		}
 		ws.Manifest.Settings.LocalTools = effectiveLocalTools(opts)
+		ws.Manifest.Settings.ExtensionTools = effectiveExtensionTools(opts)
 		ws.Manifest.SelectedOnly = lifecycleCfg.AccessPolicy.SelectedOnly
 		ws.Manifest.AllowedCodespaceNames = append([]string(nil), lifecycleCfg.AccessPolicy.AllowedCodespaceNames...)
 	}
@@ -678,8 +710,38 @@ func runLauncher(args []string) error {
 		return fmt.Errorf("changing to copilot directory: %w", err)
 	}
 
-	// Build MCP config with registry serialization for multi-CS support
-	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers, lifecycleCfg)
+	extensionTools := effectiveExtensionTools(opts)
+	if extensionTools {
+		token := extensionSessionToken()
+		env := extensionHostEnv(reg, lifecycleCfg)
+		manifestRoot := launchCtx.instructionsDir
+		if lifecycleCfg.Workspace.Dir != "" {
+			manifestRoot = lifecycleCfg.Workspace.Dir
+		}
+		extensionMode := "mirror"
+		if opts.hereMode {
+			extensionMode = "here"
+		}
+		manifestPath, err := writeExtensionSessionManifest(manifestRoot, self, env, token, extensionMode)
+		if err != nil {
+			return fmt.Errorf("writing extension manifest: %w", err)
+		}
+		if opts.hereMode {
+			if err := installUserExtension(); err != nil {
+				return fmt.Errorf("installing user extension: %w", err)
+			}
+		} else {
+			if err := generateProjectExtension(launchCtx.instructionsDir); err != nil {
+				return fmt.Errorf("generating project extension: %w", err)
+			}
+		}
+		os.Setenv(codespaceExtensionTokenEnv, token)
+		os.Setenv(codespaceExtensionManifestEnv, manifestPath)
+	}
+
+	// Build MCP config with registry serialization for multi-CS support.
+	// In extension-tools mode, first-party codespace tools come from the extension.
+	mcpConfig := buildMCPConfigWithRegistryForTools(self, reg, allRemoteMCPServers, lifecycleCfg, !extensionTools)
 
 	// Excluded tools
 	excludedTools := launcherExcludedTools(effectiveLocalTools(opts))
@@ -718,6 +780,9 @@ func runLauncher(args []string) error {
 		fmt.Printf("  Codespace: %s (alias: %s, repo: %s)\n", cs.Name, cs.Alias, cs.Repository)
 	}
 	fmt.Printf("  Excluded:  %d local tools\n", len(excludedTools))
+	if extensionTools {
+		fmt.Printf("  Tools:     generated Copilot extension (experimental)\n")
+	}
 	fmt.Printf("\n")
 
 	// Exec copilot
@@ -1326,12 +1391,15 @@ func writeCodespaceInstructionsPreamble(mirrorDir, workdir string) {
 
 You are working on a remote GitHub Codespace. Source code lives on the codespace at %s, NOT locally.
 
+The remote tools may be provided by either MCP or a Copilot extension. Use the actual available first-party Codespaces tool names shown in this session (for example remote_view, remote_edit, remote_create, remote_bash, remote_grep, remote_glob, and lifecycle tools such as list_codespaces). If a schema is unclear, inspect the available tool descriptions/schema for the current session; do not assume MCP-only naming.
+
 ## Tool routing
 
-- **Source code** (viewing, editing, creating, searching files in the project): use remote_* tools (remote_view, remote_edit, remote_create, remote_bash, remote_grep, remote_glob)
+- **Source code** (viewing, editing, creating, searching files in the project): use first-party Codespaces remote tools (remote_view, remote_edit, remote_create, remote_bash, remote_grep, remote_glob)
 - **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create)
-- **Shell commands**: use remote_bash (runs on the codespace), NOT the local bash
+- **Shell commands**: use remote_bash (runs on the codespace), NOT local bash, except for local-only tasks
 - **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent (the built-in explore agent cannot access remote files)
+- Do not make placeholder, empty, or no-op tool calls. Only call tools with the real arguments needed for the task.
 
 `, workdir)
 
@@ -1446,6 +1514,10 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 // buildMCPConfigWithRegistry creates the MCP config JSON using the full registry.
 // Uses CODESPACE_REGISTRY env var (JSON array) for zero-, single-, or multi-codespace support.
 func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any, lifecycleCfg mcp.LifecycleConfig) string {
+	return buildMCPConfigWithRegistryForTools(selfBinary, reg, remoteMCPServers, lifecycleCfg, true)
+}
+
+func buildMCPConfigWithRegistryForTools(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any, lifecycleCfg mcp.LifecycleConfig, includeFirstParty bool) string {
 	// Serialize registry entries for the MCP server process
 	var entries []registryEntry
 	for _, cs := range reg.All() {
@@ -1470,14 +1542,15 @@ func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remot
 		env[codespaceLifecycleConfigEnv] = lifecycleJSON
 	}
 
-	servers := map[string]any{
-		"codespace": map[string]any{
+	servers := map[string]any{}
+	if includeFirstParty {
+		servers["codespace"] = map[string]any{
 			"type":    "local",
 			"command": selfBinary,
 			"args":    []string{"mcp"},
 			"env":     env,
 			"tools":   []string{"*"},
-		},
+		}
 	}
 
 	// Merge remote MCP servers using the primary codespace for SSH forwarding
@@ -1494,6 +1567,9 @@ func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remot
 				}
 			}
 		}
+	}
+	if len(servers) == 0 {
+		return ""
 	}
 
 	config := map[string]any{
@@ -1519,12 +1595,14 @@ func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Reg
 		sb.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", cs.Alias, cs.Repository, branch, cs.Workdir))
 	}
 	sb.WriteString("\n## Tool routing\n\n")
-	sb.WriteString("- **All remote_* tools** accept an optional `codespace` parameter. Use the alias name to target a specific codespace.\n")
+	sb.WriteString("- Remote tools may be provided by either MCP or a Copilot extension. Use the actual available first-party Codespaces tool names shown in this session; do not assume MCP-only naming.\n")
+	sb.WriteString("- **All `remote_*` tools** accept an optional `codespace` parameter. Use the alias name to target a specific codespace.\n")
 	sb.WriteString("- Use `list_codespaces` to see connected codespaces.\n")
 	sb.WriteString("- **Local session files** (plan.md, session state): use built-in local tools (view, edit, create)\n")
-	sb.WriteString("- **Shell commands**: use `remote_bash` with the `codespace` parameter\n")
+	sb.WriteString("- **Shell commands**: use `remote_bash` with the `codespace` parameter, NOT local bash, except for local-only tasks\n")
 	sb.WriteString("- For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when you need parallel-safe or targeted execution; `remote_cd` only changes the default cwd for later sequential calls.\n")
 	sb.WriteString("- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent\n\n")
+	sb.WriteString("- Do not make placeholder, empty, or no-op tool calls. Only call tools with the real arguments needed for the task.\n\n")
 
 	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
 	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
@@ -1587,7 +1665,10 @@ You are not connected to any remote GitHub Codespaces yet, so project source cod
 		sb.WriteString("- When you `--resume` this session, the allowlist keeps the existing codespaces selected at startup plus any codespaces created from this session.\n")
 	}
 
+	sb.WriteString("- The remote tools may be provided by either MCP or a Copilot extension. Use the actual available first-party Codespaces tool names shown in this session; do not assume MCP-only naming.\n")
 	sb.WriteString("- After at least one codespace is connected, use `list_codespaces` to confirm aliases, then use the `remote_*` tools for source-code work.\n")
+	sb.WriteString("- Do not use local bash for remote source-code work; use `remote_bash` after connecting a codespace. Local bash is only for local-only tasks.\n")
+	sb.WriteString("- Do not make placeholder, empty, or no-op tool calls. Only call tools with the real arguments needed for the task.\n")
 	sb.WriteString("- **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create).\n\n")
 	return sb.String()
 }
@@ -1858,7 +1939,9 @@ func buildCopilotArgs(excludedTools []string, mcpConfig string, extraArgs []stri
 		copilotArgs = append(copilotArgs, "--excluded-tools")
 		copilotArgs = append(copilotArgs, excludedTools...)
 	}
-	copilotArgs = append(copilotArgs, "--additional-mcp-config", mcpConfig)
+	if strings.TrimSpace(mcpConfig) != "" {
+		copilotArgs = append(copilotArgs, "--additional-mcp-config", mcpConfig)
+	}
 	copilotArgs = append(copilotArgs, extraArgs...)
 	return copilotArgs
 }
@@ -1969,6 +2052,7 @@ func runResume(cfg resumeConfig) error {
 	}
 	resolvedCfg := resolveResumeConfig(ws.Manifest, cfg)
 	ws.Manifest.Settings.LocalTools = resolvedCfg.localTools
+	ws.Manifest.Settings.ExtensionTools = resolvedCfg.extensionTools
 	ws.Manifest.SetAccessPolicy(resolvedCfg.accessPolicy.SelectedOnly, resolvedCfg.accessPolicy.AllowedCodespaceNames)
 
 	fmt.Printf("Resuming workspace %q...\n", cfg.sessionName)
@@ -2060,7 +2144,21 @@ func runResume(cfg resumeConfig) error {
 		fmt.Fprintf(os.Stderr, "Warning: could not refresh workspace last-used time: %v\n", err)
 	}
 
-	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil, lifecycleCfg)
+	if resolvedCfg.extensionTools {
+		token := extensionSessionToken()
+		env := extensionHostEnv(reg, lifecycleCfg)
+		manifestPath, err := writeExtensionSessionManifest(instructionsDir, self, env, token, "resume")
+		if err != nil {
+			return fmt.Errorf("writing extension manifest: %w", err)
+		}
+		if err := generateProjectExtension(instructionsDir); err != nil {
+			return fmt.Errorf("generating project extension: %w", err)
+		}
+		os.Setenv(codespaceExtensionTokenEnv, token)
+		os.Setenv(codespaceExtensionManifestEnv, manifestPath)
+	}
+
+	mcpConfig := buildMCPConfigWithRegistryForTools(self, reg, nil, lifecycleCfg, !resolvedCfg.extensionTools)
 
 	excludedTools := launcherExcludedTools(resolvedCfg.localTools)
 
@@ -2072,6 +2170,9 @@ func runResume(cfg resumeConfig) error {
 		fmt.Printf("  %s: %s (%s)\n", cs.Alias, cs.Name, cs.Repository)
 	}
 	fmt.Printf("\n")
+	if resolvedCfg.extensionTools {
+		fmt.Printf("  Tools: generated Copilot extension (experimental)\n")
+	}
 
 	return execCopilot(excludedTools, mcpConfig, cfg.copilotArgs)
 }

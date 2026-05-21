@@ -593,11 +593,20 @@ func TestParseLauncherArgs(t *testing.T) {
 		},
 		{
 			name: "resume keeps local tools and copilot args",
-			args: []string{"--resume", "saved-session", "--local-tools", "--model", "claude-sonnet-4.5"},
+			args: []string{"--resume", "saved-session", "--local-tools", "--extension-tools", "--model", "claude-sonnet-4.5"},
 			want: launcherOptions{
-				resumeSession: "saved-session",
-				localTools:    setBoolFlag(true),
-				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
+				resumeSession:  "saved-session",
+				localTools:     setBoolFlag(true),
+				extensionTools: setBoolFlag(true),
+				copilotArgs:    []string{"--model", "claude-sonnet-4.5"},
+			},
+		},
+		{
+			name: "supports explicit false extension tools override",
+			args: []string{"--extension-tools=false", "--model", "claude-sonnet-4.5"},
+			want: launcherOptions{
+				extensionTools: setBoolFlag(false),
+				copilotArgs:    []string{"--model", "claude-sonnet-4.5"},
 			},
 		},
 		{
@@ -736,10 +745,11 @@ func TestEffectiveLocalTools(t *testing.T) {
 
 func TestNewResumeConfig(t *testing.T) {
 	cfg, err := newResumeConfig(launcherOptions{
-		resumeSession: "saved-session",
-		localTools:    setBoolFlag(true),
-		selectedOnly:  setBoolFlag(false),
-		copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
+		resumeSession:  "saved-session",
+		localTools:     setBoolFlag(true),
+		extensionTools: setBoolFlag(true),
+		selectedOnly:   setBoolFlag(false),
+		copilotArgs:    []string{"--model", "claude-sonnet-4.5"},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -750,6 +760,9 @@ func TestNewResumeConfig(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg.localTools, setBoolFlag(true)) {
 		t.Fatalf("localTools = %+v, want true override", cfg.localTools)
+	}
+	if !reflect.DeepEqual(cfg.extensionTools, setBoolFlag(true)) {
+		t.Fatalf("extensionTools = %+v, want true override", cfg.extensionTools)
 	}
 	if !reflect.DeepEqual(cfg.selectedOnly, setBoolFlag(false)) {
 		t.Fatalf("selectedOnly = %+v, want false override", cfg.selectedOnly)
@@ -773,11 +786,13 @@ func TestResolveResumeConfig(t *testing.T) {
 				SelectedOnly:          true,
 				AllowedCodespaceNames: []string{"cs-1"},
 				Settings: workspace.SessionSettings{
-					LocalTools: true,
+					LocalTools:     true,
+					ExtensionTools: true,
 				},
 			},
 			want: resolvedResumeConfig{
-				localTools: true,
+				localTools:     true,
+				extensionTools: true,
 				accessPolicy: mcp.CodespaceAccessPolicy{
 					SelectedOnly:          true,
 					AllowedCodespaceNames: []string{"cs-1"},
@@ -787,9 +802,10 @@ func TestResolveResumeConfig(t *testing.T) {
 		{
 			name: "explicit false overrides persisted true",
 			cfg: resumeConfig{
-				sessionName:  "saved-session",
-				localTools:   setBoolFlag(false),
-				selectedOnly: setBoolFlag(false),
+				sessionName:    "saved-session",
+				localTools:     setBoolFlag(false),
+				extensionTools: setBoolFlag(false),
+				selectedOnly:   setBoolFlag(false),
 			},
 			ws: &workspace.Manifest{
 				SelectedOnly:          true,
@@ -799,7 +815,8 @@ func TestResolveResumeConfig(t *testing.T) {
 				},
 			},
 			want: resolvedResumeConfig{
-				localTools: false,
+				localTools:     false,
+				extensionTools: false,
 				accessPolicy: mcp.CodespaceAccessPolicy{
 					SelectedOnly:          false,
 					AllowedCodespaceNames: []string{"cs-1"},
@@ -852,12 +869,14 @@ func TestBuildCopilotArgs(t *testing.T) {
 	tests := []struct {
 		name          string
 		excludedTools []string
+		mcpConfig     string
 		extraArgs     []string
 		want          []string
 	}{
 		{
 			name:          "includes excluded tools when present",
 			excludedTools: []string{"bash", "grep"},
+			mcpConfig:     `{"mcpServers":{}}`,
 			extraArgs:     []string{"--model", "claude-sonnet-4.5"},
 			want: []string{
 				"--excluded-tools", "bash", "grep",
@@ -868,9 +887,19 @@ func TestBuildCopilotArgs(t *testing.T) {
 		{
 			name:          "omits excluded tools flag when none are excluded",
 			excludedTools: nil,
+			mcpConfig:     `{"mcpServers":{}}`,
 			extraArgs:     []string{"--model", "claude-sonnet-4.5"},
 			want: []string{
 				"--additional-mcp-config", `{"mcpServers":{}}`,
+				"--model", "claude-sonnet-4.5",
+			},
+		},
+		{
+			name:          "omits empty mcp config",
+			excludedTools: []string{"bash"},
+			extraArgs:     []string{"--model", "claude-sonnet-4.5"},
+			want: []string{
+				"--excluded-tools", "bash",
 				"--model", "claude-sonnet-4.5",
 			},
 		},
@@ -878,7 +907,7 @@ func TestBuildCopilotArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildCopilotArgs(tt.excludedTools, `{"mcpServers":{}}`, tt.extraArgs)
+			got := buildCopilotArgs(tt.excludedTools, tt.mcpConfig, tt.extraArgs)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("buildCopilotArgs() = %v, want %v", got, tt.want)
 			}
@@ -1265,6 +1294,41 @@ func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
 	}
 }
 
+func TestBuildMCPConfigWithRegistryForTools_ExtensionModeOmitsFirstParty(t *testing.T) {
+	reg := registry.New()
+	if got := buildMCPConfigWithRegistryForTools("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{}, false); got != "" {
+		t.Fatalf("empty extension-tools MCP config = %q, want empty", got)
+	}
+
+	remoteMCP := map[string]any{
+		"remote-db": map[string]any{
+			"type":    "local",
+			"command": "db-mcp",
+		},
+	}
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:     "github",
+		Name:      "cs-abc",
+		Workdir:   "/workspaces/github",
+		ExecAgent: "/tmp/agent",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	result := buildMCPConfigWithRegistryForTools("/usr/local/bin/self", reg, remoteMCP, mcp.LifecycleConfig{}, false)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	servers := parsed["mcpServers"].(map[string]any)
+	if _, ok := servers["codespace"]; ok {
+		t.Fatal("first-party codespace MCP server should be omitted")
+	}
+	if _, ok := servers["remote-db"]; !ok {
+		t.Fatal("forwarded remote MCP server should remain")
+	}
+}
+
 func TestBuildMCPConfigWithRegistry_LifecycleConfigEnv(t *testing.T) {
 	reg := registry.New()
 
@@ -1331,6 +1395,239 @@ func TestBuildMCPConfigWithRegistry_LocalWorkdirEnv(t *testing.T) {
 	}
 }
 
+func TestExtensionSourceIncludesHostBridgeAndTokenGate(t *testing.T) {
+	source := extensionSource()
+
+	for _, want := range []string{
+		`joinSession`,
+		`readFileSync(manifestPath, "utf8")`,
+		`spawn(manifest.selfBinary, ["extension-host"]`,
+		codespaceExtensionTokenEnv,
+		codespaceExtensionManifestEnv,
+		`manifest?.token !== token`,
+		`list_tools`,
+		`call_tool`,
+		`resultType: "failure"`,
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("generated extension source missing %q:\n%s", want, source)
+		}
+	}
+	for _, notWant := range []string{
+		`CODESPACE_REGISTRY`,
+		`/usr/local/bin/self`,
+	} {
+		if strings.Contains(source, notWant) {
+			t.Fatalf("generated extension source should not embed %q:\n%s", notWant, source)
+		}
+	}
+}
+
+func TestCleanupGeneratedUserExtensionsRemovesOnlyStaleGeneratedDirs(t *testing.T) {
+	root := t.TempDir()
+	staleGenerated := filepath.Join(root, legacyGeneratedUserExtensionPrefix+"stale")
+	freshGenerated := filepath.Join(root, legacyGeneratedUserExtensionPrefix+"fresh")
+	stableUserExtension := filepath.Join(root, userExtensionName)
+	otherExtension := filepath.Join(root, "other-extension")
+	for _, dir := range []string{staleGenerated, freshGenerated, stableUserExtension, otherExtension} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	now := time.Now()
+	staleTime := now.Add(-(generatedUserExtensionMaxAge + time.Hour))
+	freshTime := now.Add(-time.Hour)
+	if err := os.Chtimes(staleGenerated, staleTime, staleTime); err != nil {
+		t.Fatalf("chtimes stale: %v", err)
+	}
+	if err := os.Chtimes(freshGenerated, freshTime, freshTime); err != nil {
+		t.Fatalf("chtimes fresh: %v", err)
+	}
+	if err := os.Chtimes(stableUserExtension, staleTime, staleTime); err != nil {
+		t.Fatalf("chtimes stable: %v", err)
+	}
+	if err := os.Chtimes(otherExtension, staleTime, staleTime); err != nil {
+		t.Fatalf("chtimes other: %v", err)
+	}
+
+	if err := cleanupLegacyGeneratedUserExtensions(root, now); err != nil {
+		t.Fatalf("cleanupLegacyGeneratedUserExtensions: %v", err)
+	}
+
+	if _, err := os.Stat(staleGenerated); !os.IsNotExist(err) {
+		t.Fatalf("stale generated extension still exists or unexpected err: %v", err)
+	}
+	for _, dir := range []string{freshGenerated, stableUserExtension, otherExtension} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("%s should remain: %v", dir, err)
+		}
+	}
+}
+
+func TestWriteExtensionSessionManifest(t *testing.T) {
+	root := t.TempDir()
+	env := map[string]string{"CODESPACE_REGISTRY": "[]"}
+	path, err := writeExtensionSessionManifest(root, "/usr/local/bin/self", env, "token-123", "here")
+	if err != nil {
+		t.Fatalf("writeExtensionSessionManifest: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat manifest: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("manifest mode = %v, want 0600", got)
+	}
+	var manifest extensionSessionManifest
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+	if manifest.SelfBinary != "/usr/local/bin/self" || manifest.Token != "token-123" || manifest.Mode != "here" {
+		t.Fatalf("manifest = %+v, want self/token/mode", manifest)
+	}
+	if got := manifest.Env["CODESPACE_REGISTRY"]; got != "[]" {
+		t.Fatalf("CODESPACE_REGISTRY = %q, want []", got)
+	}
+	if !strings.Contains(filepath.Base(path), "token-123") {
+		t.Fatalf("manifest path %q should include token to avoid same-workspace races", path)
+	}
+
+	otherPath, err := writeExtensionSessionManifest(root, "/usr/local/bin/self", env, "token-456", "here")
+	if err != nil {
+		t.Fatalf("write second manifest: %v", err)
+	}
+	if otherPath == path {
+		t.Fatal("expected distinct sessions to use distinct manifest paths")
+	}
+}
+
+func TestInstallUserExtensionWritesStableWrapper(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	if err := installUserExtension(); err != nil {
+		t.Fatalf("installUserExtension: %v", err)
+	}
+	path := filepath.Join(home, ".copilot", "extensions", userExtensionName, "extension.mjs")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read extension: %v", err)
+	}
+	source := string(data)
+	if !strings.Contains(source, codespaceExtensionManifestEnv) {
+		t.Fatalf("extension source missing manifest env:\n%s", source)
+	}
+	if strings.Contains(source, "CODESPACE_REGISTRY") {
+		t.Fatalf("stable user extension should not embed session env:\n%s", source)
+	}
+}
+
+func TestRunExtensionHostIOListAndCall(t *testing.T) {
+	t.Setenv("CODESPACE_REGISTRY", "[]")
+	t.Setenv(codespaceLifecycleConfigEnv, "")
+	t.Setenv(codespaceLocalWorkdirEnv, "")
+
+	input := strings.NewReader(
+		`{"id":1,"method":"list_tools"}` + "\n" +
+			`{"id":2,"method":"call_tool","tool":"list_codespaces","args":{}}` + "\n")
+	var output bytes.Buffer
+	if err := runExtensionHostIO(input, &output); err != nil {
+		t.Fatalf("runExtensionHostIO: %v", err)
+	}
+
+	dec := json.NewDecoder(&output)
+	var listResp extensionHostResponse
+	if err := dec.Decode(&listResp); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if listResp.Error != nil {
+		t.Fatalf("list response error: %v", listResp.Error)
+	}
+	defs, ok := listResp.Result.([]any)
+	if !ok || len(defs) == 0 {
+		t.Fatalf("list response result = %#v, want non-empty definitions", listResp.Result)
+	}
+
+	var callResp extensionHostResponse
+	if err := dec.Decode(&callResp); err != nil {
+		t.Fatalf("decode call response: %v", err)
+	}
+	if callResp.Error != nil {
+		t.Fatalf("call response error: %v", callResp.Error)
+	}
+	result, ok := callResp.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("call response result = %#v, want object", callResp.Result)
+	}
+	if got := result["resultType"]; got != "success" {
+		t.Fatalf("resultType = %v, want success", got)
+	}
+	text, _ := result["textResultForLlm"].(string)
+	if !strings.Contains(text, "No codespaces connected") {
+		t.Fatalf("textResultForLlm = %v, want no-codespaces message", result["textResultForLlm"])
+	}
+}
+
+func TestWriteCodespaceInstructionsPreambleTransportNeutralToolGuidance(t *testing.T) {
+	dir := t.TempDir()
+
+	writeCodespaceInstructionsPreamble(dir, "/workspaces/repo")
+
+	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
+	if err != nil {
+		t.Fatalf("reading instructions: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"either MCP or a Copilot extension",
+		"actual available first-party Codespaces tool names",
+		"NOT local bash, except for local-only tasks",
+		"Do not make placeholder, empty, or no-op tool calls",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in preamble, got %q", want, text)
+		}
+	}
+}
+
+func TestWriteMultiCodespaceInstructionsPreambleTransportNeutralToolGuidance(t *testing.T) {
+	dir := t.TempDir()
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:      "github",
+		Name:       "cs-abc",
+		Repository: "github/github",
+		Branch:     "main",
+		Workdir:    "/workspaces/github",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	writeMultiCodespaceInstructionsPreamble(dir, reg)
+
+	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
+	if err != nil {
+		t.Fatalf("reading instructions: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"either MCP or a Copilot extension",
+		"actual available first-party Codespaces tool names",
+		"NOT local bash, except for local-only tasks",
+		"Do not make placeholder, empty, or no-op tool calls",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in multi-codespace preamble, got %q", want, text)
+		}
+	}
+}
+
 func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1341,7 +1638,14 @@ func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
 		t.Fatalf("reading instructions: %v", err)
 	}
 	text := string(data)
-	for _, want := range []string{"list_available_codespaces", "create_codespace", "connect_codespace", "remote_*"} {
+	for _, want := range []string{
+		"list_available_codespaces",
+		"create_codespace",
+		"connect_codespace",
+		"remote_*",
+		"either MCP or a Copilot extension",
+		"Do not make placeholder, empty, or no-op tool calls",
+	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected %q in preamble, got %q", want, text)
 		}
