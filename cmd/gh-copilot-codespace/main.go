@@ -59,6 +59,7 @@ Flags:
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
   exec                   Execute a command on the codespace (used internally)
+  daemon                 Run daemon protocol server (used internally)
   workspaces             List available workspace sessions
 `)
 }
@@ -92,6 +93,15 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "extension-host" {
 		if err := runExtensionHost(); err != nil {
 			fmt.Fprintf(os.Stderr, "extension-host: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// If first arg is "daemon", run the sandbox-side daemon protocol server
+	if len(os.Args) > 1 && os.Args[1] == "daemon" {
+		if err := runDaemon(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -700,8 +710,12 @@ func runLauncher(args []string) error {
 		generateBranchSyncHook(launchCtx.instructionsDir, selectedList[0].Name, firstWorkdir, firstSSHClient)
 	}
 
-	// Generate remote-explorer custom agent for codespace file exploration
-	if !opts.hereMode {
+	// Generate remote-explorer custom agent for codespace file exploration.
+	// When extension-tools mode is active, the equivalent agent is forwarded
+	// inline through joinSession, so skip writing the file in that case to
+	// avoid registering the same agent twice.
+	extensionTools := effectiveExtensionTools(opts)
+	if !opts.hereMode && !extensionTools {
 		generateRemoteExplorerAgent(launchCtx.instructionsDir)
 	}
 
@@ -710,17 +724,16 @@ func runLauncher(args []string) error {
 		return fmt.Errorf("changing to copilot directory: %w", err)
 	}
 
-	extensionTools := effectiveExtensionTools(opts)
 	if extensionTools {
 		token := extensionSessionToken()
-		env := extensionHostEnv(reg, lifecycleCfg)
-		manifestRoot := launchCtx.instructionsDir
-		if lifecycleCfg.Workspace.Dir != "" {
-			manifestRoot = lifecycleCfg.Workspace.Dir
-		}
 		extensionMode := "mirror"
 		if opts.hereMode {
 			extensionMode = "here"
+		}
+		env := extensionHostEnv(reg, lifecycleCfg, extensionMode)
+		manifestRoot := launchCtx.instructionsDir
+		if lifecycleCfg.Workspace.Dir != "" {
+			manifestRoot = lifecycleCfg.Workspace.Dir
 		}
 		manifestPath, err := writeExtensionSessionManifest(manifestRoot, self, env, token, extensionMode)
 		if err != nil {
@@ -1387,36 +1400,24 @@ func parseMCPConfigJSON(content []byte) map[string]any {
 // copilot-instructions.md in the mirror dir. If the file doesn't exist, it creates it.
 // This tells the agent how to route between local and remote tools.
 func writeCodespaceInstructionsPreamble(mirrorDir, workdir string) {
-	preamble := fmt.Sprintf(`# Codespace Remote Development
+	preamble := BuildPreamble(PreambleContext{
+		Mode:       PreambleModeMirror,
+		Codespaces: []PreambleCodespace{{Workdir: workdir}},
+	})
+	writePreambleFile(mirrorDir, preamble)
+}
 
-You are working on a remote GitHub Codespace. Source code lives on the codespace at %s, NOT locally.
-
-The remote tools may be provided by either MCP or a Copilot extension. Use the actual available first-party Codespaces tool names shown in this session (for example remote_view, remote_edit, remote_create, remote_bash, remote_grep, remote_glob, and lifecycle tools such as list_codespaces). If a schema is unclear, inspect the available tool descriptions/schema for the current session; do not assume MCP-only naming.
-
-## Tool routing
-
-- **Source code** (viewing, editing, creating, searching files in the project): use first-party Codespaces remote tools (remote_view, remote_edit, remote_create, remote_bash, remote_grep, remote_glob)
-- **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create)
-- **Shell commands**: use remote_bash (runs on the codespace), NOT local bash, except for local-only tasks
-- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent (the built-in explore agent cannot access remote files)
-- Do not make placeholder, empty, or no-op tool calls. Only call tools with the real arguments needed for the task.
-
-`, workdir)
-
+func writePreambleFile(mirrorDir, preamble string) {
 	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
 	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
 		return
 	}
-
 	existing, err := os.ReadFile(instructionsPath)
 	if err != nil {
-		// File doesn't exist; create with just the preamble
 		os.WriteFile(instructionsPath, []byte(preamble), 0o644)
 		return
 	}
-	// Prepend preamble to existing content
-	combined := preamble + string(existing)
-	os.WriteFile(instructionsPath, []byte(combined), 0o644)
+	os.WriteFile(instructionsPath, []byte(preamble+string(existing)), 0o644)
 }
 
 // cleanMirrorDir removes all contents of the mirror directory except .git/,
@@ -1581,96 +1582,38 @@ func buildMCPConfigWithRegistryForTools(selfBinary string, reg *registry.Registr
 
 // writeMultiCodespaceInstructionsPreamble writes a preamble listing all connected codespaces.
 func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Registry) {
-	var sb strings.Builder
-	sb.WriteString("# Multi-Codespace Remote Development\n\n")
-	sb.WriteString("You are connected to multiple remote GitHub Codespaces. Source code lives on the codespaces, NOT locally.\n\n")
-	sb.WriteString("## Connected codespaces\n\n")
-	sb.WriteString("| Alias | Repository | Branch | Workdir |\n")
-	sb.WriteString("|-------|-----------|--------|--------|\n")
-	for _, cs := range reg.All() {
-		branch := cs.Branch
-		if branch == "" {
-			branch = "(default)"
-		}
-		sb.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", cs.Alias, cs.Repository, branch, cs.Workdir))
-	}
-	sb.WriteString("\n## Tool routing\n\n")
-	sb.WriteString("- Remote tools may be provided by either MCP or a Copilot extension. Use the actual available first-party Codespaces tool names shown in this session; do not assume MCP-only naming.\n")
-	sb.WriteString("- **All `remote_*` tools** accept an optional `codespace` parameter. Use the alias name to target a specific codespace.\n")
-	sb.WriteString("- Use `list_codespaces` to see connected codespaces.\n")
-	sb.WriteString("- **Local session files** (plan.md, session state): use built-in local tools (view, edit, create)\n")
-	sb.WriteString("- **Shell commands**: use `remote_bash` with the `codespace` parameter, NOT local bash, except for local-only tasks\n")
-	sb.WriteString("- For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when you need parallel-safe or targeted execution; `remote_cd` only changes the default cwd for later sequential calls.\n")
-	sb.WriteString("- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent\n\n")
-	sb.WriteString("- Do not make placeholder, empty, or no-op tool calls. Only call tools with the real arguments needed for the task.\n\n")
+	preamble := BuildPreamble(PreambleContext{
+		Mode:       PreambleModeMirror,
+		Codespaces: preambleCodespacesFromRegistry(reg),
+	})
+	writePreambleFile(mirrorDir, preamble)
+}
 
-	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
-	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
-		return
+func preambleCodespacesFromRegistry(reg *registry.Registry) []PreambleCodespace {
+	if reg == nil {
+		return nil
 	}
-
-	existing, err := os.ReadFile(instructionsPath)
-	if err != nil {
-		os.WriteFile(instructionsPath, []byte(sb.String()), 0o644)
-		return
+	all := reg.All()
+	out := make([]PreambleCodespace, 0, len(all))
+	for _, cs := range all {
+		out = append(out, PreambleCodespace{
+			Alias:      cs.Alias,
+			Repository: cs.Repository,
+			Branch:     cs.Branch,
+			Workdir:    cs.Workdir,
+		})
 	}
-	os.WriteFile(instructionsPath, []byte(sb.String()+string(existing)), 0o644)
+	return out
 }
 
 // writeZeroCodespaceInstructionsPreamble bootstraps a local session before any
 // codespace has been connected, so the agent knows to use lifecycle tools first.
 func writeZeroCodespaceInstructionsPreamble(mirrorDir string, policy mcp.CodespaceAccessPolicy) {
-	preamble := zeroCodespaceInstructionsPreamble(policy)
-
-	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
-	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
-		return
-	}
-
-	existing, err := os.ReadFile(instructionsPath)
-	if err != nil {
-		os.WriteFile(instructionsPath, []byte(preamble), 0o644)
-		return
-	}
-	os.WriteFile(instructionsPath, []byte(preamble+string(existing)), 0o644)
-}
-
-func zeroCodespaceInstructionsPreamble(policy mcp.CodespaceAccessPolicy) string {
-	var sb strings.Builder
-	sb.WriteString(`# Codespace Lifecycle Session
-
-You are not connected to any remote GitHub Codespaces yet, so project source code is not available locally.
-
-## What to do first
-
-`)
-
-	switch {
-	case policy.SelectedOnly && len(policy.AllowedCodespaceNames) == 0:
-		sb.WriteString("- This session was launched with `--selected-only`, and no existing codespaces were selected at startup.\n")
-		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create the first codespace for this session.\n")
-		sb.WriteString("- `list_available_codespaces` will not show any existing codespaces for this session, and `connect_codespace` cannot attach an existing codespace until you create one from this session.\n")
-	case policy.SelectedOnly:
-		sb.WriteString("- This session was launched with `--selected-only`, so existing codespaces are limited to the ones selected at startup plus codespaces created from this session.\n")
-		sb.WriteString("- Use `list_available_codespaces` to discover which existing codespaces are currently allowlisted for this session.\n")
-		sb.WriteString("- Use `connect_codespace` to attach one of those allowlisted existing codespaces.\n")
-		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create a new codespace for the repository you need.\n")
-	default:
-		sb.WriteString("- Use `list_available_codespaces` to discover existing codespaces you can connect to.\n")
-		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create a new codespace for the repository you need.\n")
-		sb.WriteString("- Use `connect_codespace` to attach an existing codespace to this session.\n")
-	}
-
-	if policy.SelectedOnly {
-		sb.WriteString("- When you `--resume` this session, the allowlist keeps the existing codespaces selected at startup plus any codespaces created from this session.\n")
-	}
-
-	sb.WriteString("- The remote tools may be provided by either MCP or a Copilot extension. Use the actual available first-party Codespaces tool names shown in this session; do not assume MCP-only naming.\n")
-	sb.WriteString("- After at least one codespace is connected, use `list_codespaces` to confirm aliases, then use the `remote_*` tools for source-code work.\n")
-	sb.WriteString("- Do not use local bash for remote source-code work; use `remote_bash` after connecting a codespace. Local bash is only for local-only tasks.\n")
-	sb.WriteString("- Do not make placeholder, empty, or no-op tool calls. Only call tools with the real arguments needed for the task.\n")
-	sb.WriteString("- **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create).\n\n")
-	return sb.String()
+	preamble := BuildPreamble(PreambleContext{
+		Mode:         PreambleModeMirror,
+		AccessPolicy: policy,
+	})
+	writePreambleFile(mirrorDir, preamble)
 }
 
 func zeroCodespaceStartupMessage(policy mcp.CodespaceAccessPolicy) string {
@@ -1997,51 +1940,12 @@ func generateBranchSyncHook(mirrorDir, codespaceName, workdir string, sshClient 
 	os.WriteFile(filepath.Join(hooksDir, "branch-sync.json"), data, 0o644)
 }
 
-// generateRemoteExplorerAgent creates a custom agent that can explore codespace
-// files using remote_* MCP tools. This replaces the built-in explore agent which
-// can't access remote tools (its local grep/glob/view are excluded).
+// generateRemoteExplorerAgent creates the on-disk custom agent file for MCP
+// mode. In extension-tools mode the equivalent agent is forwarded inline via
+// joinSession customAgents, so callers should skip this when extensionTools is
+// active.
 func generateRemoteExplorerAgent(mirrorDir string) {
-	agentsDir := filepath.Join(mirrorDir, ".github", "agents")
-	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
-		return
-	}
-
-	agent := `---
-name: remote-explorer
-description: >-
-  Explore and search codespace files using remote tools. Use this agent instead of the built-in
-  explore agent when you need to search, read, or understand code on a remote codespace.
-  Delegates to this agent are appropriate for: finding files, searching code patterns,
-  understanding codebase structure, reading specific files, and answering questions about code.
-model: claude-haiku-4.5
-tools:
-  - codespace/*
-  - read
-  - search
----
-
-You are a fast code exploration agent for remote GitHub Codespaces.
-
-## Available tools
-
-Use these remote tools to explore the codespace:
-- **remote_grep** — search for patterns in files (ripgrep)
-- **remote_glob** — find files by name patterns
-- **remote_view** — read file contents with line numbers
-- **remote_bash** — run commands (e.g., find, wc, head, git log)
-- **remote_cwd** — check the default working directory used when cwd is omitted
-
-## Guidelines
-
-- Be concise — return focused answers under 300 words
-- Search broadly first, then narrow down
-- Use remote_grep for content search, remote_glob for file discovery
-- Pass cwd explicitly on remote_bash/remote_grep/remote_glob when you need predictable parallel calls instead of relying on remote_cd ordering
-- Read only the relevant portions of files (use view_range)
-- When exploring structure, use remote_bash with find or ls
-`
-
-	os.WriteFile(filepath.Join(agentsDir, "remote-explorer.agent.md"), []byte(agent), 0o644)
+	writeRemoteExplorerAgentFile(mirrorDir)
 }
 
 // runResume loads a workspace session and reconnects to its codespaces.
@@ -2126,7 +2030,11 @@ func runResume(cfg resumeConfig) error {
 		fmt.Fprintf(os.Stderr, "Warning: could not auto-trust directory: %v\n", err)
 	}
 
-	generateRemoteExplorerAgent(instructionsDir)
+	// When extension-tools mode is active in resume, the inline customAgents
+	// entry covers this — skip writing the file to avoid duplicate registration.
+	if !resolvedCfg.extensionTools {
+		generateRemoteExplorerAgent(instructionsDir)
+	}
 
 	if err := os.Chdir(instructionsDir); err != nil {
 		return fmt.Errorf("changing to workspace dir: %w", err)
@@ -2146,7 +2054,7 @@ func runResume(cfg resumeConfig) error {
 
 	if resolvedCfg.extensionTools {
 		token := extensionSessionToken()
-		env := extensionHostEnv(reg, lifecycleCfg)
+		env := extensionHostEnv(reg, lifecycleCfg, "resume")
 		manifestPath, err := writeExtensionSessionManifest(instructionsDir, self, env, token, "resume")
 		if err != nil {
 			return fmt.Errorf("writing extension manifest: %w", err)

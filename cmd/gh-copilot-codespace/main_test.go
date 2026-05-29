@@ -1408,6 +1408,9 @@ func TestExtensionSourceIncludesHostBridgeAndTokenGate(t *testing.T) {
 		`list_tools`,
 		`call_tool`,
 		`resultType: "failure"`,
+		`Array.isArray(bootstrap)`,
+		`sessionConfig.systemMessage`,
+		`sessionConfig.customAgents`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Fatalf("generated extension source missing %q:\n%s", want, source)
@@ -1549,9 +1552,24 @@ func TestRunExtensionHostIOListAndCall(t *testing.T) {
 	if listResp.Error != nil {
 		t.Fatalf("list response error: %v", listResp.Error)
 	}
-	defs, ok := listResp.Result.([]any)
+	payload, ok := listResp.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("list response result = %#v, want bootstrap payload object", listResp.Result)
+	}
+	defs, ok := payload["tools"].([]any)
 	if !ok || len(defs) == 0 {
-		t.Fatalf("list response result = %#v, want non-empty definitions", listResp.Result)
+		t.Fatalf("bootstrap tools = %#v, want non-empty definitions", payload["tools"])
+	}
+	sysMsg, ok := payload["systemMessage"].(map[string]any)
+	if !ok {
+		t.Fatalf("bootstrap systemMessage = %#v, want object", payload["systemMessage"])
+	}
+	if got := sysMsg["mode"]; got != "append" {
+		t.Fatalf("systemMessage mode = %v, want append", got)
+	}
+	content, _ := sysMsg["content"].(string)
+	if !strings.Contains(content, "list_available_codespaces") {
+		t.Fatalf("systemMessage content missing zero-codespace guidance: %q", content)
 	}
 
 	var callResp extensionHostResponse
@@ -1572,6 +1590,69 @@ func TestRunExtensionHostIOListAndCall(t *testing.T) {
 	if !strings.Contains(text, "No codespaces connected") {
 		t.Fatalf("textResultForLlm = %v, want no-codespaces message", result["textResultForLlm"])
 	}
+
+	// Zero codespaces ⇒ the inline remote-explorer agent must not be advertised
+	// (its tools wouldn't work anyway).
+	if got, ok := payload["customAgents"]; ok && got != nil {
+		if agents, _ := got.([]any); len(agents) > 0 {
+			t.Fatalf("customAgents with zero codespaces = %#v, want none", agents)
+		}
+	}
+}
+
+func TestRunExtensionHostIOAdvertisesRemoteExplorerWhenCodespaceConnected(t *testing.T) {
+	t.Setenv("CODESPACE_REGISTRY", `[{"alias":"github","name":"cs-abc","workdir":"/workspaces/github","execAgent":"/tmp/agent"}]`)
+	t.Setenv(codespaceLifecycleConfigEnv, "")
+	t.Setenv(codespaceLocalWorkdirEnv, "")
+	t.Setenv(codespaceExtensionModeEnv, "mirror")
+
+	input := strings.NewReader(`{"id":1,"method":"list_tools"}` + "\n")
+	var output bytes.Buffer
+	if err := runExtensionHostIO(input, &output); err != nil {
+		t.Fatalf("runExtensionHostIO: %v", err)
+	}
+
+	var listResp extensionHostResponse
+	if err := json.NewDecoder(&output).Decode(&listResp); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	payload, ok := listResp.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("list response result = %#v, want bootstrap payload object", listResp.Result)
+	}
+
+	agentsAny, ok := payload["customAgents"].([]any)
+	if !ok || len(agentsAny) == 0 {
+		t.Fatalf("customAgents = %#v, want one entry", payload["customAgents"])
+	}
+	agent, ok := agentsAny[0].(map[string]any)
+	if !ok {
+		t.Fatalf("customAgent entry = %#v, want object", agentsAny[0])
+	}
+	if got := agent["name"]; got != remoteExplorerAgentName {
+		t.Fatalf("custom agent name = %v, want %s", got, remoteExplorerAgentName)
+	}
+	if prompt, _ := agent["prompt"].(string); !strings.Contains(prompt, "remote_grep") {
+		t.Fatalf("custom agent prompt missing remote_grep guidance: %q", prompt)
+	}
+	tools, _ := agent["tools"].([]any)
+	if len(tools) == 0 {
+		t.Fatalf("custom agent tools empty, want allow-list")
+	}
+	// Ensure the allow-list uses bare names (no `codespace/` MCP prefix).
+	seenRemoteView := false
+	for _, tname := range tools {
+		s, _ := tname.(string)
+		if strings.HasPrefix(s, "codespace/") {
+			t.Fatalf("custom agent tool %q uses MCP namespace; expected bare extension tool name", s)
+		}
+		if s == "remote_view" {
+			seenRemoteView = true
+		}
+	}
+	if !seenRemoteView {
+		t.Fatalf("custom agent tools = %v, want to include remote_view", tools)
+	}
 }
 
 func TestWriteCodespaceInstructionsPreambleTransportNeutralToolGuidance(t *testing.T) {
@@ -1585,13 +1666,27 @@ func TestWriteCodespaceInstructionsPreambleTransportNeutralToolGuidance(t *testi
 	}
 	text := string(data)
 	for _, want := range []string{
-		"either MCP or a Copilot extension",
-		"actual available first-party Codespaces tool names",
-		"NOT local bash, except for local-only tasks",
+		"/workspaces/repo",
+		"remote_view",
+		"remote_edit",
+		"remote_create",
+		"remote_bash",
+		"remote_grep",
+		"remote_glob",
+		"@remote-explorer",
+		"do NOT use local bash for codespace work",
 		"Do not make placeholder, empty, or no-op tool calls",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected %q in preamble, got %q", want, text)
+		}
+	}
+	for _, unwanted := range []string{
+		"MCP",
+		"A local checkout",
+	} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("did not expect %q in mirror-mode single-codespace preamble, got %q", unwanted, text)
 		}
 	}
 }
@@ -1608,6 +1703,15 @@ func TestWriteMultiCodespaceInstructionsPreambleTransportNeutralToolGuidance(t *
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:      "docs",
+		Name:       "cs-def",
+		Repository: "github/docs",
+		Branch:     "main",
+		Workdir:    "/workspaces/docs",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
 
 	writeMultiCodespaceInstructionsPreamble(dir, reg)
 
@@ -1617,14 +1721,24 @@ func TestWriteMultiCodespaceInstructionsPreambleTransportNeutralToolGuidance(t *
 	}
 	text := string(data)
 	for _, want := range []string{
-		"either MCP or a Copilot extension",
-		"actual available first-party Codespaces tool names",
-		"NOT local bash, except for local-only tasks",
+		"Multi-Codespace Remote Development",
+		"github/github",
+		"github/docs",
+		"`codespace` parameter",
+		"remote_view",
+		"remote_bash",
+		"remote_grep",
+		"remote_glob",
+		"@remote-explorer",
+		"do NOT use local bash for codespace work",
 		"Do not make placeholder, empty, or no-op tool calls",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected %q in multi-codespace preamble, got %q", want, text)
 		}
+	}
+	if strings.Contains(text, "MCP") {
+		t.Fatalf("did not expect transport-specific MCP language in multi-codespace preamble, got %q", text)
 	}
 }
 
@@ -1643,12 +1757,14 @@ func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
 		"create_codespace",
 		"connect_codespace",
 		"remote_*",
-		"either MCP or a Copilot extension",
 		"Do not make placeholder, empty, or no-op tool calls",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected %q in preamble, got %q", want, text)
 		}
+	}
+	if strings.Contains(text, "MCP") {
+		t.Fatalf("did not expect transport-specific MCP language in zero-codespace preamble, got %q", text)
 	}
 }
 

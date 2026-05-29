@@ -43,7 +43,7 @@ func deployBinary(sshClient *ssh.Client, codespaceName string) (string, error) {
 		return remotePath, nil
 	}
 
-	fmt.Println("Deploying exec agent to codespace...")
+	fmt.Fprintln(os.Stderr, "Deploying exec agent to codespace...")
 
 	// Get a linux binary for the codespace
 	linuxBinary, cleanup, err := getLinuxBinary(arch)
@@ -70,7 +70,7 @@ func deployBinary(sshClient *ssh.Client, codespaceName string) (string, error) {
 		return "", fmt.Errorf("copying binary to codespace: %w: %s", err, out)
 	}
 
-	fmt.Printf("  ✓ Deployed exec agent (%s)\n", arch)
+	fmt.Fprintf(os.Stderr, "  ✓ Deployed exec agent (%s)\n", arch)
 	return remotePath, nil
 }
 
@@ -143,7 +143,7 @@ func crossCompile(arch string) (string, func(), error) {
 		return "", nil, fmt.Errorf("cross-compile failed: %w", err)
 	}
 
-	fmt.Printf("  ✓ Cross-compiled for linux/%s\n", arch)
+	fmt.Fprintf(os.Stderr, "  ✓ Cross-compiled for linux/%s\n", arch)
 	return outPath, cleanup, nil
 }
 
@@ -214,6 +214,6 @@ func downloadReleaseBinary(arch string) (string, func(), error) {
 		return "", nil, err
 	}
 
-	fmt.Printf("  ✓ Downloaded linux/%s binary from release\n", arch)
+	fmt.Fprintf(os.Stderr, "  ✓ Downloaded linux/%s binary from release\n", arch)
 	return outPath, cleanup, nil
 }

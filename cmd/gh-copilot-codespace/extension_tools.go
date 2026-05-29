@@ -16,6 +16,7 @@ import (
 
 const codespaceExtensionTokenEnv = "COPILOT_CODESPACE_EXTENSION_TOKEN"
 const codespaceExtensionManifestEnv = "COPILOT_CODESPACE_EXTENSION_MANIFEST"
+const codespaceExtensionModeEnv = "COPILOT_CODESPACE_EXTENSION_MODE"
 const userExtensionName = "copilot-codespace"
 const legacyGeneratedUserExtensionPrefix = "copilot-codespace-"
 const generatedUserExtensionMaxAge = 24 * time.Hour
@@ -35,7 +36,7 @@ func extensionSessionToken() string {
 	return hex.EncodeToString(b[:])
 }
 
-func extensionHostEnv(reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig) map[string]string {
+func extensionHostEnv(reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig, mode string) map[string]string {
 	var entries []registryEntry
 	for _, cs := range reg.All() {
 		entries = append(entries, registryEntry{
@@ -55,6 +56,9 @@ func extensionHostEnv(reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig) 
 	}
 	if lifecycleJSON := lifecycleConfigEnvJSON(lifecycleCfg); lifecycleJSON != "" {
 		env[codespaceLifecycleConfigEnv] = lifecycleJSON
+	}
+	if mode != "" {
+		env[codespaceExtensionModeEnv] = mode
 	}
 	return env
 }
@@ -214,7 +218,17 @@ if (!manifest) {
     });
   }
 
-  const definitions = await request("list_tools");
+  const bootstrap = await request("list_tools");
+  // The Go side returns { tools, systemMessage?, customAgents? }. Older builds
+  // returned a bare array of tool definitions; tolerate that shape too so a
+  // mid-rollout binary skew never breaks the extension.
+  const definitions = Array.isArray(bootstrap)
+    ? bootstrap
+    : Array.isArray(bootstrap?.tools)
+      ? bootstrap.tools
+      : [];
+  const systemMessage = Array.isArray(bootstrap) ? undefined : bootstrap?.systemMessage;
+  const customAgents = Array.isArray(bootstrap) ? undefined : bootstrap?.customAgents;
   const tools = definitions.map((definition) => ({
     name: definition.name,
     description: definition.description,
@@ -231,7 +245,15 @@ if (!manifest) {
     },
   }));
 
-  await joinSession({ tools });
+  const sessionConfig = { tools };
+  if (systemMessage && typeof systemMessage.content === "string" && systemMessage.content.length > 0) {
+    sessionConfig.systemMessage = systemMessage;
+  }
+  if (Array.isArray(customAgents) && customAgents.length > 0) {
+    sessionConfig.customAgents = customAgents;
+  }
+
+  await joinSession(sessionConfig);
 }
 `, codespaceExtensionTokenEnv, codespaceExtensionManifestEnv)
 }
