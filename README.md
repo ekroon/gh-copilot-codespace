@@ -150,6 +150,13 @@ With `--here`, this remote component mirroring is skipped to avoid writing gener
 
 Remote project MCP configs are still forwarded through `--additional-mcp-config`; extension mode only replaces this project’s built-in Codespaces tool server. In normal mirrored-workspace launches, the generated extension is written under the mirror’s `.github/extensions/copilot-codespace/`. In `--here` mode, the launcher installs or updates one stable user-scoped wrapper extension at `~/.copilot/extensions/copilot-codespace/extension.mjs`, then passes a per-session manifest path and token through the Copilot process environment. The wrapper registers tools only when that manifest/token pair validates, so unrelated Copilot sessions load no tools from it. Legacy per-session generated user extension directories older than 24 hours are cleaned up on later `--extension-tools --here` launches.
 
+When extension mode is active, the generated extension also forwards two pieces of session context through `joinSession`:
+
+- A `systemMessage` (mode `"append"`) describing the connected codespaces, the alias-routing rule for `remote_*` tools, and when to prefer `remote_bash` over local bash. This is delivered through the SDK rather than written to disk, so it works equally well in `--here` mode where no mirror exists.
+- A `customAgents` entry for `@remote-explorer`, a Haiku-backed sub-agent restricted to the `remote_*` and `list_codespaces` tools that parent agents can delegate code exploration to. In MCP mode the same agent is provided as a `.github/agents/remote-explorer.agent.md` file under the mirror directory.
+
+Under the hood, extension-tools mode also routes every `remote_*` call through a long-lived **daemon** running inside the sandbox (`gh-copilot-codespace daemon` subcommand) over a single multiplexed SSH stream, instead of spawning one `ssh` per call. This eliminates per-call shell assembly and `envSecretsLoader` re-execution (~30-50ms/call) and removes a class of shell-escaping bugs. The daemon is wrapped by a `daemonclient.Executor` that satisfies the same `ssh.Executor` interface MCP uses, so the migration is invisible to consumers. Set `COPILOT_CODESPACE_NO_DAEMON=1` to fall back to per-call SSH. The transport is sandbox-agnostic: SSH is one `daemontransport.Transport` implementation today, and `DevContainerTransport`/`WSLTransport` stubs are in place for future container and WSL targets.
+
 ## Multi-codespace support
 
 When connecting to multiple codespaces, all first-party `remote_*` tools accept an optional `codespace` parameter (the alias), whether they are supplied by MCP or by the generated extension. When only one codespace is connected, this parameter is optional.
