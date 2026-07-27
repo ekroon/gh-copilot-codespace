@@ -1,34 +1,46 @@
 # gh-copilot-codespace
 
-Launch Copilot CLI with all file/bash operations executing on remote GitHub Codespace(s) via SSH. Supports multiple codespaces, session resume, selected-only restrictions, and on-demand codespace creation.
+Launch Copilot CLI in your current local checkout with tools for working on one or more GitHub Codespaces over SSH.
 
 ## How it works
 
-A single Go binary (`gh-copilot-codespace`) serves four roles:
+The launcher:
 
-1. **Launcher mode** (default) — Lists your codespaces, lets you pick one or more, starts them if needed, deploys the exec agent, fetches instruction files and project-level components, then launches `copilot` with:
-    - `--excluded-tools` — disables local shell/search tools
-    - `--additional-mcp-config` — adds itself as the MCP server (plus any remote MCP configs), unless first-party tools are supplied by the experimental extension mode
+1. Selects, starts, and connects to Codespaces.
+2. Deploys the helper binary and establishes multiplexed SSH connections.
+3. Installs a user-scoped Copilot extension and starts its local extension host.
+4. Launches Copilot without changing directories.
 
-2. **MCP server mode** (`gh-copilot-codespace mcp`) — Spawned by copilot, provides 17 remote tools over SSH:
-    - `remote_view`, `remote_edit`, `remote_create` — file operations
-    - `remote_bash` (session-backed fast path + async), `remote_grep`, `remote_glob` — commands & search
-    - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash` — async session management (tmux-based)
-    - `remote_cd`, `remote_cwd` — default working directory navigation
-    - `list_codespaces`, `create_codespace`, `connect_codespace`, `delete_codespace` — codespace lifecycle
-    - `open_shell` — open interactive SSH session
+Copilot remains in the checkout where you ran `gh copilot-codespace`. Local instructions, agents, skills, and other project files are the source of session context. Nothing is fetched from a Codespace into a generated mirror, and no project agents, hooks, or remote server configuration are generated locally.
 
-3. **Exec agent** (`gh-copilot-codespace exec`) — Deployed to the codespace at startup. Provides structured command execution with workdir/env setup, replacing fragile shell escaping in SSH forwarding.
+All built-in local tools remain enabled. The extension adds the first-party Codespaces tools, but repository implementation must happen in the Codespace working copy:
 
-4. **Extension host** (`gh-copilot-codespace extension-host`) — Used by generated Copilot CLI extensions when `--extension-tools` is enabled. It exposes the same first-party remote tools through the extension API while keeping tool state in one long-lived helper process.
+- Use `remote_view`, `remote_edit`, `remote_create`, `remote_grep`, and `remote_glob` for repository files.
+- Use `remote_bash` for builds, tests, linters, dependency operations, repository scripts, and Git commands.
+- Reserve local tools for local context, Copilot session artifacts, and explicit local-only work.
 
-5. **Workspace management** (`gh-copilot-codespace workspaces`) — Lists and manages workspace sessions for `--resume`.
+The local and remote checkouts are separate and are not synchronized.
+
+## Runtime architecture
+
+The Go binary has four modes:
+
+1. **Launcher** (default) — connects Codespaces, prepares the extension session, and replaces itself with Copilot.
+2. **Exec agent** (`gh-copilot-codespace exec`) — deployed to a Codespace for structured remote process execution.
+3. **Extension host** (`gh-copilot-codespace extension-host`) — exposes the 20 first-party remote and lifecycle tools through the Copilot extension API.
+4. **Sandbox daemon** (`gh-copilot-codespace daemon`) — runs inside each connected Codespace and handles remote operations over a long-lived JSON protocol stream.
+
+The stable user-scoped extension at `~/.copilot/extensions/copilot-codespace/extension.mjs` activates only when the launcher supplies a valid per-session manifest and token. It forwards the extension host's tools, appended `systemMessage`, and inline `@remote-explorer` agent to `joinSession`.
+
+The `systemMessage` always explains that local files provide context while repository work belongs on the Codespace, and it supplies remote-tool routing guidance. When at least one Codespace is connected, the extension also registers the inline `@remote-explorer` agent for remote codebase exploration. These are delivered through the extension API rather than generated project files.
+
+The extension host wraps each Codespace SSH executor with a daemon client by default. Calls share one multiplexed SSH stream, avoiding a new SSH process and shell setup for every operation. If daemon deployment or connection fails, the host falls back to direct SSH. Set `COPILOT_CODESPACE_NO_DAEMON=1` to force that fallback.
 
 ## Prerequisites
 
 - `gh` CLI authenticated with `codespace` scope
-- `gh` permission to list, create, and connect GitHub Codespaces
-- [Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) installed (or available via `gh copilot`)
+- Permission to list, create, and connect GitHub Codespaces
+- [Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) installed, or available through `gh copilot`
 
 ## Installation
 
@@ -46,167 +58,84 @@ go build -o gh-copilot-codespace ./cmd/gh-copilot-codespace
 ## Quick start
 
 ```bash
-# Via gh extension — interactive picker (select zero, one, or many)
+# Interactive picker (select zero, one, or many)
 gh copilot-codespace
 
-# Connect to a specific codespace
+# Connect to a specific Codespace
 gh copilot-codespace -c my-codespace-name
 
-# Connect to multiple codespaces
+# Connect to multiple Codespaces
 gh copilot-codespace -c codespace-1,codespace-2
 
-# Keep Copilot in the current local directory while adding remote tools
-gh copilot-codespace --here -c my-codespace-name
+# Start without a Codespace, then create or connect from the agent
+gh copilot-codespace --no-codespace
 
-# Same, while passing Copilot CLI flags such as conversation resume
-gh copilot-codespace --here -c my-codespace-name -- --resume <copilot-session>
-
-# Start non-interactively with no codespaces, then create/connect from the agent
-gh copilot-codespace --no-codespace --name bootstrap-session
-
-# Restrict existing-codespace access to the codespaces selected at startup
+# Restrict existing-Codespace access to the startup selection
 gh copilot-codespace --selected-only
 
-# Start a restricted bootstrap session with no existing codespaces selected
-gh copilot-codespace --no-codespace --selected-only --name restricted-bootstrap
-
-# Name the session for later resume
-gh copilot-codespace --name my-session
-
-# Resume a previous session by name
-gh copilot-codespace --resume my-session
-
-# Resume and keep local bash/grep/glob tools enabled too
-gh copilot-codespace --resume my-session --local-tools
-
-# Experimental: register first-party remote tools through a generated Copilot extension
-gh copilot-codespace -c my-codespace-name --extension-tools
-
-# Resume by choosing from saved sessions
-gh copilot-codespace --resume
-
-# List workspace sessions
-gh copilot-codespace workspaces
-
-# Pass extra copilot flags
+# Forward Copilot CLI arguments directly
+gh copilot-codespace -c my-codespace-name --resume <copilot-session>
 gh copilot-codespace --model claude-sonnet-4.5
 ```
 
-If you launch without `-c/--codespace` or `--no-codespace`, the interactive picker supports selecting multiple codespaces. Press Enter without toggling any codespaces to start with no codespaces connected, or use `--no-codespace` to skip the picker entirely for non-interactive launches. In unrestricted sessions, you can then use `list_available_codespaces`, `create_codespace`, or `connect_codespace` from the agent. In `--selected-only` sessions, existing-codespace access is limited to the codespaces selected at startup, and a zero-selection launch becomes create-only until you create a codespace.
+Arguments not consumed by this launcher are forwarded directly to Copilot. In particular, `--resume` is Copilot's conversation-resume option; this project does not create or manage launcher workspaces.
 
-## Current-directory mode
+If neither `-c/--codespace` nor `--no-codespace` is supplied, the interactive picker supports multiple selections. Press Enter without selecting a Codespace to launch with none connected. The agent can then use `list_available_codespaces`, `get_codespace_options`, `create_codespace`, or `connect_codespace`.
 
-Use `--here` when you already have useful local context (local WIP, a plan, local instructions, or an existing Copilot conversation) and want to add Codespaces tools without moving Copilot into the generated mirror directory.
+## Remote tools
 
-In `--here` mode, Copilot starts in the current local directory, local tools stay enabled by default, and remote tools are still available through the Codespaces MCP server. Remote project instructions, hooks, skills, and forwarded remote MCP configs are **not** mirrored into the current repository in this mode, so generated files are not written into your worktree.
+The extension registers:
 
-The local and remote checkouts are separate worktrees. Copying between them is explicit with `remote_copy`:
+- `remote_view`, `remote_edit`, `remote_create`
+- `remote_bash`, `remote_grep`, `remote_glob`
+- `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash`
+- `remote_cd`, `remote_cwd`
+- `remote_copy`
+- `list_codespaces`, `list_available_codespaces`
+- `get_codespace_options`, `create_codespace`, `connect_codespace`, `delete_codespace`
+- `open_shell`
+
+For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when parallel calls or precise targeting require it. `remote_cd` changes only the default directory for later sequential calls.
+
+### Explicit file transfer
+
+`remote_copy` performs an explicit one-time transfer between the current local checkout and a connected Codespace:
 
 ```text
 remote_copy(source="src/app.go", destination="cs://github/src/app.go")
 remote_copy(source="cs://github/src/generated.go", destination="src/generated.go")
 ```
 
-The `github` segment is the connected codespace alias shown by `list_codespaces`. `remote_copy` refuses to overwrite destination files unless `overwrite=true`; each copy is a one-time transfer, not synchronization.
+The `github` segment is the alias shown by `list_codespaces`. The tool copies files only, refuses to overwrite by default, and never establishes synchronization between checkouts.
+
+## Multi-Codespace support
+
+All repository `remote_*` tools accept an optional `codespace` alias. The alias is optional when exactly one Codespace is connected.
+
+```text
+remote_bash(codespace="api", cwd="/workspaces/api", command="go test ./...")
+remote_view(codespace="web", path="/workspaces/web/src/app.ts")
+```
+
+Use `list_codespaces` to see connected aliases, repositories, branches, and working directories. Lifecycle tools can create, connect, and delete Codespaces during the session.
 
 ## Selected-only sessions
 
-`--selected-only` restricts access to **existing** codespaces. It does not disable `create_codespace`; it narrows which already-existing codespaces the agent can discover or attach to.
+`--selected-only` limits access to existing Codespaces. It does not disable Codespace creation.
 
-| Tool | Behavior in `--selected-only` sessions |
+| Tool | Behavior |
 |---|---|
-| `list_available_codespaces` | Shows only the existing codespaces selected at startup. After `--resume`, it also shows codespaces that were created from inside that session and preserved in the session allowlist. |
-| `connect_codespace` | Can attach only existing codespaces on that allowlist. Other existing codespaces stay hidden from `list_available_codespaces` and are rejected if you try to connect to them directly. |
-| `create_codespace` | Always remains available. Newly created codespaces are connected immediately and added to the allowlist for future `--resume` sessions. |
+| `list_available_codespaces` | Shows only existing Codespaces selected at startup. |
+| `connect_codespace` | Can attach only an existing Codespace on that allowlist. |
+| `create_codespace` | Remains available; a newly created Codespace is connected immediately. |
 
-If you start with `--no-codespace --selected-only` (or leave the picker empty with the flag enabled), no existing codespaces are allowlisted. That session is **create-only** for adding codespaces: `list_available_codespaces` returns no connectable existing codespaces, and `connect_codespace` rejects existing codespaces until you create one with `create_codespace`.
-
-## What gets fetched from the codespace
-
-The launcher fetches all project-level Copilot CLI components in a single SSH call:
-
-| Component | Remote path | Local handling |
-|---|---|---|
-| Copilot instructions | `.github/copilot-instructions.md` | Mirrored |
-| Scoped instructions | `.github/instructions/*.instructions.md` | Mirrored |
-| Agent files | `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` (recursive) | Mirrored |
-| **Custom agents** | `.github/agents/*.agent.md`, `.claude/agents/*.agent.md` | Mirrored |
-| **Skills** | `.github/skills/`, `.agents/skills/`, `.claude/skills/` (full trees) | Mirrored |
-| **Commands** | `.claude/commands/` | Mirrored |
-| **Hooks** | `.github/hooks/*.json` | Rewritten for SSH forwarding |
-| **MCP servers** | `.copilot/mcp-config.json`, `.vscode/mcp.json`, `.mcp.json`, `.github/mcp.json` | Parsed & forwarded over SSH |
-
-**Skills** include supporting files (scripts, templates) so Copilot can read them during skill loading. Actual script execution happens remotely via `remote_bash`.
-
-**Hooks** have their bash commands rewritten to execute on the codespace via SSH. Stdin/stdout piping through SSH preserves `preToolUse` allow/deny behavior.
-
-**MCP servers** are rewritten to forward stdio over SSH, so remote MCP tools appear as local tools to Copilot.
-
-With `--here`, this remote component mirroring is skipped to avoid writing generated instructions, hooks, agents, or skills into the current repository.
-
-## Experimental extension tools
-
-`--extension-tools` registers this project’s first-party Codespaces tools through a generated Copilot CLI extension instead of the first-party `codespace` MCP server. The user-facing tool names stay the same (`remote_bash`, `remote_view`, `create_codespace`, and the rest of the first-party remote tools), and the generated extension delegates calls to a long-lived `gh-copilot-codespace extension-host` helper so working-directory changes, connected codespaces, and lifecycle state persist across calls.
-
-Remote project MCP configs are still forwarded through `--additional-mcp-config`; extension mode only replaces this project’s built-in Codespaces tool server. In normal mirrored-workspace launches, the generated extension is written under the mirror’s `.github/extensions/copilot-codespace/`. In `--here` mode, the launcher installs or updates one stable user-scoped wrapper extension at `~/.copilot/extensions/copilot-codespace/extension.mjs`, then passes a per-session manifest path and token through the Copilot process environment. The wrapper registers tools only when that manifest/token pair validates, so unrelated Copilot sessions load no tools from it. Legacy per-session generated user extension directories older than 24 hours are cleaned up on later `--extension-tools --here` launches.
-
-When extension mode is active, the generated extension also forwards two pieces of session context through `joinSession`:
-
-- A `systemMessage` (mode `"append"`) describing the connected codespaces, the alias-routing rule for `remote_*` tools, and when to prefer `remote_bash` over local bash. This is delivered through the SDK rather than written to disk, so it works equally well in `--here` mode where no mirror exists.
-- A `customAgents` entry for `@remote-explorer`, a Haiku-backed sub-agent restricted to the `remote_*` and `list_codespaces` tools that parent agents can delegate code exploration to. In MCP mode the same agent is provided as a `.github/agents/remote-explorer.agent.md` file under the mirror directory.
-
-Under the hood, extension-tools mode also routes every `remote_*` call through a long-lived **daemon** running inside the sandbox (`gh-copilot-codespace daemon` subcommand) over a single multiplexed SSH stream, instead of spawning one `ssh` per call. This eliminates per-call shell assembly and `envSecretsLoader` re-execution (~30-50ms/call) and removes a class of shell-escaping bugs. The daemon is wrapped by a `daemonclient.Executor` that satisfies the same `ssh.Executor` interface MCP uses, so the migration is invisible to consumers. Set `COPILOT_CODESPACE_NO_DAEMON=1` to fall back to per-call SSH. The transport is sandbox-agnostic: SSH is one `daemontransport.Transport` implementation today, and `DevContainerTransport`/`WSLTransport` stubs are in place for future container and WSL targets.
-
-## Multi-codespace support
-
-When connecting to multiple codespaces, all first-party `remote_*` tools accept an optional `codespace` parameter (the alias), whether they are supplied by MCP or by the generated extension. When only one codespace is connected, this parameter is optional.
-
-For `remote_bash`, `remote_grep`, and `remote_glob`, prefer passing `cwd` explicitly when you need predictable behavior across parallel tool calls. `remote_cd` still updates the default cwd for later sequential calls, but it should not be treated as an ordering dependency inside a parallel batch.
-
-`remote_copy` uses aliases in `cs://<alias>/<path>` endpoints. For example, `cs://api/src/server.go` copies to or from the codespace connected as alias `api`.
-
-The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools. Starting with zero connected codespaces is supported, so you can bootstrap a brand-new session and create the first codespace from inside the agent. With `--selected-only`, that zero-codespace bootstrap flow stays create-first unless you already preserved codespaces selected at startup or created from the session in the resumed allowlist.
-
-## Session resume
-
-Workspace sessions are saved to `~/.copilot/workspaces/` with a manifest (`workspace.json`) tracking connected codespaces. Empty sessions are resumable too, which is useful when you want to launch first and create/connect codespaces later from the agent. Use `--resume` to reconnect by name, or pass bare `--resume` to choose interactively from saved sessions:
-
-```bash
-# First session
-gh copilot-codespace --name my-feature -c my-codespace
-
-# Later: resume by name
-gh copilot-codespace --resume my-feature
-
-# Or choose from saved sessions
-gh copilot-codespace --resume
-```
-
-`gh copilot-codespace workspaces` now shows richer workspace metadata including repositories, codespace names, branches, the local workspace path, and recent activity time. The interactive `--resume` picker also includes that metadata in each entry so you can search on it directly.
-
-Local files created in the workspace `files/` directory persist across sessions.
-
-Workspace manifests also persist session behavior, including `--local-tools` and the selected-only access policy. Resume uses those saved settings by default.
-
-You can override persisted booleans on resume:
-
-- bare `--local-tools` / `--selected-only` still mean `true`
-- `--local-tools=true|false`
-- `--selected-only=true|false`
-
-Launch identity flags are still not valid with resume: `--codespace`, `--workdir`, and `--name` are creation-time inputs, while resume reuses the saved workspace session and its persisted codespace metadata.
-
-When `--selected-only` was enabled, resume preserves the allowlist too: the **existing** codespaces selected at startup stay eligible, and any codespaces created from inside that session stay eligible as well. Resuming does not reopen access to other pre-existing codespaces that were not selected at startup.
+Starting with `--no-codespace --selected-only` creates a create-first session: no existing Codespaces are discoverable or connectable, but the agent can create a new one.
 
 ## Custom provisioners
 
-Provisioners run custom setup on codespaces after connection or creation. Built-in provisioners handle terminal info upload and git fetch automatically.
+Provisioners run setup after the launcher connects a Codespace and after extension lifecycle tools create or connect one. Built-in provisioners upload terminal information and run `git fetch origin`.
 
-Provisioners are loaded in both places:
-- when the launcher initially connects to selected/resumed codespaces
-- when the MCP lifecycle tools (`create_codespace` / `connect_codespace`) attach new codespaces later in the session
-
-For Ghostty, you usually do **not** need to copy your Ghostty config file into the codespace. The built-in `terminfo` provisioner uploads local terminfo entries into the codespace; when Ghostty is detected it always uploads `xterm-ghostty`, even if you override `$TERM` locally. That matches the intent of the legacy shell script. If you want extra Ghostty-specific setup beyond that, add a custom provisioner matched on `"terminal": "xterm-ghostty"`; Ghostty sessions are normalized to that detected terminal name for matching too. Custom `bash` provisioners still run on the codespace itself; the local-to-remote terminfo upload is specific to the built-in provisioner.
+For Ghostty, the built-in terminal provisioner uploads `xterm-ghostty`. Custom `bash` provisioners run on the Codespace.
 
 Add custom provisioners in `~/.config/copilot-codespace/provisioners.json`:
 
@@ -223,10 +152,6 @@ Add custom provisioners in `~/.config/copilot-codespace/provisioners.json`:
       "match": { "terminal": "xterm-ghostty" }
     },
     {
-      "name": "my-dotfiles",
-      "bash": "curl -fsSL https://raw.githubusercontent.com/me/dotfiles/main/setup.sh | bash"
-    },
-    {
       "name": "github-setup",
       "bash": "cd /workspaces/github && bin/setup",
       "match": { "repository": "github/github" }
@@ -235,54 +160,46 @@ Add custom provisioners in `~/.config/copilot-codespace/provisioners.json`:
 }
 ```
 
-Set a built-in to `false` if you want to disable it entirely.
-
 | Field | Description |
-|-------|-------------|
-| `builtins.terminfo` | Enable/disable the built-in terminfo upload provisioner (default: enabled) |
-| `builtins.git-fetch` | Enable/disable the built-in `git fetch origin` provisioner (default: enabled) |
-| `name` | Provisioner name (shown in logs) |
-| `bash` | Command to run on the codespace via SSH |
-| `match.terminal` | Only run when the detected local terminal matches (e.g., Ghostty normalizes to `"xterm-ghostty"` even if `$TERM` is overridden) |
-| `match.repository` | Only run for this repository (e.g., `"github/github"`) |
+|---|---|
+| `builtins.terminfo` | Enable or disable terminal information upload (enabled by default) |
+| `builtins.git-fetch` | Enable or disable `git fetch origin` (enabled by default) |
+| `name` | Provisioner name shown in logs |
+| `bash` | Command run on the Codespace |
+| `match.terminal` | Run only for the detected local terminal |
+| `match.repository` | Run only for the specified repository |
 
-Provisioners without `match` run on every codespace. Errors are logged but don't block connection.
+Provisioners without `match` run on every Codespace. Errors are logged but do not block connection.
 
 ## Development
 
-### Running tests
-
 ```bash
+go build ./cmd/gh-copilot-codespace
+go vet ./...
 go test -race ./...
 ```
 
-### Integration testing & signoff
-
-Integration tests require a real codespace and `gh` CLI authentication. They run locally, not in CI.
+Integration tests require a real Codespace and `gh` authentication:
 
 ```bash
-# One-time setup: install gh-signoff
 ./scripts/setup-signoff.sh
-
-# Run integration tests
 ./scripts/integration-test.sh
-
-# Sign off on the current commit (sets a GitHub commit status)
 gh signoff integration
 ```
 
-### Release flow
+## Release flow
 
-Every push to `main` triggers CI (vet, test, cross-platform build). If CI passes, a pre-release (`dev-{sha}`) is created automatically.
+Every push to `main` runs vet, tests, and cross-platform builds. A successful build creates a `dev-{sha}` pre-release.
 
-To create a stable release for gh extension users, push a semver tag (e.g., `git tag v0.1.0 && git push origin v0.1.0`). This triggers a release via `cli/gh-extension-precompile` which builds binaries compatible with `gh extension install/upgrade`.
-
-To promote a dev pre-release to `latest` (for mise users), run the "Promote to Latest" workflow from the GitHub Actions tab (or `gh workflow run promote-to-latest.yml`). It checks signoff on the latest main commit and promotes the existing pre-release to `latest`.
+Pushing a semantic-version tag triggers a release for `gh extension` users. To promote a development release to `latest` for mise users, run the **Promote to Latest** workflow after integration signoff.
 
 ## Environment variables
 
-| Variable | Description | Set by |
-|---|---|---|
-| `CODESPACE_NAME` | Codespace name | Launcher → MCP server |
-| `CODESPACE_WORKDIR` | Working directory on codespace | Launcher → MCP server |
-| `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` | Temp dir with fetched instruction files | Launcher → copilot |
+| Variable | Description |
+|---|---|
+| `CODESPACE_REGISTRY` | Connected Codespace metadata supplied to the extension host |
+| `CODESPACE_LOCAL_WORKDIR` | Current local checkout used as the allowed local root for `remote_copy` |
+| `CODESPACE_LIFECYCLE_CONFIG` | Per-session lifecycle access policy |
+| `COPILOT_CODESPACE_EXTENSION_TOKEN` | Token activating the user-scoped extension for this launch |
+| `COPILOT_CODESPACE_EXTENSION_MANIFEST` | Path to the per-session extension manifest |
+| `COPILOT_CODESPACE_NO_DAEMON` | Set to `1` to use direct SSH instead of the sandbox daemon |

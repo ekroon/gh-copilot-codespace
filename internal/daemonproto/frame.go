@@ -15,10 +15,10 @@
 //   - TypeRequest  ("req")     — client → server, carries an id, verb, params.
 //   - TypeResponse ("resp")    — server → client, references the request id.
 //   - TypeCancel   ("cancel")  — client → server, asks the daemon to terminate
-//                                an in-flight request by id (SIGTERM the
-//                                process group, drop pending verb work).
+//     an in-flight request by id (SIGTERM the
+//     process group, drop pending verb work).
 //   - TypeHello    ("hello")   — server → client, sent once on connect to
-//                                announce protocol version and supported verbs.
+//     announce protocol version and supported verbs.
 //
 // IDs are caller-allocated positive integers, unique per connection. The
 // server never reuses an id in a response; once a response or terminal error

@@ -3,71 +3,80 @@
 ## Build, test, and lint
 
 ```bash
-go build ./cmd/gh-copilot-codespace    # build the binary
-go vet ./...                        # lint
-go test -race ./...                 # all tests
-go test -race -run TestParseInput ./internal/ssh  # single test
+go build ./cmd/gh-copilot-codespace
+go vet ./...
+go test -race ./...
+go test -race -run TestParseInput ./internal/ssh
 ```
 
-Integration tests require a real codespace and `gh` CLI auth — run `./scripts/integration-test.sh` locally (not in CI). Sign off with `gh signoff integration` after they pass.
+Integration tests require a real Codespace and `gh` authentication. Run `./scripts/integration-test.sh` locally, then use `gh signoff integration`.
 
 ## Architecture
 
-Single Go binary that operates in five modes, selected by the first argument:
+The single Go binary operates in four modes:
 
 1. **Launcher** (`gh-copilot-codespace [flags]`) — `cmd/gh-copilot-codespace/main.go`
-   - Lists codespaces via `gh`, picks one, starts it if stopped
-   - Deploys exec agent binary to the codespace (`deploy.go`)
-   - Fetches project-level components (instructions, skills, agents, commands, hooks, MCP configs) into a local mirror dir
-   - Rewrites MCP servers and hooks for SSH forwarding (using remote exec agent when available)
-   - Execs `copilot` with `--excluded-tools` (disabling 10 local file/shell tools) and `--additional-mcp-config` (adding itself as the MCP server)
-   - Falls back to `gh copilot` if standalone `copilot` binary is not in PATH
+   - Selects zero or more Codespaces, starts them when needed, detects their repository working directories, and establishes multiplexed SSH connections.
+   - Deploys the helper binary and runs provisioners for initially connected Codespaces.
+   - Keeps Copilot in the caller's current checkout. Local instructions, agents, skills, and files remain the source of context.
+   - Leaves all Copilot built-in local tools enabled.
+   - Installs the stable user-scoped extension, creates a token-protected per-session manifest, and execs Copilot.
+   - Forwards unconsumed arguments, including Copilot's `--resume`, directly to Copilot.
+   - Falls back to `gh copilot` when the standalone `copilot` binary is unavailable.
 
-2. **MCP server** (`gh-copilot-codespace mcp`) — `internal/mcp/server.go`
-   - Spawned by Copilot CLI as a child process, communicates via stdio JSON-RPC
-   - Provides `remote_*` tools (view, edit, create, bash, grep, glob, write/read/stop/list_bash) that mirror Copilot's built-in local tools
-   - Delegates all operations to `ssh.Executor` interface
+2. **Exec agent** (`gh-copilot-codespace exec`) — `cmd/gh-copilot-codespace/exec.go`
+   - Is deployed to each Codespace for structured process execution with working-directory and environment setup.
+   - Replaces fragile remote shell-command assembly with Go process management.
 
-3. **Exec agent** (`gh-copilot-codespace exec`) — `cmd/gh-copilot-codespace/exec.go`
-   - Deployed to codespace at startup, used for structured remote command execution
-   - `exec [--workdir DIR] [--env K=V]... -- COMMAND [ARGS...]`
-   - Replaces fragile `bash -c 'cd WD && export K=V && exec CMD'` shell assembly with proper Go process management
+3. **Extension host** (`gh-copilot-codespace extension-host`) — `cmd/gh-copilot-codespace/extension_host.go`
+   - Is spawned locally by the user-scoped Copilot extension.
+   - Owns the shared `mcp.ToolRuntime`, exposing its 20 first-party remote and lifecycle tools through a small stdio JSON protocol.
+   - Returns `{tools, systemMessage, customAgents}` from `list_tools`; the JavaScript extension forwards these values to `joinSession`.
+   - Always builds current-directory guidance: local files supply project context, while repository reads, edits, commands, tests, dependencies, scripts, and Git operations must use the appropriate `remote_*` tools.
+   - Supplies `@remote-explorer` as an inline custom agent whenever at least one Codespace is connected; no project agent file is generated.
+   - Wraps registered `ssh.Client` executors with `daemonclient.Executor` by default. Wrap or dial failures fall back transparently to direct SSH.
 
-4. **Extension host** (`gh-copilot-codespace extension-host`) — `cmd/gh-copilot-codespace/extension_host.go`
-   - Spawned locally by the generated Copilot CLI extension under `--extension-tools`
-   - On `list_tools` returns a `{tools, systemMessage, customAgents}` bootstrap payload — the JS extension forwards `systemMessage` (codespace context preamble) and `customAgents` (inline `@remote-explorer` agent) to `joinSession` in addition to tools
-   - Mode is selected from `COPILOT_CODESPACE_EXTENSION_MODE` (`mirror`/`here`/`resume`) so the preamble wording matches the launch flavor
-   - `remoteExplorerInlineAgent` (in `remote_explorer.go`) is the single source of truth for the sub-agent; the on-disk variant `.github/agents/remote-explorer.agent.md` is generated only for MCP mode
-   - On startup wraps each registered `ssh.Client` with a `daemonclient.Executor` (see daemon mode below) unless `COPILOT_CODESPACE_NO_DAEMON=1` is set. Wrap-and-dial failures fall back transparently to the original `ssh.Client`.
+4. **Sandbox daemon** (`gh-copilot-codespace daemon`) — `cmd/gh-copilot-codespace/daemon.go`
+   - Runs as a long-lived stdio JSON server inside each connected Codespace.
+   - Implements all `ssh.Executor` verbs natively; file content travels in JSON frames rather than through a base64 shell hop.
+   - Dispatches concurrent requests to goroutines and serializes response writes with one mutex.
+   - Starts bash children in their own process group so cancellation terminates the full command tree.
+   - Refreshes process environment from `/workspaces/.codespaces/shared/.env-secrets` for every request.
 
-5. **Sandbox daemon** (`gh-copilot-codespace daemon`) — `cmd/gh-copilot-codespace/daemon.go`
-   - Long-lived stdio JSON-RPC server inside the sandbox (codespace). Reads `daemonproto` frames from stdin, writes responses to stdout.
-   - All 12 `Executor` verbs implemented natively (no base64-over-bash). `run_bash` spawns children with `Setpgid: true` so cancel frames SIGTERM the whole process group.
-   - Concurrent requests dispatched to goroutines; the response writer is serialized through a single mutex.
-   - Per-request env refresh from `/workspaces/.codespaces/shared/.env-secrets` via `codespaceenv.ApplyProcessBootstrap`.
+## Context and tool routing
 
-Key packages:
-- `internal/ssh` — `Client` implements `Executor` by running commands over SSH (via `gh codespace ssh` or multiplexed ControlMaster). Async sessions use tmux on the codespace. Used directly by MCP mode and as the byte-stream substrate for extension-mode's daemon transport.
-- `internal/daemonproto` — wire protocol shared by daemon and DaemonExecutor. Frame envelope, 12 verbs, six error codes, Encoder/Decoder over newline-delimited JSON (chose `json.Decoder` over `bufio.Scanner` so large file payloads don't hit token limits). Mutating verbs reserve an `idempotency_key` field for future dedup.
-- `internal/daemontransport` — `Transport` interface (`Deploy(ctx) → remotePath`, `Spawn(ctx, remotePath) → io.ReadWriteCloser`, `Close`, `Name`). Today: `SSHTransport` (production, reuses ControlMaster multiplexing) + `LocalTransport` (test-only). Stubs: `DevContainerTransport`, `WSLTransport`. The Transport abstraction is the seam that makes future devcontainer/WSL/gh-sandbox targets purely additive.
-- `internal/daemonclient` — `Executor` satisfies `ssh.Executor` by speaking `daemonproto` over any Transport. Reader goroutine demuxes responses by id; ctx cancellation issues a Cancel frame and returns `context.Canceled`. Compile-time check (`var _ ssh.Executor = (*Executor)(nil)`) keeps the interface in lock-step.
-- `internal/registry` — `Registry` maps codespace aliases to `ManagedCodespace` instances, each with its own `ssh.Executor`. Supports multi-codespace sessions.
-- `internal/workspace` — Manages local workspace sessions with `workspace.json` manifests for `--resume` support.
-- `internal/provisioner` — Provisioner interface for custom codespace setup (terminfo upload, git fetch, user-defined hooks).
+- Copilot always stays in the current local checkout.
+- Local project components are context only and are not synchronized with a Codespace.
+- All local tools remain enabled, but repository implementation work belongs in the remote working copy.
+- Use `remote_view`, `remote_edit`, `remote_create`, `remote_grep`, and `remote_glob` for repository files.
+- Use `remote_bash` for builds, tests, linters, dependency operations, repository scripts, and Git.
+- Use `remote_copy` only for an explicit one-time file transfer between the local checkout and `cs://<alias>/<path>`; it is not synchronization.
+- Use the inline `@remote-explorer` agent for remote codebase exploration.
+
+## Key packages
+
+- `internal/ssh` — `Client` implements `Executor` over `gh codespace ssh`; asynchronous sessions use tmux.
+- `internal/daemonproto` — newline-delimited JSON protocol shared by the daemon and daemon client, including cancellation and error envelopes.
+- `internal/daemontransport` — transport abstraction. `SSHTransport` is production; `LocalTransport` supports tests; devcontainer and WSL transports are future seams.
+- `internal/daemonclient` — multiplexes requests over a transport, demultiplexes responses by ID, and satisfies `ssh.Executor`.
+- `internal/registry` — maps Codespace aliases to `ManagedCodespace` instances and their executors.
+- `internal/mcp` — retains the shared tool definitions, handlers, lifecycle state, and transport-neutral `ToolRuntime` used by the extension host.
+- `internal/provisioner` — applies built-in and user-defined setup when Codespaces are connected.
 
 ## Conventions
 
-- The `ssh.Executor` interface is the seam for testing MCP handlers — tests use `mockExecutor` (defined in `server_test.go`), not real SSH.
-- File transfers use base64 encoding over SSH for the MCP path (`base64 < file` to read, `echo <b64> | base64 -d > file` to write). The daemon path transfers raw bytes inside JSON frames — no base64 hop.
-- Async bash sessions are backed by tmux on the codespace. Session names are prefixed with `copilot-` (see `tmuxPrefix` constant). The daemon's session verbs shell out to the same tmux commands.
-- MCP tool handlers never return Go errors — they return `toolError()` results with `IsError: true` so the MCP protocol layer stays clean.
-- The binary uses `syscall.Exec` to replace itself with `copilot` (or `node` for `--experimental-shell`), so the launcher process doesn't stay resident.
-- Daemon mode and MCP mode are independent. MCP stays on plain `ssh.Client` deliberately (blast-radius minimization); extension-tools mode is opt-in and the daemon transport runs only there. Both consume the same `ssh.Executor` interface, so swapping MCP to the daemon later is a one-line registry change.
+- `ssh.Executor` is the testing seam for tool handlers; tests use mock executors rather than real SSH.
+- Extension-host tool calls return transport-neutral `RuntimeCallResult` values.
+- Tool handlers report operational failures as tool results instead of protocol errors.
+- Async bash sessions use tmux names prefixed with `copilot-`.
+- `remote_bash`, `remote_grep`, and `remote_glob` should receive explicit working directories when parallel ordering matters.
+- The launcher uses `syscall.Exec`, so it does not remain resident after Copilot starts.
+- The user-scoped extension activates only when its per-session manifest and token validate; unrelated Copilot sessions receive no tools from it.
 
 ## Installation
 
-Installable as a gh CLI extension (`gh extension install ekroon/gh-copilot-codespace`) or via mise (`mise use -g github:ekroon/gh-copilot-codespace`).
+Install as a `gh` extension with `gh extension install ekroon/gh-copilot-codespace`, or with mise using `mise use -g github:ekroon/gh-copilot-codespace`.
 
 ## Release flow
 
-Every push to `main` triggers CI (vet, test, cross-platform build). If CI passes, a pre-release (`dev-{sha}`) is created. Pushing a semver tag (`v*`) triggers a `cli/gh-extension-precompile` release for gh extension users. The `latest` tag is only updated by running the "Promote to Latest" workflow (`gh workflow run promote-to-latest.yml`) after `gh signoff integration` has been run against the commit.
+Every push to `main` runs vet, tests, and cross-platform builds and creates a `dev-{sha}` pre-release on success. Semantic-version tags create extension releases. Promote to `latest` only after integration signoff by running the **Promote to Latest** workflow.

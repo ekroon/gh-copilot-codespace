@@ -133,12 +133,6 @@ func runExtensionHostIO(in io.Reader, out io.Writer) error {
 	}
 }
 
-func preambleModeFromEnv(mode string) PreambleMode {
-	switch mode {
-	case "here":
-		return PreambleModeHere
-	default:
-		// "mirror", "resume", "" — all use the standard remote-only wording.
-		return PreambleModeMirror
-	}
+func preambleModeFromEnv(string) PreambleMode {
+	return PreambleModeHere
 }

@@ -18,31 +18,6 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// NewServer creates and configures the MCP server with all remote tools.
-// Uses a registry to support multiple codespaces.
-func NewServer(reg *registry.Registry, lcfg ...LifecycleConfig) *server.MCPServer {
-	s := server.NewMCPServer("codespace-mcp", "0.2.0")
-
-	var cfg LifecycleConfig
-	if len(lcfg) > 0 {
-		cfg = lcfg[0]
-	}
-	NewToolRuntime(reg, cfg).AddToServer(s)
-
-	return s
-}
-
-// NewServerSingle creates an MCP server with a single codespace for backward compatibility.
-func NewServerSingle(executor ssh.Executor, codespaceName string) *server.MCPServer {
-	reg := registry.New()
-	reg.Register(&registry.ManagedCodespace{
-		Alias:    registry.DefaultAlias(codespaceName, nil),
-		Name:     codespaceName,
-		Executor: executor,
-	})
-	return NewServer(reg)
-}
-
 // resolveExecutor extracts the codespace alias from the request and resolves it via the registry.
 func resolveExecutor(reg *registry.Registry, req mcpsdk.CallToolRequest) (ssh.Executor, error) {
 	alias := optionalString(req, "codespace")
@@ -172,7 +147,11 @@ func resolveLocalRoot(localRoot string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolving local workdir: %w", err)
 	}
-	return filepath.Clean(abs), nil
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(abs))
+	if err != nil {
+		return "", fmt.Errorf("resolving local workdir symlinks: %w", err)
+	}
+	return resolved, nil
 }
 
 func resolveLocalCopyPath(root, value string) (string, error) {
@@ -189,7 +168,46 @@ func resolveLocalCopyPath(root, value string) (string, error) {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("local path %q escapes local workdir %q", value, root)
 	}
-	return candidate, nil
+	resolved, err := resolvePathSymlinks(candidate)
+	if err != nil {
+		return "", fmt.Errorf("resolving local path %q: %w", value, err)
+	}
+	resolvedRel, err := filepath.Rel(root, resolved)
+	if err != nil {
+		return "", fmt.Errorf("resolving local path: %w", err)
+	}
+	if resolvedRel == ".." || strings.HasPrefix(resolvedRel, ".."+string(filepath.Separator)) || filepath.IsAbs(resolvedRel) {
+		return "", fmt.Errorf("local path %q escapes local workdir %q", value, root)
+	}
+	return resolved, nil
+}
+
+func resolvePathSymlinks(candidate string) (string, error) {
+	current := candidate
+	var missing []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return resolved, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		if _, lstatErr := os.Lstat(current); lstatErr == nil {
+			return "", err
+		} else if !os.IsNotExist(lstatErr) {
+			return "", lstatErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func resolveRemoteCopyPath(cs *registry.ManagedCodespace, value string) (string, error) {

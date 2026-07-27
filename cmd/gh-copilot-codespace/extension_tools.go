@@ -20,12 +20,21 @@ const codespaceExtensionModeEnv = "COPILOT_CODESPACE_EXTENSION_MODE"
 const userExtensionName = "copilot-codespace"
 const legacyGeneratedUserExtensionPrefix = "copilot-codespace-"
 const generatedUserExtensionMaxAge = 24 * time.Hour
+const extensionRuntimeDirName = "gh-copilot-codespace/extension-sessions"
+const extensionSessionManifestPrefix = "extension-session-"
+const extensionSessionManifestMaxAge = 24 * time.Hour
 
 type extensionSessionManifest struct {
 	SelfBinary string            `json:"selfBinary"`
 	Env        map[string]string `json:"env"`
 	Token      string            `json:"token"`
-	Mode       string            `json:"mode,omitempty"`
+}
+
+type extensionLaunch struct {
+	Token        string
+	ManifestPath string
+	HostEnv      map[string]string
+	ProcessEnv   map[string]string
 }
 
 func extensionSessionToken() string {
@@ -36,7 +45,7 @@ func extensionSessionToken() string {
 	return hex.EncodeToString(b[:])
 }
 
-func extensionHostEnv(reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig, mode string) map[string]string {
+func extensionHostEnv(reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig, _ string) map[string]string {
 	var entries []registryEntry
 	for _, cs := range reg.All() {
 		entries = append(entries, registryEntry{
@@ -57,39 +66,106 @@ func extensionHostEnv(reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig, 
 	if lifecycleJSON := lifecycleConfigEnvJSON(lifecycleCfg); lifecycleJSON != "" {
 		env[codespaceLifecycleConfigEnv] = lifecycleJSON
 	}
-	if mode != "" {
-		env[codespaceExtensionModeEnv] = mode
-	}
 	return env
 }
 
-func writeExtensionSessionManifest(root, selfBinary string, env map[string]string, token, mode string) (string, error) {
-	dir := filepath.Join(root, ".copilot-codespace")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+func writeExtensionSessionManifest(_ string, selfBinary string, env map[string]string, token, _ string) (string, error) {
+	dir, err := extensionRuntimeDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("creating extension manifest dir: %w", err)
 	}
-	path := filepath.Join(dir, "extension-session-"+token+".json")
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", fmt.Errorf("securing extension manifest dir: %w", err)
+	}
+	if err := cleanupStaleExtensionSessionManifests(dir, time.Now()); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, extensionSessionManifestPrefix+token+".json")
 	data, err := json.MarshalIndent(extensionSessionManifest{
 		SelfBinary: selfBinary,
 		Env:        env,
 		Token:      token,
-		Mode:       mode,
 	}, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshaling extension manifest: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return "", fmt.Errorf("writing extension manifest: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("writing extension manifest: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("closing extension manifest: %w", err)
 	}
 	return path, nil
 }
 
-func generateProjectExtension(root string) error {
-	extDir := filepath.Join(root, ".github", "extensions", "copilot-codespace")
-	if err := os.MkdirAll(extDir, 0o755); err != nil {
-		return fmt.Errorf("creating project extension dir: %w", err)
+func extensionRuntimeDir() (string, error) {
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		var err error
+		base, err = os.UserCacheDir()
+		if err != nil {
+			return "", fmt.Errorf("getting user cache dir: %w", err)
+		}
 	}
-	return os.WriteFile(filepath.Join(extDir, "extension.mjs"), []byte(extensionSource()), 0o644)
+	return filepath.Join(base, filepath.FromSlash(extensionRuntimeDirName)), nil
+}
+
+func cleanupStaleExtensionSessionManifests(dir string, now time.Time) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("reading extension manifest dir: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), extensionSessionManifestPrefix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("stat extension manifest %q: %w", entry.Name(), err)
+		}
+		if now.Sub(info.ModTime()) < extensionSessionManifestMaxAge {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+			return fmt.Errorf("removing stale extension manifest %q: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+func prepareExtensionLaunch(selfBinary string, reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig) (extensionLaunch, error) {
+	if err := installUserExtension(); err != nil {
+		return extensionLaunch{}, err
+	}
+	token := extensionSessionToken()
+	hostEnv := extensionHostEnv(reg, lifecycleCfg, "")
+	manifestPath, err := writeExtensionSessionManifest("", selfBinary, hostEnv, token, "")
+	if err != nil {
+		return extensionLaunch{}, err
+	}
+	return extensionLaunch{
+		Token:        token,
+		ManifestPath: manifestPath,
+		HostEnv:      hostEnv,
+		ProcessEnv: map[string]string{
+			codespaceExtensionTokenEnv:    token,
+			codespaceExtensionManifestEnv: manifestPath,
+		},
+	}, nil
+}
+
+func generateProjectExtension(_ string) error {
+	return installUserExtension()
 }
 
 func installUserExtension() error {

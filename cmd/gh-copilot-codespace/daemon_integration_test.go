@@ -404,12 +404,12 @@ func projectRoot(t *testing.T) string {
 
 // extensionHostRPC is a thin client over the extension-host stdio JSON.
 type extensionHostRPC struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  *bufio.Reader
-	enc     *json.Encoder
-	dec     *json.Decoder
-	nextID  int
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+	enc    *json.Encoder
+	dec    *json.Decoder
+	nextID int
 }
 
 type rpcRequest struct {

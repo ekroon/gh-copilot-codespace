@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
-	"github.com/ekroon/gh-copilot-codespace/internal/workspace"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -39,19 +38,6 @@ func (m *mockGHRunner) Run(_ context.Context, args ...string) (string, error) {
 		}
 	}
 	return "", nil
-}
-
-func newTestWorkspace(t *testing.T, name string) *workspace.Workspace {
-	t.Helper()
-
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	ws, err := workspace.New(name)
-	if err != nil {
-		t.Fatalf("workspace.New(%q): %v", name, err)
-	}
-	return ws
 }
 
 func installFakeCodespaceCLI(t *testing.T, listJSON string, workdir string) {
@@ -215,8 +201,7 @@ func TestDeleteCodespaceHandler_Disconnect(t *testing.T) {
 	}
 }
 
-func TestCreateCodespaceHandler_PersistsWorkspaceManifestAndAllowlist(t *testing.T) {
-	ws := newTestWorkspace(t, "create-manifest")
+func TestCreateCodespaceHandler_AddsCreatedCodespaceToSelectedOnlyAllowlist(t *testing.T) {
 	installFakeCodespaceCLI(t, `[{"name":"cs-created","repository":"owner/repo"}]`, "/workspaces/repo/")
 
 	reg := registry.New()
@@ -226,17 +211,14 @@ func TestCreateCodespaceHandler_PersistsWorkspaceManifestAndAllowlist(t *testing
 			"codespace ssh":    {output: "ready"},
 		},
 	}
-	handler := createCodespaceHandler(reg, LifecycleConfig{
+	state := newLifecycleState(LifecycleConfig{
 		GHRunner: gh,
 		AccessPolicy: CodespaceAccessPolicy{
 			SelectedOnly:          true,
 			AllowedCodespaceNames: []string{"cs-selected"},
 		},
-		Workspace: WorkspaceSessionContext{
-			Name: ws.Name,
-			Dir:  ws.Dir,
-		},
 	})
+	handler := createCodespaceHandlerWithState(reg, state)
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{
 		"repository": "owner/repo",
@@ -245,26 +227,9 @@ func TestCreateCodespaceHandler_PersistsWorkspaceManifestAndAllowlist(t *testing
 		t.Fatalf("unexpected error: %s", resultText(res))
 	}
 
-	loaded, err := workspace.Load(ws.Name)
-	if err != nil {
-		t.Fatalf("workspace.Load: %v", err)
-	}
-
-	entry, ok := loaded.Manifest.Codespaces["repo"]
-	if !ok {
-		t.Fatalf("expected persisted alias %q, got %v", "repo", loaded.Manifest.Codespaces)
-	}
-	if entry.Name != "cs-created" {
-		t.Fatalf("entry.Name = %q, want %q", entry.Name, "cs-created")
-	}
-	if entry.Repository != "owner/repo" {
-		t.Fatalf("entry.Repository = %q, want %q", entry.Repository, "owner/repo")
-	}
-	if entry.Workdir != "/workspaces/repo" {
-		t.Fatalf("entry.Workdir = %q, want %q", entry.Workdir, "/workspaces/repo")
-	}
-	if !reflect.DeepEqual(loaded.Manifest.AllowedCodespaceNames, []string{"cs-selected", "cs-created"}) {
-		t.Fatalf("allowed codespace names = %v, want [cs-selected cs-created]", loaded.Manifest.AllowedCodespaceNames)
+	policy := state.accessPolicy()
+	if !slices.Equal(policy.AllowedCodespaceNames, []string{"cs-selected", "cs-created"}) {
+		t.Fatalf("allowed codespace names = %v, want [cs-selected cs-created]", policy.AllowedCodespaceNames)
 	}
 }
 
@@ -291,34 +256,20 @@ func TestDeleteCodespaceHandler_DeleteFromGitHub(t *testing.T) {
 	}
 }
 
-func TestDeleteCodespaceHandler_DisconnectKeepsAllowlistInWorkspaceManifest(t *testing.T) {
-	ws := newTestWorkspace(t, "disconnect-manifest")
-	ws.AddCodespace("repo", workspace.CodespaceEntry{
-		Name:       "cs-created",
-		Repository: "owner/repo",
-		Workdir:    "/workspaces/repo",
-	})
-	ws.Manifest.SetAccessPolicy(true, []string{"cs-created"})
-	if err := ws.Save(); err != nil {
-		t.Fatalf("workspace.Save: %v", err)
-	}
-
+func TestDeleteCodespaceHandler_DisconnectKeepsInMemoryAllowlist(t *testing.T) {
 	reg := registry.New()
 	if err := reg.Register(&registry.ManagedCodespace{Alias: "repo", Name: "cs-created", Executor: &mockExecutor{}}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
-	handler := deleteCodespaceHandlerWithState(reg, newLifecycleState(LifecycleConfig{
+	state := newLifecycleState(LifecycleConfig{
 		GHRunner: &mockGHRunner{},
 		AccessPolicy: CodespaceAccessPolicy{
 			SelectedOnly:          true,
 			AllowedCodespaceNames: []string{"cs-created"},
 		},
-		Workspace: WorkspaceSessionContext{
-			Name: ws.Name,
-			Dir:  ws.Dir,
-		},
-	}))
+	})
+	handler := deleteCodespaceHandlerWithState(reg, state)
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{
 		"codespace": "repo",
@@ -327,30 +278,13 @@ func TestDeleteCodespaceHandler_DisconnectKeepsAllowlistInWorkspaceManifest(t *t
 		t.Fatalf("unexpected error: %s", resultText(res))
 	}
 
-	loaded, err := workspace.Load(ws.Name)
-	if err != nil {
-		t.Fatalf("workspace.Load: %v", err)
-	}
-	if len(loaded.Manifest.Codespaces) != 0 {
-		t.Fatalf("codespaces = %v, want empty", loaded.Manifest.Codespaces)
-	}
-	if !reflect.DeepEqual(loaded.Manifest.AllowedCodespaceNames, []string{"cs-created"}) {
-		t.Fatalf("allowed codespace names = %v, want [cs-created]", loaded.Manifest.AllowedCodespaceNames)
+	policy := state.accessPolicy()
+	if !slices.Equal(policy.AllowedCodespaceNames, []string{"cs-created"}) {
+		t.Fatalf("allowed codespace names = %v, want [cs-created]", policy.AllowedCodespaceNames)
 	}
 }
 
-func TestDeleteCodespaceHandler_DeleteRemovesAllowlistFromWorkspaceManifest(t *testing.T) {
-	ws := newTestWorkspace(t, "delete-manifest")
-	ws.AddCodespace("repo", workspace.CodespaceEntry{
-		Name:       "cs-created",
-		Repository: "owner/repo",
-		Workdir:    "/workspaces/repo",
-	})
-	ws.Manifest.SetAccessPolicy(true, []string{"cs-created"})
-	if err := ws.Save(); err != nil {
-		t.Fatalf("workspace.Save: %v", err)
-	}
-
+func TestDeleteCodespaceHandler_DeleteRemovesInMemoryAllowlistEntry(t *testing.T) {
 	reg := registry.New()
 	if err := reg.Register(&registry.ManagedCodespace{Alias: "repo", Name: "cs-created", Executor: &mockExecutor{}}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -361,17 +295,14 @@ func TestDeleteCodespaceHandler_DeleteRemovesAllowlistFromWorkspaceManifest(t *t
 			"codespace delete": {output: "deleted"},
 		},
 	}
-	handler := deleteCodespaceHandlerWithState(reg, newLifecycleState(LifecycleConfig{
+	state := newLifecycleState(LifecycleConfig{
 		GHRunner: gh,
 		AccessPolicy: CodespaceAccessPolicy{
 			SelectedOnly:          true,
 			AllowedCodespaceNames: []string{"cs-created"},
 		},
-		Workspace: WorkspaceSessionContext{
-			Name: ws.Name,
-			Dir:  ws.Dir,
-		},
-	}))
+	})
+	handler := deleteCodespaceHandlerWithState(reg, state)
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{
 		"codespace": "repo",
@@ -381,15 +312,40 @@ func TestDeleteCodespaceHandler_DeleteRemovesAllowlistFromWorkspaceManifest(t *t
 		t.Fatalf("unexpected error: %s", resultText(res))
 	}
 
-	loaded, err := workspace.Load(ws.Name)
-	if err != nil {
-		t.Fatalf("workspace.Load: %v", err)
+	if names := state.accessPolicy().AllowedCodespaceNames; len(names) != 0 {
+		t.Fatalf("allowed codespace names = %v, want empty", names)
 	}
-	if len(loaded.Manifest.Codespaces) != 0 {
-		t.Fatalf("codespaces = %v, want empty", loaded.Manifest.Codespaces)
+}
+
+func TestDeleteCodespaceHandler_FailedDeleteKeepsInMemoryAllowlistEntry(t *testing.T) {
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{Alias: "repo", Name: "cs-created", Executor: &mockExecutor{}}); err != nil {
+		t.Fatalf("register: %v", err)
 	}
-	if len(loaded.Manifest.AllowedCodespaceNames) != 0 {
-		t.Fatalf("allowed codespace names = %v, want empty", loaded.Manifest.AllowedCodespaceNames)
+
+	gh := &mockGHRunner{
+		results: map[string]mockGHResult{
+			"codespace delete": {err: fmt.Errorf("GitHub unavailable")},
+		},
+	}
+	state := newLifecycleState(LifecycleConfig{
+		GHRunner: gh,
+		AccessPolicy: CodespaceAccessPolicy{
+			SelectedOnly:          true,
+			AllowedCodespaceNames: []string{"cs-created"},
+		},
+	})
+	handler := deleteCodespaceHandlerWithState(reg, state)
+
+	res, _ := handler(context.Background(), makeReq(map[string]any{
+		"codespace": "repo",
+		"delete":    true,
+	}))
+	if !res.IsError {
+		t.Fatal("expected delete failure")
+	}
+	if !slices.Equal(state.accessPolicy().AllowedCodespaceNames, []string{"cs-created"}) {
+		t.Fatalf("allowed codespace names = %v, want [cs-created]", state.accessPolicy().AllowedCodespaceNames)
 	}
 }
 
@@ -440,25 +396,17 @@ func TestConnectCodespaceHandler_DuplicateCodespaceName(t *testing.T) {
 	}
 }
 
-func TestConnectCodespaceHandler_PersistsWorkspaceManifestWithoutExpandingAllowlist(t *testing.T) {
-	ws := newTestWorkspace(t, "connect-manifest")
-	ws.Manifest.SetAccessPolicy(true, []string{"cs-selected"})
-	if err := ws.Save(); err != nil {
-		t.Fatalf("workspace.Save: %v", err)
-	}
+func TestConnectCodespaceHandler_PreservesInMemoryAllowlist(t *testing.T) {
 	installFakeCodespaceCLI(t, `[{"name":"cs-selected","repository":"owner/repo"}]`, "/workspaces/repo/")
 
 	reg := registry.New()
-	handler := connectCodespaceHandler(reg, LifecycleConfig{
+	state := newLifecycleState(LifecycleConfig{
 		AccessPolicy: CodespaceAccessPolicy{
 			SelectedOnly:          true,
 			AllowedCodespaceNames: []string{"cs-selected"},
 		},
-		Workspace: WorkspaceSessionContext{
-			Name: ws.Name,
-			Dir:  ws.Dir,
-		},
 	})
+	handler := connectCodespaceHandlerWithState(reg, state)
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{
 		"name": "cs-selected",
@@ -467,25 +415,9 @@ func TestConnectCodespaceHandler_PersistsWorkspaceManifestWithoutExpandingAllowl
 		t.Fatalf("unexpected error: %s", resultText(res))
 	}
 
-	loaded, err := workspace.Load(ws.Name)
-	if err != nil {
-		t.Fatalf("workspace.Load: %v", err)
-	}
-	entry, ok := loaded.Manifest.Codespaces["cs-selected"]
-	if !ok {
-		t.Fatalf("expected persisted alias %q, got %v", "cs-selected", loaded.Manifest.Codespaces)
-	}
-	if entry.Name != "cs-selected" {
-		t.Fatalf("entry.Name = %q, want %q", entry.Name, "cs-selected")
-	}
-	if entry.Repository != "owner/repo" {
-		t.Fatalf("entry.Repository = %q, want %q", entry.Repository, "owner/repo")
-	}
-	if entry.Workdir != "/workspaces/repo" {
-		t.Fatalf("entry.Workdir = %q, want %q", entry.Workdir, "/workspaces/repo")
-	}
-	if !reflect.DeepEqual(loaded.Manifest.AllowedCodespaceNames, []string{"cs-selected"}) {
-		t.Fatalf("allowed codespace names = %v, want [cs-selected]", loaded.Manifest.AllowedCodespaceNames)
+	policy := state.accessPolicy()
+	if !slices.Equal(policy.AllowedCodespaceNames, []string{"cs-selected"}) {
+		t.Fatalf("allowed codespace names = %v, want [cs-selected]", policy.AllowedCodespaceNames)
 	}
 }
 
@@ -528,6 +460,50 @@ func TestCodespaceAccessPolicy_AllowsExistingCodespace(t *testing.T) {
 				t.Fatalf("allowsExistingCodespace(%q) = %v, want %v", tt.codespace, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLifecycleConfigDataRoundTrip(t *testing.T) {
+	data, err := MarshalLifecycleConfigData(LifecycleConfig{
+		AccessPolicy: CodespaceAccessPolicy{
+			SelectedOnly:          true,
+			AllowedCodespaceNames: []string{"cs-2", "cs-1", "cs-2", ""},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MarshalLifecycleConfigData: %v", err)
+	}
+	if data != `{"accessPolicy":{"selectedOnly":true,"allowedCodespaceNames":["cs-2","cs-1"]}}` {
+		t.Fatalf("serialized lifecycle config = %s", data)
+	}
+
+	cfg, err := ParseLifecycleConfigData(data)
+	if err != nil {
+		t.Fatalf("ParseLifecycleConfigData: %v", err)
+	}
+	if !cfg.AccessPolicy.SelectedOnly {
+		t.Fatal("expected selected-only policy")
+	}
+	if !slices.Equal(cfg.AccessPolicy.AllowedCodespaceNames, []string{"cs-2", "cs-1"}) {
+		t.Fatalf("allowed codespace names = %v", cfg.AccessPolicy.AllowedCodespaceNames)
+	}
+}
+
+func TestLifecycleConfigDataEmptyAndLegacyWorkspace(t *testing.T) {
+	data, err := MarshalLifecycleConfigData(LifecycleConfig{})
+	if err != nil {
+		t.Fatalf("MarshalLifecycleConfigData: %v", err)
+	}
+	if data != "" {
+		t.Fatalf("empty config serialized as %q", data)
+	}
+
+	cfg, err := ParseLifecycleConfigData(`{"workspace":{"name":"removed","dir":"/removed"}}`)
+	if err != nil {
+		t.Fatalf("ParseLifecycleConfigData legacy workspace: %v", err)
+	}
+	if cfg.AccessPolicy.SelectedOnly || len(cfg.AccessPolicy.AllowedCodespaceNames) != 0 {
+		t.Fatalf("legacy workspace changed config: %+v", cfg)
 	}
 }
 
@@ -750,8 +726,7 @@ func TestCreateCodespaceHandler_DefaultPermissions(t *testing.T) {
 	}
 }
 
-func TestCreateCodespaceHandler_WorkspacePersistenceFailureRollsBackRegistry(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+func TestCreateCodespaceHandler_RegistersWithoutWorkspacePersistence(t *testing.T) {
 	installFakeCodespaceCLI(t, `[{"name":"cs-created","repository":"owner/repo"}]`, "/workspaces/repo/")
 
 	reg := registry.New()
@@ -763,23 +738,16 @@ func TestCreateCodespaceHandler_WorkspacePersistenceFailureRollsBackRegistry(t *
 	}
 	handler := createCodespaceHandler(reg, LifecycleConfig{
 		GHRunner: gh,
-		Workspace: WorkspaceSessionContext{
-			Name: "missing-workspace",
-		},
 	})
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{
 		"repository": "owner/repo",
 	}))
-	if !res.IsError {
-		t.Fatal("expected workspace persistence failure")
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
 	}
-	text := resultText(res)
-	if !strings.Contains(text, "failed to persist workspace state") {
-		t.Fatalf("expected persistence failure message, got %q", text)
-	}
-	if reg.Len() != 0 {
-		t.Fatalf("expected registry rollback, got %d entries", reg.Len())
+	if reg.Len() != 1 {
+		t.Fatalf("expected registered codespace, got %d entries", reg.Len())
 	}
 }
 

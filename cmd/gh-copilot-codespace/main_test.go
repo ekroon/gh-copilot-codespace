@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,401 +11,11 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
-	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
-	"github.com/ekroon/gh-copilot-codespace/internal/workspace"
 )
 
 func setBoolFlag(value bool) optionalBool {
 	return optionalBool{set: true, value: value}
-}
-
-func TestBuildMCPConfig(t *testing.T) {
-	result := buildMCPConfig("/usr/local/bin/self", "my-codespace", "/workspaces/repo", nil, "")
-
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		t.Fatalf("buildMCPConfig returned invalid JSON: %v", err)
-	}
-
-	servers, ok := parsed["mcpServers"].(map[string]any)
-	if !ok {
-		t.Fatal("missing mcpServers key")
-	}
-	cs, ok := servers["codespace"].(map[string]any)
-	if !ok {
-		t.Fatal("missing mcpServers.codespace key")
-	}
-
-	if got := cs["command"]; got != "/usr/local/bin/self" {
-		t.Errorf("command = %v, want /usr/local/bin/self", got)
-	}
-
-	args, ok := cs["args"].([]any)
-	if !ok || len(args) != 1 || args[0] != "mcp" {
-		t.Errorf("args = %v, want [mcp]", cs["args"])
-	}
-
-	env, ok := cs["env"].(map[string]any)
-	if !ok {
-		t.Fatal("missing env key")
-	}
-	if got := env["CODESPACE_NAME"]; got != "my-codespace" {
-		t.Errorf("CODESPACE_NAME = %v, want my-codespace", got)
-	}
-	if got := env["CODESPACE_WORKDIR"]; got != "/workspaces/repo" {
-		t.Errorf("CODESPACE_WORKDIR = %v, want /workspaces/repo", got)
-	}
-}
-
-func TestBuildMCPConfigWithRemoteServers(t *testing.T) {
-	remoteMCP := map[string]any{
-		"my-tool": map[string]any{
-			"type":    "local",
-			"command": "gh",
-			"args":    []string{"codespace", "ssh", "-c", "cs", "--", "my-tool"},
-		},
-	}
-
-	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "")
-
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	servers := parsed["mcpServers"].(map[string]any)
-
-	// Our server should still be present
-	if _, ok := servers["codespace"]; !ok {
-		t.Error("missing codespace server")
-	}
-	// Remote server should be merged
-	if _, ok := servers["my-tool"]; !ok {
-		t.Error("missing remote my-tool server")
-	}
-}
-
-func TestBuildMCPConfigRemoteCannotOverrideCodespace(t *testing.T) {
-	remoteMCP := map[string]any{
-		"codespace": map[string]any{
-			"type":    "local",
-			"command": "evil",
-		},
-	}
-
-	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "")
-
-	var parsed map[string]any
-	json.Unmarshal([]byte(result), &parsed)
-
-	servers := parsed["mcpServers"].(map[string]any)
-	cs := servers["codespace"].(map[string]any)
-
-	// Should still be our binary, not the overridden one
-	if got := cs["command"]; got != "/usr/local/bin/self" {
-		t.Errorf("codespace command = %v, should not be overridden", got)
-	}
-}
-
-func TestRewriteMCPServerForSSH(t *testing.T) {
-	server := map[string]any{
-		"type":    "stdio",
-		"command": "/usr/local/bin/test-mcp",
-		"args":    []any{"--mode", "dev"},
-		"env": map[string]any{
-			"API_KEY": "secret",
-		},
-	}
-
-	result := rewriteMCPServerForSSH(server, "my-cs", "/workspaces/repo", "")
-
-	if result == nil {
-		t.Fatal("rewriteMCPServerForSSH returned nil")
-	}
-
-	if got := result["command"]; got != "gh" {
-		t.Errorf("command = %v, want gh", got)
-	}
-
-	args, ok := result["args"].([]string)
-	if !ok {
-		t.Fatal("args not []string")
-	}
-
-	// Should contain: codespace ssh -c my-cs -- bash -c <remote-cmd>
-	if len(args) < 6 {
-		t.Fatalf("args too short: %v", args)
-	}
-	if args[0] != "codespace" || args[1] != "ssh" {
-		t.Errorf("args should start with [codespace ssh], got %v", args[:2])
-	}
-
-	// The remote command should contain the original command
-	remoteCmd := args[len(args)-1]
-	if !contains(remoteCmd, "/usr/local/bin/test-mcp") {
-		t.Errorf("remote command should contain original command, got %q", remoteCmd)
-	}
-	if !contains(remoteCmd, "--mode") {
-		t.Errorf("remote command should contain args, got %q", remoteCmd)
-	}
-	if !contains(remoteCmd, ".env-secrets") {
-		t.Errorf("remote command should bootstrap codespace auth env, got %q", remoteCmd)
-	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-func TestCleanMirrorDir(t *testing.T) {
-	dir := t.TempDir()
-
-	// Create some files and directories including .git, files/, workspace.json
-	os.MkdirAll(filepath.Join(dir, ".git", "objects"), 0o755)
-	os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref"), 0o644)
-	os.MkdirAll(filepath.Join(dir, ".github"), 0o755)
-	os.WriteFile(filepath.Join(dir, ".github", "copilot-instructions.md"), []byte("hi"), 0o644)
-	os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("agents"), 0o644)
-	os.MkdirAll(filepath.Join(dir, "docs"), 0o755)
-	os.WriteFile(filepath.Join(dir, "docs", "AGENTS.md"), []byte("docs agents"), 0o644)
-	os.MkdirAll(filepath.Join(dir, "files"), 0o755)
-	os.WriteFile(filepath.Join(dir, "files", "plan.md"), []byte("my plan"), 0o644)
-	os.WriteFile(filepath.Join(dir, "workspace.json"), []byte("{}"), 0o644)
-
-	cleanMirrorDir(dir)
-
-	// .git, files/, workspace.json should survive
-	for _, name := range []string{".git/HEAD", "files/plan.md", "workspace.json"} {
-		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
-			t.Errorf("%s should survive cleanup", name)
-		}
-	}
-
-	// Everything else should be gone
-	for _, name := range []string{".github", "AGENTS.md", "docs"} {
-		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
-			t.Errorf("%s should have been removed", name)
-		}
-	}
-}
-
-func TestGenerateBranchSyncHookTracksSessionTools(t *testing.T) {
-	dir := t.TempDir()
-	client := ssh.NewClient("demo")
-
-	generateBranchSyncHook(dir, "demo", "/workspaces/repo", client)
-
-	path := filepath.Join(dir, ".github", "hooks", "branch-sync.json")
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read hook file: %v", err)
-	}
-
-	if !strings.Contains(string(content), "remote_(bash|write_bash|read_bash|stop_bash)") {
-		t.Fatalf("hook file does not watch session tools: %s", content)
-	}
-}
-
-func TestEnsureTrustedFolder(t *testing.T) {
-	// Point HOME to a temp dir so ensureTrustedFolder writes there
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
-
-	configDir := filepath.Join(tmpHome, ".copilot")
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	configPath := filepath.Join(configDir, "config.json")
-	if err := os.WriteFile(configPath, []byte(`{"trusted_folders":[]}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	dir := "/some/trusted/dir"
-
-	// First call: should add the folder
-	if err := ensureTrustedFolder(dir); err != nil {
-		t.Fatalf("first call: %v", err)
-	}
-	assertTrustedFolders(t, configPath, []string{dir})
-
-	// Second call: should not duplicate
-	if err := ensureTrustedFolder(dir); err != nil {
-		t.Fatalf("second call: %v", err)
-	}
-	assertTrustedFolders(t, configPath, []string{dir})
-}
-
-func assertTrustedFolders(t *testing.T, configPath string, want []string) {
-	t.Helper()
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var config map[string]any
-	if err := json.Unmarshal(data, &config); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := config["trusted_folders"].([]any)
-	var got []string
-	for _, v := range raw {
-		if s, ok := v.(string); ok {
-			got = append(got, s)
-		}
-	}
-	if len(got) != len(want) {
-		t.Fatalf("trusted_folders = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("trusted_folders[%d] = %q, want %q", i, got[i], want[i])
-		}
-	}
-}
-
-func TestParseMCPConfigJSON_MultipleLocations(t *testing.T) {
-	// Verify that parseMCPConfigJSON works for configs from all supported locations
-	tests := []struct {
-		name    string
-		content string
-		want    []string // expected server names
-	}{
-		{
-			name:    "copilot-mcp-config",
-			content: `{"mcpServers":{"db-tool":{"command":"db-mcp"}}}`,
-			want:    []string{"db-tool"},
-		},
-		{
-			name:    "vscode-mcp",
-			content: `{"mcpServers":{"vscode-server":{"command":"vscode-mcp"}}}`,
-			want:    []string{"vscode-server"},
-		},
-		{
-			name:    "root-mcp",
-			content: `{"mcpServers":{"root-server":{"command":"root-mcp"}}}`,
-			want:    []string{"root-server"},
-		},
-		{
-			name:    "empty-servers",
-			content: `{"mcpServers":{}}`,
-			want:    nil,
-		},
-		{
-			name:    "invalid-json",
-			content: `{invalid`,
-			want:    nil,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			result := parseMCPConfigJSON([]byte(tc.content))
-			if tc.want == nil {
-				if result != nil {
-					t.Errorf("expected nil, got %v", result)
-				}
-				return
-			}
-			if result == nil {
-				t.Fatal("expected non-nil result")
-			}
-			for _, name := range tc.want {
-				if _, ok := result[name]; !ok {
-					t.Errorf("missing server %q", name)
-				}
-			}
-		})
-	}
-}
-
-func TestRewriteHooksForSSH(t *testing.T) {
-	hooksJSON := `{
-		"version": 1,
-		"hooks": {
-			"sessionStart": [
-				{
-					"type": "command",
-					"bash": "echo 'started'",
-					"cwd": ".",
-					"timeoutSec": 10
-				}
-			],
-			"preToolUse": [
-				{
-					"type": "command",
-					"bash": "./scripts/policy-check.sh",
-					"cwd": "scripts",
-					"env": {"LOG_LEVEL": "INFO"}
-				}
-			]
-		}
-	}`
-
-	result := rewriteHooksForSSH([]byte(hooksJSON), "my-cs", "/workspaces/repo", "")
-	if result == nil {
-		t.Fatal("rewriteHooksForSSH returned nil")
-	}
-
-	var parsed map[string]any
-	if err := json.Unmarshal(result, &parsed); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	hooks := parsed["hooks"].(map[string]any)
-
-	// Check sessionStart hook was rewritten
-	sessionStart := hooks["sessionStart"].([]any)
-	if len(sessionStart) != 1 {
-		t.Fatalf("expected 1 sessionStart hook, got %d", len(sessionStart))
-	}
-	hook0 := sessionStart[0].(map[string]any)
-	bash0 := hook0["bash"].(string)
-	if !contains(bash0, "gh codespace ssh") {
-		t.Errorf("sessionStart bash should contain 'gh codespace ssh', got %q", bash0)
-	}
-	if !contains(bash0, "my-cs") {
-		t.Errorf("sessionStart bash should contain codespace name, got %q", bash0)
-	}
-	if !contains(bash0, "echo") {
-		t.Errorf("sessionStart bash should contain original command, got %q", bash0)
-	}
-	if !contains(bash0, ".env-secrets") {
-		t.Errorf("sessionStart bash should bootstrap codespace auth env, got %q", bash0)
-	}
-	// cwd should be removed (baked into SSH command)
-	if _, ok := hook0["cwd"]; ok {
-		t.Error("cwd should be removed from rewritten hook")
-	}
-
-	// Check preToolUse hook was rewritten
-	preToolUse := hooks["preToolUse"].([]any)
-	hook1 := preToolUse[0].(map[string]any)
-	bash1 := hook1["bash"].(string)
-	if !contains(bash1, "./scripts/policy-check.sh") {
-		t.Errorf("preToolUse bash should contain original command, got %q", bash1)
-	}
-	if !contains(bash1, ".env-secrets") {
-		t.Errorf("preToolUse bash should bootstrap codespace auth env, got %q", bash1)
-	}
-	// Env should be removed (baked into SSH command)
-	if _, ok := hook1["env"]; ok {
-		t.Error("env should be removed from rewritten hook")
-	}
-	// Verify env was baked into the command
-	if !contains(bash1, "LOG_LEVEL") {
-		t.Errorf("env vars should be baked into SSH command, got %q", bash1)
-	}
 }
 
 func TestRepoBaseName(t *testing.T) {
@@ -475,20 +84,6 @@ func TestChooseWorkdir(t *testing.T) {
 	}
 }
 
-func TestRewriteHooksForSSH_NoHooks(t *testing.T) {
-	result := rewriteHooksForSSH([]byte(`{"version": 1}`), "cs", "/workspaces/repo", "")
-	if result != nil {
-		t.Error("expected nil for config with no hooks")
-	}
-}
-
-func TestRewriteHooksForSSH_InvalidJSON(t *testing.T) {
-	result := rewriteHooksForSSH([]byte(`{invalid`), "cs", "/workspaces/repo", "")
-	if result != nil {
-		t.Error("expected nil for invalid JSON")
-	}
-}
-
 func TestParseSelectionIndices(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -532,23 +127,12 @@ func TestParseLauncherArgs(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "no codespace mode skips picker",
-			args: []string{"--no-codespace", "--name", "bootstrap", "--model", "claude-sonnet-4.5"},
+			name: "preserves launcher and copilot arguments",
+			args: []string{"--no-codespace", "--selected-only=false", "--model", "claude-sonnet-4.5"},
 			want: launcherOptions{
-				noCodespace: true,
-				sessionName: "bootstrap",
-				copilotArgs: []string{"--model", "claude-sonnet-4.5"},
-			},
-		},
-		{
-			name: "parses existing launcher flags",
-			args: []string{"--selected-only", "--local-tools", "-w", "/workspaces/repo", "-c", "cs-1,cs-2", "--theme", "dark"},
-			want: launcherOptions{
-				codespaceNames:  []string{"cs-1", "cs-2"},
-				selectedOnly:    setBoolFlag(true),
-				workdirOverride: "/workspaces/repo",
-				localTools:      setBoolFlag(true),
-				copilotArgs:     []string{"--theme", "dark"},
+				noCodespace:  true,
+				selectedOnly: setBoolFlag(false),
+				copilotArgs:  []string{"--model", "claude-sonnet-4.5"},
 			},
 		},
 		{
@@ -559,87 +143,19 @@ func TestParseLauncherArgs(t *testing.T) {
 			},
 		},
 		{
-			name: "here mode with copilot args after separator",
-			args: []string{"--here", "-c", "cs-1", "--", "--resume", "copilot-session"},
+			name: "resume is forwarded with its value",
+			args: []string{"-c", "cs-1", "--resume", "copilot-session", "--model", "claude-sonnet-4.5"},
 			want: launcherOptions{
-				hereMode:       true,
 				codespaceNames: []string{"cs-1"},
-				copilotArgs:    []string{"--resume", "copilot-session"},
+				copilotArgs:    []string{"--resume", "copilot-session", "--model", "claude-sonnet-4.5"},
 			},
 		},
 		{
 			name: "bare separator is not forwarded",
-			args: []string{"--here", "--", "--model", "claude-sonnet-4.5"},
+			args: []string{"--no-codespace", "--", "--resume", "copilot-session"},
 			want: launcherOptions{
-				hereMode:    true,
-				copilotArgs: []string{"--model", "claude-sonnet-4.5"},
-			},
-		},
-		{
-			name: "here mode supports explicit false local tools override",
-			args: []string{"--here", "--local-tools=false"},
-			want: launcherOptions{
-				hereMode:   true,
-				localTools: setBoolFlag(false),
-			},
-		},
-		{
-			name: "explicit resume session consumes following value",
-			args: []string{"--resume", "saved-session", "--model", "claude-sonnet-4.5"},
-			want: launcherOptions{
-				resumeSession: "saved-session",
-				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
-			},
-		},
-		{
-			name: "resume keeps local tools and copilot args",
-			args: []string{"--resume", "saved-session", "--local-tools", "--extension-tools", "--model", "claude-sonnet-4.5"},
-			want: launcherOptions{
-				resumeSession:  "saved-session",
-				localTools:     setBoolFlag(true),
-				extensionTools: setBoolFlag(true),
-				copilotArgs:    []string{"--model", "claude-sonnet-4.5"},
-			},
-		},
-		{
-			name: "supports explicit false extension tools override",
-			args: []string{"--extension-tools=false", "--model", "claude-sonnet-4.5"},
-			want: launcherOptions{
-				extensionTools: setBoolFlag(false),
-				copilotArgs:    []string{"--model", "claude-sonnet-4.5"},
-			},
-		},
-		{
-			name: "resume supports explicit false local tools override",
-			args: []string{"--resume", "saved-session", "--local-tools=false", "--model", "claude-sonnet-4.5"},
-			want: launcherOptions{
-				resumeSession: "saved-session",
-				localTools:    setBoolFlag(false),
-				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
-			},
-		},
-		{
-			name: "resume supports selected-only override values",
-			args: []string{"--resume", "saved-session", "--selected-only=false", "--model", "claude-sonnet-4.5"},
-			want: launcherOptions{
-				resumeSession: "saved-session",
-				selectedOnly:  setBoolFlag(false),
-				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
-			},
-		},
-		{
-			name: "bare resume enables interactive picker mode",
-			args: []string{"--resume"},
-			want: launcherOptions{
-				resumeInteractive: true,
-			},
-		},
-		{
-			name: "bare resume before another flag keeps later args intact",
-			args: []string{"--resume", "--model", "claude-sonnet-4.5"},
-			want: launcherOptions{
-				resumeInteractive: true,
-				copilotArgs:       []string{"--model", "claude-sonnet-4.5"},
+				noCodespace: true,
+				copilotArgs: []string{"--resume", "copilot-session"},
 			},
 		},
 		{
@@ -648,34 +164,34 @@ func TestParseLauncherArgs(t *testing.T) {
 			wantErr: "--no-codespace and --codespace are mutually exclusive",
 		},
 		{
-			name:    "no-codespace conflicts with bare resume",
-			args:    []string{"--no-codespace", "--resume"},
-			wantErr: "--no-codespace and --resume are mutually exclusive",
+			name:    "rejects removed launcher flags",
+			args:    []string{"--here"},
+			wantErr: "--here is no longer supported",
 		},
 		{
-			name:    "no-codespace conflicts with resume",
-			args:    []string{"--no-codespace", "--resume", "saved-session"},
-			wantErr: "--no-codespace and --resume are mutually exclusive",
+			name:    "rejects workdir",
+			args:    []string{"--workdir", "/workspaces/repo"},
+			wantErr: "--workdir is no longer supported",
 		},
 		{
-			name:    "resume conflicts with explicit codespace",
-			args:    []string{"--resume", "saved-session", "--codespace", "cs-1"},
-			wantErr: "--codespace and --resume are mutually exclusive",
+			name:    "rejects short workdir",
+			args:    []string{"-w", "/workspaces/repo"},
+			wantErr: "-w is no longer supported",
 		},
 		{
-			name:    "resume conflicts with workdir",
-			args:    []string{"--resume", "saved-session", "--workdir", "/workspaces/repo"},
-			wantErr: "--workdir and --resume are mutually exclusive",
+			name:    "rejects local tools boolean form",
+			args:    []string{"--local-tools=false"},
+			wantErr: "--local-tools is no longer supported",
 		},
 		{
-			name:    "resume conflicts with name",
-			args:    []string{"--resume", "saved-session", "--name", "other-session"},
-			wantErr: "--name and --resume are mutually exclusive",
+			name:    "rejects extension tools",
+			args:    []string{"--extension-tools"},
+			wantErr: "--extension-tools is no longer supported",
 		},
 		{
-			name:    "here conflicts with wrapper resume",
-			args:    []string{"--here", "--resume", "saved-session"},
-			wantErr: "--here and --resume are mutually exclusive; use -- --resume to pass Copilot resume arguments",
+			name:    "rejects name",
+			args:    []string{"--name", "saved-session"},
+			wantErr: "--name is no longer supported",
 		},
 	}
 
@@ -702,475 +218,63 @@ func TestParseLauncherArgs(t *testing.T) {
 }
 
 func TestResolveLaunchContext(t *testing.T) {
-	t.Run("default uses instruction dir as copilot cwd", func(t *testing.T) {
-		got := resolveLaunchContext(false, "/local/repo", "/mirror")
-		if got.copilotCWD != "/mirror" {
-			t.Fatalf("copilotCWD = %q, want /mirror", got.copilotCWD)
-		}
-		if !got.fetchRemoteFiles {
-			t.Fatal("expected default mode to fetch remote files")
-		}
-	})
-
-	t.Run("here uses original cwd", func(t *testing.T) {
-		got := resolveLaunchContext(true, "/local/repo", "/mirror")
-		if got.copilotCWD != "/local/repo" {
-			t.Fatalf("copilotCWD = %q, want /local/repo", got.copilotCWD)
-		}
-		if got.fetchRemoteFiles {
-			t.Fatal("did not expect here mode to fetch remote files")
-		}
-	})
-}
-
-func TestEffectiveLocalTools(t *testing.T) {
-	tests := []struct {
-		name string
-		opts launcherOptions
-		want bool
-	}{
-		{name: "default mode disables local tools", opts: launcherOptions{}, want: false},
-		{name: "default mode explicit true", opts: launcherOptions{localTools: setBoolFlag(true)}, want: true},
-		{name: "here mode enables local tools", opts: launcherOptions{hereMode: true}, want: true},
-		{name: "here mode explicit false", opts: launcherOptions{hereMode: true, localTools: setBoolFlag(false)}, want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := effectiveLocalTools(tt.opts); got != tt.want {
-				t.Fatalf("effectiveLocalTools() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestNewResumeConfig(t *testing.T) {
-	cfg, err := newResumeConfig(launcherOptions{
-		resumeSession:  "saved-session",
-		localTools:     setBoolFlag(true),
-		extensionTools: setBoolFlag(true),
-		selectedOnly:   setBoolFlag(false),
-		copilotArgs:    []string{"--model", "claude-sonnet-4.5"},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if cfg.sessionName != "saved-session" {
-		t.Fatalf("sessionName = %q, want saved-session", cfg.sessionName)
-	}
-	if !reflect.DeepEqual(cfg.localTools, setBoolFlag(true)) {
-		t.Fatalf("localTools = %+v, want true override", cfg.localTools)
-	}
-	if !reflect.DeepEqual(cfg.extensionTools, setBoolFlag(true)) {
-		t.Fatalf("extensionTools = %+v, want true override", cfg.extensionTools)
-	}
-	if !reflect.DeepEqual(cfg.selectedOnly, setBoolFlag(false)) {
-		t.Fatalf("selectedOnly = %+v, want false override", cfg.selectedOnly)
-	}
-	if !reflect.DeepEqual(cfg.copilotArgs, []string{"--model", "claude-sonnet-4.5"}) {
-		t.Fatalf("copilotArgs = %v, want [--model claude-sonnet-4.5]", cfg.copilotArgs)
-	}
-}
-
-func TestResolveResumeConfig(t *testing.T) {
-	tests := []struct {
-		name string
-		cfg  resumeConfig
-		ws   *workspace.Manifest
-		want resolvedResumeConfig
-	}{
-		{
-			name: "uses persisted defaults",
-			cfg:  resumeConfig{sessionName: "saved-session"},
-			ws: &workspace.Manifest{
-				SelectedOnly:          true,
-				AllowedCodespaceNames: []string{"cs-1"},
-				Settings: workspace.SessionSettings{
-					LocalTools:     true,
-					ExtensionTools: true,
-				},
-			},
-			want: resolvedResumeConfig{
-				localTools:     true,
-				extensionTools: true,
-				accessPolicy: mcp.CodespaceAccessPolicy{
-					SelectedOnly:          true,
-					AllowedCodespaceNames: []string{"cs-1"},
-				},
-			},
-		},
-		{
-			name: "explicit false overrides persisted true",
-			cfg: resumeConfig{
-				sessionName:    "saved-session",
-				localTools:     setBoolFlag(false),
-				extensionTools: setBoolFlag(false),
-				selectedOnly:   setBoolFlag(false),
-			},
-			ws: &workspace.Manifest{
-				SelectedOnly:          true,
-				AllowedCodespaceNames: []string{"cs-1"},
-				Settings: workspace.SessionSettings{
-					LocalTools: true,
-				},
-			},
-			want: resolvedResumeConfig{
-				localTools:     false,
-				extensionTools: false,
-				accessPolicy: mcp.CodespaceAccessPolicy{
-					SelectedOnly:          false,
-					AllowedCodespaceNames: []string{"cs-1"},
-				},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := resolveResumeConfig(tt.ws, tt.cfg)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("resolveResumeConfig() = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestLauncherExcludedTools(t *testing.T) {
-	tests := []struct {
-		name       string
-		localTools bool
-		want       []string
-	}{
-		{
-			name:       "default excludes local shell tools",
-			localTools: false,
-			want: []string{
-				"bash", "write_bash", "read_bash",
-				"stop_bash", "list_bash", "grep", "glob",
-			},
-		},
-		{
-			name:       "local tools enabled excludes nothing",
-			localTools: true,
-			want:       nil,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := launcherExcludedTools(tt.localTools); !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("launcherExcludedTools(%v) = %v, want %v", tt.localTools, got, tt.want)
-			}
-		})
+	got := resolveLaunchContext("/local/repo")
+	if got.copilotCWD != "/local/repo" {
+		t.Fatalf("copilotCWD = %q, want /local/repo", got.copilotCWD)
 	}
 }
 
 func TestBuildCopilotArgs(t *testing.T) {
-	tests := []struct {
-		name          string
-		excludedTools []string
-		mcpConfig     string
-		extraArgs     []string
-		want          []string
-	}{
-		{
-			name:          "includes excluded tools when present",
-			excludedTools: []string{"bash", "grep"},
-			mcpConfig:     `{"mcpServers":{}}`,
-			extraArgs:     []string{"--model", "claude-sonnet-4.5"},
-			want: []string{
-				"--excluded-tools", "bash", "grep",
-				"--additional-mcp-config", `{"mcpServers":{}}`,
-				"--model", "claude-sonnet-4.5",
-			},
-		},
-		{
-			name:          "omits excluded tools flag when none are excluded",
-			excludedTools: nil,
-			mcpConfig:     `{"mcpServers":{}}`,
-			extraArgs:     []string{"--model", "claude-sonnet-4.5"},
-			want: []string{
-				"--additional-mcp-config", `{"mcpServers":{}}`,
-				"--model", "claude-sonnet-4.5",
-			},
-		},
-		{
-			name:          "omits empty mcp config",
-			excludedTools: []string{"bash"},
-			extraArgs:     []string{"--model", "claude-sonnet-4.5"},
-			want: []string{
-				"--excluded-tools", "bash",
-				"--model", "claude-sonnet-4.5",
-			},
-		},
+	extraArgs := []string{"--model", "claude-sonnet-4.5"}
+	got := buildCopilotArgs(extraArgs)
+	if !reflect.DeepEqual(got, extraArgs) {
+		t.Fatalf("buildCopilotArgs() = %v, want passthrough %v", got, extraArgs)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := buildCopilotArgs(tt.excludedTools, tt.mcpConfig, tt.extraArgs)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("buildCopilotArgs() = %v, want %v", got, tt.want)
-			}
-		})
+	for _, obsolete := range []string{"--excluded-tools", "--additional-mcp-config"} {
+		if slicesContain(got, obsolete) {
+			t.Fatalf("buildCopilotArgs() unexpectedly contains %q: %v", obsolete, got)
+		}
 	}
 }
 
-func TestSelectWorkspaceSession(t *testing.T) {
-	t.Run("no saved sessions returns error", func(t *testing.T) {
-		_, err := selectWorkspaceSession(nil)
-		if err == nil || err.Error() != "no workspace sessions found" {
-			t.Fatalf("got err %v, want no workspace sessions found", err)
-		}
-	})
-
-	t.Run("single saved session returns immediately", func(t *testing.T) {
-		got, err := selectWorkspaceSession([]workspace.WorkspaceSummary{
-			{Name: "only-session"},
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != "only-session" {
-			t.Fatalf("got %q, want %q", got, "only-session")
-		}
-	})
-
-	t.Run("numbered fallback selects requested session", func(t *testing.T) {
-		t.Setenv("PATH", t.TempDir())
-
-		stdinFile := writeTempInputFile(t, "2\n")
-		originalStdin := os.Stdin
-		os.Stdin = stdinFile
-		defer func() { os.Stdin = originalStdin }()
-
-		got, err := selectWorkspaceSession([]workspace.WorkspaceSummary{
-			{Name: "first", Created: mustParseTime(t, "2026-03-17 09:00"), CodespaceCount: 1},
-			{Name: "second", Created: mustParseTime(t, "2026-03-18 10:30"), CodespaceCount: 2},
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != "second" {
-			t.Fatalf("got %q, want %q", got, "second")
-		}
-	})
-}
-
-func TestSelectWorkspaceSessionFallbackSupportsSearch(t *testing.T) {
-	input := strings.NewReader("github/docs\n1\n")
-	var output bytes.Buffer
-
-	got, err := selectWorkspaceSessionFallback([]workspace.WorkspaceSummary{
-		{
-			Name:           "first",
-			LastUsed:       mustParseTime(t, "2026-03-17 09:00"),
-			CodespaceCount: 1,
-			Repositories:   []string{"github/github"},
-			CodespaceNames: []string{"cs-abc"},
-			Branches:       []string{"main"},
-			Path:           "/tmp/workspaces/first",
-		},
-		{
-			Name:           "second",
-			LastUsed:       mustParseTime(t, "2026-03-18 10:30"),
-			CodespaceCount: 2,
-			Repositories:   []string{"github/docs"},
-			CodespaceNames: []string{"cs-docs", "cs-preview"},
-			Branches:       []string{"feature/planning"},
-			Path:           "/tmp/workspaces/second",
-		},
-	}, input, &output)
+func TestPrepareLaunchDirectoryLeavesCheckoutUntouched(t *testing.T) {
+	checkout := t.TempDir()
+	marker := filepath.Join(checkout, "tracked.txt")
+	if err := os.WriteFile(marker, []byte("unchanged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	originalCWD, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	if got != "second" {
-		t.Fatalf("got %q, want %q", got, "second")
+	t.Cleanup(func() { _ = os.Chdir(originalCWD) })
+
+	if err := prepareLaunchDirectory(checkout); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "Search") {
-		t.Fatalf("expected search prompt in output, got %q", output.String())
+	content, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "unchanged" {
+		t.Fatalf("checkout marker changed to %q", content)
+	}
+	entries, err := os.ReadDir(checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "tracked.txt" {
+		t.Fatalf("helper setup changed checkout contents: %v", entries)
 	}
 }
 
-func TestFormatWorkspaceSummaryIncludesMetadata(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-
-	got := formatWorkspaceSummary(workspace.WorkspaceSummary{
-		Name:           "2026-03-18_104209-8774e7",
-		LastUsed:       mustParseTime(t, "2026-03-19 11:22"),
-		CodespaceCount: 2,
-		Repositories:   []string{"github/graph-hopper"},
-		CodespaceNames: []string{"cs-router", "cs-gatekeeper"},
-		Branches:       []string{"feature/searchable-resume"},
-		Path:           filepath.Join(homeDir, ".copilot", "workspaces", "2026-03-18_104209-8774e7"),
-	})
-
-	for _, want := range []string{
-		"2026-03-18_104209-8774e7",
-		"github/graph-hopper",
-		"cs-router, cs-gatekeeper",
-		"feature/searchable-resume",
-		"2 codespaces",
-		"last used 2026-03-19 11:22",
-		"~/.copilot/workspaces/2026-03-18_104209-8774e7",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("expected %q in summary %q", want, got)
+func slicesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
 		}
 	}
-}
-
-func TestSelectWorkspaceSessionPickerCancelDoesNotFallback(t *testing.T) {
-	originalInteractive := interactiveTerminalFunc
-	originalPicker := workspacePickerFunc
-	interactiveTerminalFunc = func() bool { return true }
-	workspacePickerFunc = func([]workspace.WorkspaceSummary, *os.File, *os.File) (string, error) {
-		return "", errWorkspaceSelectionCancelled
-	}
-	t.Cleanup(func() {
-		interactiveTerminalFunc = originalInteractive
-		workspacePickerFunc = originalPicker
-	})
-
-	stdinFile := writeTempInputFile(t, "1\n")
-	originalStdin := os.Stdin
-	os.Stdin = stdinFile
-	defer func() { os.Stdin = originalStdin }()
-
-	_, err := selectWorkspaceSession([]workspace.WorkspaceSummary{
-		{Name: "first"},
-		{Name: "second"},
-	})
-	if !errors.Is(err, errWorkspaceSelectionCancelled) {
-		t.Fatalf("got err %v, want errWorkspaceSelectionCancelled", err)
-	}
-}
-
-func TestSelectWorkspaceSessionPickerErrorFallsBack(t *testing.T) {
-	originalInteractive := interactiveTerminalFunc
-	originalPicker := workspacePickerFunc
-	interactiveTerminalFunc = func() bool { return true }
-	workspacePickerFunc = func([]workspace.WorkspaceSummary, *os.File, *os.File) (string, error) {
-		return "", errors.New("picker failed")
-	}
-	t.Cleanup(func() {
-		interactiveTerminalFunc = originalInteractive
-		workspacePickerFunc = originalPicker
-	})
-
-	stdinFile := writeTempInputFile(t, "github/docs\n1\n")
-	originalStdin := os.Stdin
-	os.Stdin = stdinFile
-	defer func() { os.Stdin = originalStdin }()
-
-	originalStdout := os.Stdout
-	stdoutFile, err := os.CreateTemp(t.TempDir(), "stdout")
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
-	}
-	os.Stdout = stdoutFile
-	defer func() { os.Stdout = originalStdout }()
-
-	got, err := selectWorkspaceSession([]workspace.WorkspaceSummary{
-		{Name: "first", Repositories: []string{"github/github"}},
-		{Name: "second", Repositories: []string{"github/docs"}},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got != "second" {
-		t.Fatalf("got %q, want %q", got, "second")
-	}
-}
-
-func TestWorkspacePickerModelFiltersOnMetadata(t *testing.T) {
-	model := newWorkspacePickerModel([]workspace.WorkspaceSummary{
-		{
-			Name:           "first",
-			Repositories:   []string{"github/github"},
-			CodespaceNames: []string{"cs-app"},
-			Branches:       []string{"main"},
-			Path:           "/tmp/workspaces/first",
-		},
-		{
-			Name:           "second",
-			Repositories:   []string{"github/docs"},
-			CodespaceNames: []string{"cs-docs"},
-			Branches:       []string{"feature/search"},
-			Path:           "/tmp/workspaces/second",
-		},
-	})
-
-	model.setQuery("github/docs")
-
-	if len(model.filtered) != 1 {
-		t.Fatalf("filtered len = %d, want 1", len(model.filtered))
-	}
-	if model.filtered[0].Name != "second" {
-		t.Fatalf("got %q, want %q", model.filtered[0].Name, "second")
-	}
-}
-
-func TestWorkspacePickerModelFiltersOnLegacyCodespaceWorkdirPath(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-
-	model := newWorkspacePickerModel([]workspace.WorkspaceSummary{
-		{
-			Name:           "graph-hopper-session",
-			Repositories:   []string{"github/graph-hopper"},
-			CodespaceNames: []string{"graph-hopper-plan-4jxr59475hqrj5"},
-			Branches:       []string{"main"},
-			Path:           filepath.Join(homeDir, ".copilot", "workspaces", "graph-hopper-session"),
-		},
-	})
-
-	model.setQuery("~/.copilot/codespace-workdirs/graph-hopper-plan-4jxr59475hqrj5")
-
-	if len(model.filtered) != 1 {
-		t.Fatalf("filtered len = %d, want 1", len(model.filtered))
-	}
-	if model.filtered[0].Name != "graph-hopper-session" {
-		t.Fatalf("got %q, want %q", model.filtered[0].Name, "graph-hopper-session")
-	}
-}
-
-func TestWorkspacePickerModelCtrlCCancels(t *testing.T) {
-	model := newWorkspacePickerModel([]workspace.WorkspaceSummary{
-		{Name: "first"},
-	})
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
-	got := updated.(workspacePickerModel)
-
-	if !got.cancelled {
-		t.Fatal("expected picker model to be cancelled")
-	}
-}
-
-func writeTempInputFile(t *testing.T, input string) *os.File {
-	t.Helper()
-
-	path := filepath.Join(t.TempDir(), "stdin.txt")
-	if err := os.WriteFile(path, []byte(input), 0o644); err != nil {
-		t.Fatalf("write stdin file: %v", err)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatalf("open stdin file: %v", err)
-	}
-	t.Cleanup(func() { file.Close() })
-	return file
-}
-
-func mustParseTime(t *testing.T, value string) time.Time {
-	t.Helper()
-
-	parsed, err := time.Parse("2006-01-02 15:04", value)
-	if err != nil {
-		t.Fatalf("parse time %q: %v", value, err)
-	}
-	return parsed
+	return false
 }
 
 func TestResolveSelectedCodespaces(t *testing.T) {
@@ -1214,184 +318,6 @@ func TestSelectedCodespaceNames(t *testing.T) {
 
 	if got := selectedCodespaceNames(selected); !reflect.DeepEqual(got, []string{"cs-1", "cs-2"}) {
 		t.Fatalf("selectedCodespaceNames() = %v, want [cs-1 cs-2]", got)
-	}
-}
-
-func TestBuildMCPConfigWithRegistry(t *testing.T) {
-	reg := registry.New()
-	reg.Register(&registry.ManagedCodespace{
-		Alias:      "github",
-		Name:       "cs-abc",
-		Repository: "github/github",
-		Branch:     "main",
-		Workdir:    "/workspaces/github",
-	})
-
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{})
-
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	servers := parsed["mcpServers"].(map[string]any)
-	cs := servers["codespace"].(map[string]any)
-
-	if got := cs["command"]; got != "/usr/local/bin/self" {
-		t.Errorf("command = %v, want /usr/local/bin/self", got)
-	}
-
-	env, ok := cs["env"].(map[string]any)
-	if !ok {
-		t.Fatal("missing env key")
-	}
-
-	registryJSON, ok := env["CODESPACE_REGISTRY"].(string)
-	if !ok || registryJSON == "" {
-		t.Fatal("missing CODESPACE_REGISTRY env var")
-	}
-
-	var entries []registryEntry
-	if err := json.Unmarshal([]byte(registryJSON), &entries); err != nil {
-		t.Fatalf("invalid CODESPACE_REGISTRY JSON: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d entries, want 1", len(entries))
-	}
-	if entries[0].Alias != "github" {
-		t.Errorf("alias = %q, want %q", entries[0].Alias, "github")
-	}
-}
-
-func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
-	reg := registry.New()
-
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{})
-
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	servers := parsed["mcpServers"].(map[string]any)
-	cs := servers["codespace"].(map[string]any)
-	env := cs["env"].(map[string]any)
-
-	registryJSON, ok := env["CODESPACE_REGISTRY"].(string)
-	if !ok {
-		t.Fatal("missing CODESPACE_REGISTRY env var")
-	}
-
-	var entries []registryEntry
-	if err := json.Unmarshal([]byte(registryJSON), &entries); err != nil {
-		t.Fatalf("invalid CODESPACE_REGISTRY JSON: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("got %d entries, want 0", len(entries))
-	}
-	if _, ok := env[codespaceLifecycleConfigEnv]; ok {
-		t.Fatalf("did not expect %s for empty lifecycle config", codespaceLifecycleConfigEnv)
-	}
-}
-
-func TestBuildMCPConfigWithRegistryForTools_ExtensionModeOmitsFirstParty(t *testing.T) {
-	reg := registry.New()
-	if got := buildMCPConfigWithRegistryForTools("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{}, false); got != "" {
-		t.Fatalf("empty extension-tools MCP config = %q, want empty", got)
-	}
-
-	remoteMCP := map[string]any{
-		"remote-db": map[string]any{
-			"type":    "local",
-			"command": "db-mcp",
-		},
-	}
-	if err := reg.Register(&registry.ManagedCodespace{
-		Alias:     "github",
-		Name:      "cs-abc",
-		Workdir:   "/workspaces/github",
-		ExecAgent: "/tmp/agent",
-	}); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	result := buildMCPConfigWithRegistryForTools("/usr/local/bin/self", reg, remoteMCP, mcp.LifecycleConfig{}, false)
-
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	servers := parsed["mcpServers"].(map[string]any)
-	if _, ok := servers["codespace"]; ok {
-		t.Fatal("first-party codespace MCP server should be omitted")
-	}
-	if _, ok := servers["remote-db"]; !ok {
-		t.Fatal("forwarded remote MCP server should remain")
-	}
-}
-
-func TestBuildMCPConfigWithRegistry_LifecycleConfigEnv(t *testing.T) {
-	reg := registry.New()
-
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{
-		AccessPolicy: mcp.CodespaceAccessPolicy{
-			SelectedOnly:          true,
-			AllowedCodespaceNames: []string{"cs-1", "cs-1", "cs-2"},
-		},
-		Workspace: mcp.WorkspaceSessionContext{
-			Name: "bootstrap",
-			Dir:  "/tmp/bootstrap",
-		},
-	})
-
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	servers := parsed["mcpServers"].(map[string]any)
-	cs := servers["codespace"].(map[string]any)
-	env := cs["env"].(map[string]any)
-
-	lifecycleJSON, ok := env[codespaceLifecycleConfigEnv].(string)
-	if !ok || lifecycleJSON == "" {
-		t.Fatalf("missing %s env var", codespaceLifecycleConfigEnv)
-	}
-	if !strings.Contains(lifecycleJSON, `"selectedOnly":true`) {
-		t.Fatalf("expected lifecycle config to serialize selectedOnly, got %q", lifecycleJSON)
-	}
-
-	cfg, err := lifecycleConfigFromEnv(lifecycleJSON)
-	if err != nil {
-		t.Fatalf("parse lifecycle config env: %v", err)
-	}
-	if !cfg.AccessPolicy.SelectedOnly {
-		t.Fatal("expected selected-only policy to be enabled")
-	}
-	if !reflect.DeepEqual(cfg.AccessPolicy.AllowedCodespaceNames, []string{"cs-1", "cs-2"}) {
-		t.Fatalf("allowed codespace names = %v, want [cs-1 cs-2]", cfg.AccessPolicy.AllowedCodespaceNames)
-	}
-	if cfg.Workspace.Name != "bootstrap" || cfg.Workspace.Dir != "/tmp/bootstrap" {
-		t.Fatalf("workspace = %+v, want bootstrap /tmp/bootstrap", cfg.Workspace)
-	}
-}
-
-func TestBuildMCPConfigWithRegistry_LocalWorkdirEnv(t *testing.T) {
-	reg := registry.New()
-
-	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil, mcp.LifecycleConfig{
-		LocalWorkdir: "/local/repo",
-	})
-
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	servers := parsed["mcpServers"].(map[string]any)
-	cs := servers["codespace"].(map[string]any)
-	env := cs["env"].(map[string]any)
-	if got := env[codespaceLocalWorkdirEnv]; got != "/local/repo" {
-		t.Fatalf("%s = %v, want /local/repo", codespaceLocalWorkdirEnv, got)
 	}
 }
 
@@ -1470,6 +396,7 @@ func TestCleanupGeneratedUserExtensionsRemovesOnlyStaleGeneratedDirs(t *testing.
 
 func TestWriteExtensionSessionManifest(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", root)
 	env := map[string]string{"CODESPACE_REGISTRY": "[]"}
 	path, err := writeExtensionSessionManifest(root, "/usr/local/bin/self", env, "token-123", "here")
 	if err != nil {
@@ -1491,8 +418,8 @@ func TestWriteExtensionSessionManifest(t *testing.T) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		t.Fatalf("unmarshal manifest: %v", err)
 	}
-	if manifest.SelfBinary != "/usr/local/bin/self" || manifest.Token != "token-123" || manifest.Mode != "here" {
-		t.Fatalf("manifest = %+v, want self/token/mode", manifest)
+	if manifest.SelfBinary != "/usr/local/bin/self" || manifest.Token != "token-123" {
+		t.Fatalf("manifest = %+v, want self/token", manifest)
 	}
 	if got := manifest.Env["CODESPACE_REGISTRY"]; got != "[]" {
 		t.Fatalf("CODESPACE_REGISTRY = %q, want []", got)
@@ -1652,207 +579,6 @@ func TestRunExtensionHostIOAdvertisesRemoteExplorerWhenCodespaceConnected(t *tes
 	}
 	if !seenRemoteView {
 		t.Fatalf("custom agent tools = %v, want to include remote_view", tools)
-	}
-}
-
-func TestWriteCodespaceInstructionsPreambleTransportNeutralToolGuidance(t *testing.T) {
-	dir := t.TempDir()
-
-	writeCodespaceInstructionsPreamble(dir, "/workspaces/repo")
-
-	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
-	if err != nil {
-		t.Fatalf("reading instructions: %v", err)
-	}
-	text := string(data)
-	for _, want := range []string{
-		"/workspaces/repo",
-		"remote_view",
-		"remote_edit",
-		"remote_create",
-		"remote_bash",
-		"remote_grep",
-		"remote_glob",
-		"@remote-explorer",
-		"do NOT use local bash for codespace work",
-		"Do not make placeholder, empty, or no-op tool calls",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("expected %q in preamble, got %q", want, text)
-		}
-	}
-	for _, unwanted := range []string{
-		"MCP",
-		"A local checkout",
-	} {
-		if strings.Contains(text, unwanted) {
-			t.Fatalf("did not expect %q in mirror-mode single-codespace preamble, got %q", unwanted, text)
-		}
-	}
-}
-
-func TestWriteMultiCodespaceInstructionsPreambleTransportNeutralToolGuidance(t *testing.T) {
-	dir := t.TempDir()
-	reg := registry.New()
-	if err := reg.Register(&registry.ManagedCodespace{
-		Alias:      "github",
-		Name:       "cs-abc",
-		Repository: "github/github",
-		Branch:     "main",
-		Workdir:    "/workspaces/github",
-	}); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	if err := reg.Register(&registry.ManagedCodespace{
-		Alias:      "docs",
-		Name:       "cs-def",
-		Repository: "github/docs",
-		Branch:     "main",
-		Workdir:    "/workspaces/docs",
-	}); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-
-	writeMultiCodespaceInstructionsPreamble(dir, reg)
-
-	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
-	if err != nil {
-		t.Fatalf("reading instructions: %v", err)
-	}
-	text := string(data)
-	for _, want := range []string{
-		"Multi-Codespace Remote Development",
-		"github/github",
-		"github/docs",
-		"`codespace` parameter",
-		"remote_view",
-		"remote_bash",
-		"remote_grep",
-		"remote_glob",
-		"@remote-explorer",
-		"do NOT use local bash for codespace work",
-		"Do not make placeholder, empty, or no-op tool calls",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("expected %q in multi-codespace preamble, got %q", want, text)
-		}
-	}
-	if strings.Contains(text, "MCP") {
-		t.Fatalf("did not expect transport-specific MCP language in multi-codespace preamble, got %q", text)
-	}
-}
-
-func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
-	dir := t.TempDir()
-
-	writeZeroCodespaceInstructionsPreamble(dir, mcp.CodespaceAccessPolicy{})
-
-	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
-	if err != nil {
-		t.Fatalf("reading instructions: %v", err)
-	}
-	text := string(data)
-	for _, want := range []string{
-		"list_available_codespaces",
-		"create_codespace",
-		"connect_codespace",
-		"remote_*",
-		"Do not make placeholder, empty, or no-op tool calls",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("expected %q in preamble, got %q", want, text)
-		}
-	}
-	if strings.Contains(text, "MCP") {
-		t.Fatalf("did not expect transport-specific MCP language in zero-codespace preamble, got %q", text)
-	}
-}
-
-func TestWriteZeroCodespaceInstructionsPreamble_SelectedOnlyCreateOnly(t *testing.T) {
-	dir := t.TempDir()
-
-	writeZeroCodespaceInstructionsPreamble(dir, mcp.CodespaceAccessPolicy{
-		SelectedOnly: true,
-	})
-
-	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
-	if err != nil {
-		t.Fatalf("reading instructions: %v", err)
-	}
-	text := string(data)
-	for _, want := range []string{
-		"--selected-only",
-		"no existing codespaces were selected at startup",
-		"create_codespace",
-		"list_available_codespaces",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("expected %q in restricted preamble, got %q", want, text)
-		}
-	}
-	if strings.Contains(text, "Use `connect_codespace` to attach an existing codespace to this session.") {
-		t.Fatalf("did not expect unrestricted connect guidance in restricted create-only preamble, got %q", text)
-	}
-}
-
-func TestWriteZeroCodespaceInstructionsPreamble_SelectedOnlyAllowlist(t *testing.T) {
-	dir := t.TempDir()
-
-	writeZeroCodespaceInstructionsPreamble(dir, mcp.CodespaceAccessPolicy{
-		SelectedOnly:          true,
-		AllowedCodespaceNames: []string{"cs-selected", "cs-created"},
-	})
-
-	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
-	if err != nil {
-		t.Fatalf("reading instructions: %v", err)
-	}
-	text := string(data)
-	for _, want := range []string{
-		"selected at startup plus codespaces created from this session",
-		"Use `connect_codespace` to attach one of those allowlisted existing codespaces.",
-		"When you `--resume` this session, the allowlist keeps the existing codespaces selected at startup plus any codespaces created from this session.",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("expected %q in restricted allowlist preamble, got %q", want, text)
-		}
-	}
-}
-
-func TestZeroCodespaceStartupMessage(t *testing.T) {
-	tests := []struct {
-		name   string
-		policy mcp.CodespaceAccessPolicy
-		want   string
-	}{
-		{
-			name:   "unrestricted",
-			policy: mcp.CodespaceAccessPolicy{},
-			want:   "No codespaces selected. Start with create_codespace or connect_codespace from the agent.",
-		},
-		{
-			name: "restricted create only",
-			policy: mcp.CodespaceAccessPolicy{
-				SelectedOnly: true,
-			},
-			want: "No existing codespaces selected at startup are available in this selected-only session. Start with create_codespace from the agent.",
-		},
-		{
-			name: "restricted with allowlist",
-			policy: mcp.CodespaceAccessPolicy{
-				SelectedOnly:          true,
-				AllowedCodespaceNames: []string{"cs-selected", "cs-created"},
-			},
-			want: "No codespaces connected yet. Use list_available_codespaces for existing codespaces selected at startup or created from this session, or create_codespace to add a new one.",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := zeroCodespaceStartupMessage(tt.policy); got != tt.want {
-				t.Fatalf("zeroCodespaceStartupMessage() = %q, want %q", got, tt.want)
-			}
-		})
 	}
 }
 

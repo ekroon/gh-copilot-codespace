@@ -15,7 +15,6 @@ import (
 	"github.com/ekroon/gh-copilot-codespace/internal/provisioner"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
-	"github.com/ekroon/gh-copilot-codespace/internal/workspace"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -30,20 +29,18 @@ type CodespaceAccessPolicy struct {
 	AllowedCodespaceNames []string `json:"allowedCodespaceNames,omitempty"`
 }
 
-// WorkspaceSessionContext identifies the local workspace session backing the MCP server.
-type WorkspaceSessionContext struct {
-	Name string `json:"name,omitempty"`
-	Dir  string `json:"dir,omitempty"`
-}
-
 // LifecycleConfig holds dependencies and launcher context for lifecycle tool handlers.
 type LifecycleConfig struct {
 	GHRunner     GHRunner
 	DeployFunc   DeployFunc                // optional: deploy exec agent after SSH setup
 	Provisioners []provisioner.Provisioner // optional: run after setup
 	AccessPolicy CodespaceAccessPolicy
-	Workspace    WorkspaceSessionContext
 	LocalWorkdir string // optional local root for tools that bridge local and remote files
+}
+
+// LifecycleConfigData is the serializable launcher context for lifecycle handlers.
+type LifecycleConfigData struct {
+	AccessPolicy *CodespaceAccessPolicy `json:"accessPolicy,omitempty"`
 }
 
 type lifecycleState struct {
@@ -65,31 +62,10 @@ func (s *lifecycleState) accessPolicy() CodespaceAccessPolicy {
 	return cloneAccessPolicy(s.cfg.AccessPolicy)
 }
 
-func (s *lifecycleState) syncWorkspace(mutator func(*workspace.Workspace, *CodespaceAccessPolicy)) error {
-	if s.cfg.Workspace.Name == "" {
-		return nil
-	}
-
+func (s *lifecycleState) mutateAccessPolicy(mutator func(*CodespaceAccessPolicy)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	ws, err := workspace.Load(s.cfg.Workspace.Name)
-	if err != nil {
-		return fmt.Errorf("loading workspace manifest %q: %w", s.cfg.Workspace.Name, err)
-	}
-
-	oldPolicy := cloneAccessPolicy(s.cfg.AccessPolicy)
-	ws.Manifest.SetAccessPolicy(oldPolicy.SelectedOnly, oldPolicy.AllowedCodespaceNames)
-
-	mutator(ws, &s.cfg.AccessPolicy)
-	ws.Manifest.SetAccessPolicy(s.cfg.AccessPolicy.SelectedOnly, s.cfg.AccessPolicy.AllowedCodespaceNames)
-
-	if err := ws.Save(); err != nil {
-		s.cfg.AccessPolicy = oldPolicy
-		return fmt.Errorf("saving workspace manifest %q: %w", s.cfg.Workspace.Name, err)
-	}
-
-	return nil
+	mutator(&s.cfg.AccessPolicy)
 }
 
 func cloneAccessPolicy(p CodespaceAccessPolicy) CodespaceAccessPolicy {
@@ -120,6 +96,40 @@ func normalizeAllowedCodespaceNames(names []string) []string {
 		return nil
 	}
 	return normalized
+}
+
+// ParseLifecycleConfigData parses serialized lifecycle launcher context.
+func ParseLifecycleConfigData(data string) (LifecycleConfig, error) {
+	if strings.TrimSpace(data) == "" {
+		return LifecycleConfig{}, nil
+	}
+
+	var serialized LifecycleConfigData
+	if err := json.Unmarshal([]byte(data), &serialized); err != nil {
+		return LifecycleConfig{}, fmt.Errorf("parsing lifecycle config: %w", err)
+	}
+
+	var cfg LifecycleConfig
+	if serialized.AccessPolicy != nil {
+		cfg.AccessPolicy = cloneAccessPolicy(*serialized.AccessPolicy)
+		cfg.AccessPolicy.AllowedCodespaceNames = normalizeAllowedCodespaceNames(cfg.AccessPolicy.AllowedCodespaceNames)
+	}
+	return cfg, nil
+}
+
+// MarshalLifecycleConfigData serializes lifecycle launcher context.
+func MarshalLifecycleConfigData(cfg LifecycleConfig) (string, error) {
+	policy := cloneAccessPolicy(cfg.AccessPolicy)
+	policy.AllowedCodespaceNames = normalizeAllowedCodespaceNames(policy.AllowedCodespaceNames)
+	if !policy.SelectedOnly && len(policy.AllowedCodespaceNames) == 0 {
+		return "", nil
+	}
+
+	data, err := json.Marshal(LifecycleConfigData{AccessPolicy: &policy})
+	if err != nil {
+		return "", fmt.Errorf("serializing lifecycle config: %w", err)
+	}
+	return string(data), nil
 }
 
 func (p *CodespaceAccessPolicy) addAllowedCodespaceName(name string) bool {
@@ -350,18 +360,9 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
 		}
 
-		if err := state.syncWorkspace(func(ws *workspace.Workspace, policy *CodespaceAccessPolicy) {
-			ws.AddCodespace(alias, workspace.CodespaceEntry{
-				Name:       csName,
-				Repository: repo,
-				Branch:     branch,
-				Workdir:    workdir,
-			})
+		state.mutateAccessPolicy(func(policy *CodespaceAccessPolicy) {
 			policy.addAllowedCodespaceName(csName)
-		}); err != nil {
-			reg.Deregister(alias)
-			return toolError(fmt.Sprintf("codespace %q was created and connected as alias %q, but failed to persist workspace state: %v. The local session entry was rolled back.", csName, alias, err)), nil
-		}
+		})
 
 		// Run provisioners
 		if len(state.cfg.Provisioners) > 0 {
@@ -498,16 +499,7 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
 		}
 
-		if err := state.syncWorkspace(func(ws *workspace.Workspace, policy *CodespaceAccessPolicy) {
-			ws.AddCodespace(alias, workspace.CodespaceEntry{
-				Name:       csName,
-				Repository: repoInfo,
-				Workdir:    workdir,
-			})
-		}); err != nil {
-			reg.Deregister(alias)
-			return toolError(fmt.Sprintf("codespace %q was connected as alias %q, but failed to persist workspace state: %v. The local session entry was rolled back.", csName, alias, err)), nil
-		}
+		state.mutateAccessPolicy(func(*CodespaceAccessPolicy) {})
 
 		// Run provisioners
 		if len(state.cfg.Provisioners) > 0 {
@@ -591,21 +583,15 @@ func deleteCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 			}
 		}
 
-		if err := state.syncWorkspace(func(ws *workspace.Workspace, policy *CodespaceAccessPolicy) {
-			ws.RemoveCodespace(alias)
-			if shouldDelete {
-				policy.removeAllowedCodespaceName(csName)
-			}
-		}); err != nil {
-			return toolError(fmt.Sprintf("failed to update workspace state while disconnecting %q: %v. The codespace remains connected in this session.", alias, err)), nil
-		}
-
 		reg.Deregister(alias)
 
 		if shouldDelete {
 			if _, err := state.cfg.GHRunner.Run(ctx, "codespace", "delete", "-c", csName, "--force"); err != nil {
 				return toolError(fmt.Sprintf("disconnected %q but failed to delete: %v", alias, err)), nil
 			}
+			state.mutateAccessPolicy(func(policy *CodespaceAccessPolicy) {
+				policy.removeAllowedCodespaceName(csName)
+			})
 			return toolSuccess(fmt.Sprintf("Disconnected and deleted codespace %q (%s)", alias, csName)), nil
 		}
 

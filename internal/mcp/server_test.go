@@ -388,6 +388,72 @@ func TestRemoteCopy_RejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestRemoteCopy_RejectsSourceSymlinkEscape(t *testing.T) {
+	localRoot := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write outside source: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(localRoot, "secret-link")); err != nil {
+		t.Fatalf("create source symlink: %v", err)
+	}
+
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: &mockExecutor{runBashExit: 1},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "secret-link",
+		"destination": "cs://github/secret.txt",
+	}))
+	if !res.IsError {
+		t.Fatal("expected source symlink escape error")
+	}
+	if !strings.Contains(resultText(res), "escapes local workdir") {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+}
+
+func TestRemoteCopy_RejectsDestinationParentSymlinkEscape(t *testing.T) {
+	localRoot := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(localRoot, "outside-link")); err != nil {
+		t.Fatalf("create destination symlink: %v", err)
+	}
+
+	mock := &mockExecutor{
+		runBashStdout: base64.StdEncoding.EncodeToString([]byte("remote")),
+	}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "cs://github/remote.txt",
+		"destination": "outside-link/copied.txt",
+	}))
+	if !res.IsError {
+		t.Fatal("expected destination symlink escape error")
+	}
+	if !strings.Contains(resultText(res), "escapes local workdir") {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	if _, err := os.Stat(filepath.Join(outside, "copied.txt")); !os.IsNotExist(err) {
+		t.Fatalf("outside destination was created or stat failed unexpectedly: %v", err)
+	}
+}
+
 func TestRemoteCopy_RejectsRemoteTraversal(t *testing.T) {
 	localRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(localRoot, "src.txt"), []byte("hello"), 0o644); err != nil {

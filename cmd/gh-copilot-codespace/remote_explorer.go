@@ -14,7 +14,7 @@ const remoteExplorerAgentName = "remote-explorer"
 
 // remoteExplorerAgentDescription is the description shown to the parent agent
 // when it picks a sub-agent to delegate to.
-const remoteExplorerAgentDescription = "Explore and search codespace files using remote tools. Use this agent instead of the built-in explore agent when you need to search, read, or understand code on a remote codespace. Delegates to this agent are appropriate for: finding files, searching code patterns, understanding codebase structure, reading specific files, and answering questions about code."
+const remoteExplorerAgentDescription = "Explore and search repository source on remote codespaces using remote tools. Use this agent instead of the built-in explore agent for finding files, searching code patterns, understanding codebase structure, reading specific files, and answering questions about remote code."
 
 // remoteExplorerAgentPrompt is the system prompt for the inline agent. The
 // frontmatter form on disk includes the same prompt body below; keeping them
@@ -29,12 +29,15 @@ Use these remote tools to explore the codespace:
 - **remote_view** — read file contents with line numbers
 - **remote_bash** — run commands (e.g., find, wc, head, git log)
 - **remote_cwd** — check the default working directory used when cwd is omitted
+- **list_codespaces** — list connected codespaces and their aliases
 
 ## Guidelines
 
+- All repository source lives on remote GitHub Codespaces. Do not use local built-in file, search, or shell tools for repository exploration.
 - Be concise — return focused answers under 300 words
 - Search broadly first, then narrow down
 - Use remote_grep for content search, remote_glob for file discovery
+- With multiple codespaces, use list_codespaces and pass the ` + "`codespace` alias" + ` to every remote tool call that needs an explicit target
 - Pass cwd explicitly on remote_bash/remote_grep/remote_glob when you need predictable parallel calls instead of relying on remote_cd ordering
 - Read only the relevant portions of files (use view_range)
 - When exploring structure, use remote_bash with find or ls
