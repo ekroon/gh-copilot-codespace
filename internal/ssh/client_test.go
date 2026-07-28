@@ -216,6 +216,22 @@ func TestResolveWorkdir(t *testing.T) {
 	}
 }
 
+func TestControlSocketPathIsShortAndUnique(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), ".copilot", "codespace-workdirs")
+	first := controlSocketPath(configDir, "graphql-stargazers-observability-jrg4wwvpcj74w")
+	second := controlSocketPath(configDir, "graphql-stargazers-observability-jrg4wwvpcj74x")
+
+	if first == second {
+		t.Fatalf("controlSocketPath() collision: %q", first)
+	}
+	if len(first) > 80 {
+		t.Fatalf("controlSocketPath() length = %d, want <= 80 to leave room for OpenSSH's temporary suffix: %q", len(first), first)
+	}
+	if got := controlSocketPath(configDir, "graphql-stargazers-observability-jrg4wwvpcj74w"); got != first {
+		t.Fatalf("controlSocketPath() = %q, want stable path %q", got, first)
+	}
+}
+
 func TestWrapCommandInWorkdir(t *testing.T) {
 	got := wrapCommandInWorkdir("pwd", "/workspaces/repo")
 	want := "cd '/workspaces/repo' && pwd"
@@ -292,6 +308,52 @@ func TestCommandContextHelperProcess(t *testing.T) {
 		exitCode = 1
 	}
 	os.Exit(exitCode)
+}
+
+func TestSetupMultiplexingUsesShortControlSocketForLongCodespaceName(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	client := NewClient("graphql-stargazers-observability-jrg4wwvpcj74w")
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "Host cs.long-name\n  HostName example.com\n  LogLevel quiet\n"},
+		{},
+	})
+
+	if err := client.SetupMultiplexing(context.Background()); err != nil {
+		t.Fatalf("SetupMultiplexing() error = %v", err)
+	}
+
+	controlSocket := client.ControlSocketPath()
+	if len(controlSocket) > 80 {
+		t.Fatalf("ControlSocketPath() length = %d, want <= 80: %q", len(controlSocket), controlSocket)
+	}
+	if strings.Contains(controlSocket, client.codespaceName) {
+		t.Fatalf("ControlSocketPath() contains full codespace name: %q", controlSocket)
+	}
+
+	config, err := os.ReadFile(client.SSHConfigPath())
+	if err != nil {
+		t.Fatalf("ReadFile(SSHConfigPath()) error = %v", err)
+	}
+	if !strings.Contains(string(config), "ControlPath "+controlSocket) {
+		t.Fatalf("SSH config does not contain short control socket %q:\n%s", controlSocket, config)
+	}
+
+	wantCalls := []fakeExecCall{
+		{name: "gh", args: []string{"codespace", "ssh", "--config", "-c", client.codespaceName}},
+		{name: "ssh", args: []string{
+			"-F", client.SSHConfigPath(),
+			"-o", "ControlMaster=yes",
+			"-o", "ControlPersist=600",
+			"-fN",
+			"cs.long-name",
+		}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
 }
 
 func TestViewFileRetriesReadOnlyTransportFailure(t *testing.T) {

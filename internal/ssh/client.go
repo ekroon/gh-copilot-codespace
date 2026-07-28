@@ -3,6 +3,7 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -103,6 +104,11 @@ func (c *Client) setSSHConfigPath(sshConfigPath string) {
 	c.sshConfigPath = sshConfigPath
 }
 
+func controlSocketPath(configDir, codespaceName string) string {
+	sum := sha256.Sum256([]byte(configDir + "\x00" + codespaceName))
+	return filepath.Join(os.TempDir(), fmt.Sprintf(".gcs-%x", sum[:10]))
+}
+
 // SetupMultiplexing generates an SSH config with ControlMaster and establishes
 // a persistent connection. Subsequent Exec calls use this connection (~0.1s vs ~3s).
 func (c *Client) SetupMultiplexing(ctx context.Context) error {
@@ -116,7 +122,7 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 		return fmt.Errorf("creating config dir: %w", err)
 	}
 
-	controlSocket := filepath.Join(configDir, ".ssh-"+c.codespaceName)
+	controlSocket := controlSocketPath(configDir, c.codespaceName)
 	sshConfigPath := filepath.Join(configDir, ".ssh-config-"+c.codespaceName)
 
 	// Reuse existing multiplexed connection if alive (e.g., set up by the launcher).
@@ -125,9 +131,12 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 	var sshHost string
 	if data, err := os.ReadFile(sshConfigPath); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "Host ") {
-				sshHost = strings.TrimPrefix(strings.TrimSpace(line), "Host ")
-				break
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "Host ") {
+				sshHost = strings.TrimPrefix(trimmed, "Host ")
+			}
+			if strings.HasPrefix(trimmed, "ControlPath ") {
+				controlSocket = strings.TrimPrefix(trimmed, "ControlPath ")
 			}
 		}
 		if sshHost != "" {
@@ -145,6 +154,8 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 			}
 		}
 	}
+
+	controlSocket = controlSocketPath(configDir, c.codespaceName)
 
 	// Get SSH config from gh (contains ProxyCommand, identity file, etc.)
 	ghConfig, err := c.command(ctx, "gh", "codespace", "ssh",
