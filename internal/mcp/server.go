@@ -2,9 +2,9 @@ package mcp
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	pathpkg "path"
@@ -155,6 +155,70 @@ func resolveLocalRoot(localRoot string) (string, error) {
 }
 
 func resolveLocalCopyPath(root, value string) (string, error) {
+	candidate, err := localCopyCandidate(root, value)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := resolvePathSymlinks(candidate)
+	if err != nil {
+		return "", fmt.Errorf("resolving local path %q: %w", value, err)
+	}
+	if err := ensureLocalPathContained(root, resolved, value); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+func resolveLocalCopySource(root, value string) (string, error) {
+	candidate, err := localCopyCandidate(root, value)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(candidate)
+	if err != nil {
+		return "", fmt.Errorf("reading local source: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("local source %q is a symbolic link", value)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("local source %q is not a regular file", value)
+	}
+	resolvedParent, err := resolvePathSymlinks(filepath.Dir(candidate))
+	if err != nil {
+		return "", fmt.Errorf("resolving local source %q: %w", value, err)
+	}
+	resolved := filepath.Join(resolvedParent, filepath.Base(candidate))
+	if err := ensureLocalPathContained(root, resolved, value); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+func resolveLocalCopyDestination(root, value string) (string, error) {
+	candidate, err := localCopyCandidate(root, value)
+	if err != nil {
+		return "", err
+	}
+	if info, err := os.Lstat(candidate); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("local destination %q is a symbolic link", value)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("checking local destination %q: %w", value, err)
+	}
+	resolvedParent, err := resolvePathSymlinks(filepath.Dir(candidate))
+	if err != nil {
+		return "", fmt.Errorf("resolving local destination %q: %w", value, err)
+	}
+	resolved := filepath.Join(resolvedParent, filepath.Base(candidate))
+	if err := ensureLocalPathContained(root, resolved, value); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+func localCopyCandidate(root, value string) (string, error) {
 	var candidate string
 	if filepath.IsAbs(value) {
 		candidate = filepath.Clean(value)
@@ -168,18 +232,18 @@ func resolveLocalCopyPath(root, value string) (string, error) {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("local path %q escapes local workdir %q", value, root)
 	}
-	resolved, err := resolvePathSymlinks(candidate)
-	if err != nil {
-		return "", fmt.Errorf("resolving local path %q: %w", value, err)
-	}
+	return candidate, nil
+}
+
+func ensureLocalPathContained(root, resolved, value string) error {
 	resolvedRel, err := filepath.Rel(root, resolved)
 	if err != nil {
-		return "", fmt.Errorf("resolving local path: %w", err)
+		return fmt.Errorf("resolving local path: %w", err)
 	}
 	if resolvedRel == ".." || strings.HasPrefix(resolvedRel, ".."+string(filepath.Separator)) || filepath.IsAbs(resolvedRel) {
-		return "", fmt.Errorf("local path %q escapes local workdir %q", value, root)
+		return fmt.Errorf("local path %q escapes local workdir %q", value, root)
 	}
-	return resolved, nil
+	return nil
 }
 
 func resolvePathSymlinks(candidate string) (string, error) {
@@ -225,17 +289,14 @@ func resolveRemoteCopyPath(cs *registry.ManagedCodespace, value string) (string,
 }
 
 func copyToRemote(ctx context.Context, reg *registry.Registry, localRoot string, src, dst copyEndpoint, overwrite bool) (*mcpsdk.CallToolResult, error) {
-	localPath, err := resolveLocalCopyPath(localRoot, src.path)
+	if err := ctx.Err(); err != nil {
+		return toolError(fmt.Sprintf("reading local source: %v", err)), nil
+	}
+	source, localPath, err := openLocalCopySourceRooted(localRoot, src.path, localCopyReadHooks{})
 	if err != nil {
 		return toolError(err.Error()), nil
 	}
-	info, err := os.Stat(localPath)
-	if err != nil {
-		return toolError(fmt.Sprintf("reading local source: %v", err)), nil
-	}
-	if info.IsDir() {
-		return toolError("remote_copy currently supports files only, not directories"), nil
-	}
+	defer source.Close()
 
 	cs, err := reg.Resolve(dst.alias)
 	if err != nil {
@@ -254,14 +315,94 @@ func copyToRemote(ctx context.Context, reg *registry.Registry, localRoot string,
 			return toolError(fmt.Sprintf("destination %s already exists on codespace %q; set overwrite=true to replace it", remotePath, cs.Alias)), nil
 		}
 	}
-	content, err := os.ReadFile(localPath)
+	content, err := readOpenedLocalCopySource(ctx, source, localCopyReadHooks{})
 	if err != nil {
-		return toolError(fmt.Sprintf("reading local source: %v", err)), nil
+		return toolError(err.Error()), nil
 	}
-	if err := cs.Executor.CreateFile(ctx, remotePath, string(content)); err != nil {
+	copyExecutor, ok := cs.Executor.(ssh.RootedFileExecutor)
+	if !ok {
+		return toolError("copy to codespace: executor does not support rooted file copies"), nil
+	}
+	if err := copyExecutor.WriteFileRooted(ctx, ssh.RootedWriteRequest{
+		Path:      remotePath,
+		Root:      cs.Workdir,
+		Data:      content,
+		Overwrite: overwrite,
+	}); err != nil {
 		return toolError(fmt.Sprintf("copy to codespace: %v", err)), nil
 	}
 	return toolSuccess(fmt.Sprintf("Copied %s to cs://%s/%s", localPath, cs.Alias, strings.TrimPrefix(dst.path, "/"))), nil
+}
+
+type localCopyReadHooks struct {
+	afterParentOpen func() error
+	afterStat       func() error
+	reader          func(io.Reader) io.Reader
+}
+
+type localCopyWriteHooks struct {
+	afterParentOpen  func() error
+	afterTempCreated func() error
+	beforeInstall    func() error
+	afterInstall     func() error
+}
+
+type localCopyContextReader struct {
+	ctx context.Context
+	src io.Reader
+}
+
+func (r localCopyContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.src.Read(p)
+	if ctxErr := r.ctx.Err(); ctxErr != nil {
+		return n, ctxErr
+	}
+	return n, err
+}
+
+func readLocalCopySourceWithHooks(ctx context.Context, path string, hooks localCopyReadHooks) ([]byte, error) {
+	return readLocalCopySourceRootedWithHooks(ctx, filepath.Dir(path), filepath.Base(path), hooks)
+}
+
+func readLocalCopySourceRootedWithHooks(ctx context.Context, root, value string, hooks localCopyReadHooks) ([]byte, error) {
+	file, _, err := openLocalCopySourceRooted(root, value, hooks)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readOpenedLocalCopySource(ctx, file, hooks)
+}
+
+func readOpenedLocalCopySource(ctx context.Context, file *os.File, hooks localCopyReadHooks) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("reading local source: %w", err)
+	}
+	if hooks.afterStat != nil {
+		if err := hooks.afterStat(); err != nil {
+			return nil, fmt.Errorf("reading local source: %w", err)
+		}
+	}
+
+	var source io.Reader = file
+	if hooks.reader != nil {
+		source = hooks.reader(source)
+	}
+	source = localCopyContextReader{ctx: ctx, src: source}
+	content, err := io.ReadAll(io.LimitReader(source, ssh.MaxFileTransferBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading local source: %w", err)
+	}
+	if len(content) > ssh.MaxFileTransferBytes {
+		return nil, fmt.Errorf("%w: local source grew beyond %d bytes",
+			ssh.ErrFileTransferTooLarge, ssh.MaxFileTransferBytes)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("reading local source: %w", err)
+	}
+	return content, nil
 }
 
 func copyFromRemote(ctx context.Context, reg *registry.Registry, localRoot string, src, dst copyEndpoint, overwrite bool) (*mcpsdk.CallToolResult, error) {
@@ -273,32 +414,32 @@ func copyFromRemote(ctx context.Context, reg *registry.Registry, localRoot strin
 	if err != nil {
 		return toolError(err.Error()), nil
 	}
-	localPath, err := resolveLocalCopyPath(localRoot, dst.path)
+	localPath, exists, err := inspectLocalCopyDestinationRooted(localRoot, dst.path)
 	if err != nil {
 		return toolError(err.Error()), nil
 	}
-	if !overwrite {
-		if _, err := os.Stat(localPath); err == nil {
-			return toolError(fmt.Sprintf("destination %s already exists locally; set overwrite=true to replace it", localPath)), nil
-		} else if !os.IsNotExist(err) {
-			return toolError(fmt.Sprintf("checking local destination: %v", err)), nil
-		}
+	if !overwrite && exists {
+		return toolError(fmt.Sprintf("destination %s already exists locally; set overwrite=true to replace it", localPath)), nil
 	}
-	content, err := readRemoteFile(ctx, cs.Executor, remotePath)
+	copyExecutor, ok := cs.Executor.(ssh.RootedFileExecutor)
+	if !ok {
+		return toolError("copy from codespace: executor does not support rooted file copies"), nil
+	}
+	content, err := copyExecutor.ReadFileRooted(ctx, ssh.RootedReadRequest{
+		Path: remotePath,
+		Root: cs.Workdir,
+	})
 	if err != nil {
 		return toolError(fmt.Sprintf("copy from codespace: %v", err)), nil
 	}
-	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
-		return toolError(fmt.Sprintf("creating local parent directory: %v", err)), nil
-	}
-	if err := os.WriteFile(localPath, content, 0o644); err != nil {
+	if err := writeLocalFileAtomicRootedWithHooks(ctx, localRoot, dst.path, content, overwrite, localCopyWriteHooks{}); err != nil {
 		return toolError(fmt.Sprintf("writing local destination: %v", err)), nil
 	}
 	return toolSuccess(fmt.Sprintf("Copied cs://%s/%s to %s", cs.Alias, strings.TrimPrefix(src.path, "/"), localPath)), nil
 }
 
 func remotePathExists(ctx context.Context, executor ssh.Executor, path string) (bool, error) {
-	_, stderr, exitCode, err := executor.RunBash(ctx, fmt.Sprintf("test -e %s", shellQuote(path)), "/")
+	_, stderr, exitCode, err := executor.RunBash(ctx, fmt.Sprintf("test -e %[1]s || test -L %[1]s", shellQuote(path)), "/")
 	if err != nil {
 		return false, fmt.Errorf("checking remote destination: %w", err)
 	}
@@ -312,39 +453,30 @@ func remotePathExists(ctx context.Context, executor ssh.Executor, path string) (
 	}
 }
 
-func readRemoteFile(ctx context.Context, executor ssh.Executor, path string) ([]byte, error) {
-	stdout, stderr, exitCode, err := executor.RunBash(ctx, fmt.Sprintf("base64 < %s", shellQuote(path)), "/")
-	if err != nil {
-		return nil, fmt.Errorf("read remote source: %w", err)
-	}
-	if exitCode != 0 {
-		return nil, fmt.Errorf("read remote source failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
-	}
-	content, err := base64.StdEncoding.DecodeString(strings.TrimSpace(stdout))
-	if err != nil {
-		return nil, fmt.Errorf("decode remote source: %w", err)
-	}
-	return content, nil
-}
-
 // --- remote_view ---
 
 func viewTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_view",
-		Description: "View a file or directory on the remote codespace. Returns file contents with line numbers. Replaces the local 'view' tool.",
+		Description: "View a file or directory on the remote codespace. Supports local view-style ranges, large-file overrides, directory listings, and structured image or binary metadata when the executor provides them. Replaces the local 'view' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"codespace": codespaceParam,
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Path to the file to view",
+					"description": "Path to the file or directory to view",
 				},
 				"view_range": map[string]any{
 					"type":        "array",
 					"description": "Optional [start_line, end_line] range. Use -1 for end_line to read to end of file.",
 					"items":       map[string]any{"type": "integer"},
+					"minItems":    2,
+					"maxItems":    2,
+				},
+				"forceReadLargeFiles": map[string]any{
+					"type":        "boolean",
+					"description": "When true, bypasses large-file safeguards if the remote executor supports it.",
 				},
 			},
 			Required: []string{"path"},
@@ -363,22 +495,24 @@ func viewHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			return toolError(err.Error()), nil
 		}
 
-		var viewRange []int
-		if raw, ok := req.GetArguments()["view_range"]; ok {
-			if arr, ok := raw.([]any); ok && len(arr) == 2 {
-				start, ok1 := toInt(arr[0])
-				end, ok2 := toInt(arr[1])
-				if ok1 && ok2 {
-					viewRange = []int{start, end}
-				}
-			}
-		}
-
-		result, err := c.ViewFile(ctx, path, viewRange)
+		viewRange, err := optionalViewRangeArg(req)
 		if err != nil {
 			return toolError(err.Error()), nil
 		}
-		return toolSuccess(result), nil
+		forceReadLargeFiles, err := optionalBoolArgStrict(req, "forceReadLargeFiles")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+
+		result, err := ssh.ExecuteView(ctx, c, ssh.ViewRequest{
+			Path:                path,
+			ViewRange:           viewRange,
+			ForceReadLargeFiles: forceReadLargeFiles,
+		})
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		return viewToolSuccess(path, result), nil
 	}
 }
 
@@ -807,7 +941,7 @@ func listBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func grepTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_grep",
-		Description: "Search for a pattern in files on the remote codespace using ripgrep (with grep fallback). Replaces the local 'grep' tool.",
+		Description: "Search file contents on the remote codespace with local rg-style options. Replaces the local 'rg' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -818,11 +952,62 @@ func grepTool() mcpsdk.Tool {
 				},
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory or file to search in (defaults to '.' within cwd)",
+					"description": "Legacy single directory or file to search in (defaults to '.' within cwd)",
+				},
+				"paths": map[string]any{
+					"description": "A single path or multiple paths to search in (defaults to '.' within cwd)",
+					"oneOf": []any{
+						map[string]any{"type": "string"},
+						map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						},
+					},
+				},
+				"output_mode": map[string]any{
+					"type":        "string",
+					"description": "Output format",
+					"enum": []string{
+						string(ssh.GrepOutputModeContent),
+						string(ssh.GrepOutputModeFilesWithMatches),
+						string(ssh.GrepOutputModeCount),
+					},
 				},
 				"glob": map[string]any{
 					"type":        "string",
 					"description": "Glob pattern to filter files (e.g., '*.go', '*.ts')",
+				},
+				"type": map[string]any{
+					"type":        "string",
+					"description": "File type filter (e.g., 'go', 'ts', 'py')",
+				},
+				"-i": map[string]any{
+					"type":        "boolean",
+					"description": "Case insensitive search",
+				},
+				"-A": map[string]any{
+					"type":        "integer",
+					"description": "Lines of context after each match",
+				},
+				"-B": map[string]any{
+					"type":        "integer",
+					"description": "Lines of context before each match",
+				},
+				"-C": map[string]any{
+					"type":        "integer",
+					"description": "Lines of context before and after each match",
+				},
+				"-n": map[string]any{
+					"type":        "boolean",
+					"description": "Show line numbers",
+				},
+				"head_limit": map[string]any{
+					"type":        "integer",
+					"description": "Limit output to the first N results",
+				},
+				"multiline": map[string]any{
+					"type":        "boolean",
+					"description": "Enable multiline mode where patterns can span lines",
 				},
 				"cwd": map[string]any{
 					"type":        "string",
@@ -845,18 +1030,66 @@ func grepHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			return toolError(err.Error()), nil
 		}
 
-		path := optionalString(req, "path")
-		glob := optionalString(req, "glob")
-		cwd := optionalString(req, "cwd")
-
-		result, err := c.Grep(ctx, pattern, path, glob, cwd)
+		paths, err := optionalPathsArg(req, "paths")
 		if err != nil {
 			return toolError(err.Error()), nil
 		}
-		if result == "" {
-			return toolSuccess("No matches found."), nil
+		outputMode, err := optionalGrepOutputModeArg(req, "output_mode")
+		if err != nil {
+			return toolError(err.Error()), nil
 		}
-		return toolSuccess(result), nil
+		caseInsensitive, err := optionalBoolArgStrict(req, "-i")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		afterContext, err := optionalIntArg(req, "-A")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		beforeContext, err := optionalIntArg(req, "-B")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		contextLines, err := optionalIntArg(req, "-C")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		lineNumbers, err := optionalBoolPtrArg(req, "-n")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		headLimit, err := optionalIntArg(req, "head_limit")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		multiline, err := optionalBoolArgStrict(req, "multiline")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+
+		result, err := ssh.ExecuteGrep(ctx, c, ssh.GrepRequest{
+			Pattern:         pattern,
+			Path:            optionalString(req, "path"),
+			Paths:           paths,
+			Glob:            optionalString(req, "glob"),
+			OutputMode:      outputMode,
+			Type:            optionalString(req, "type"),
+			CaseInsensitive: caseInsensitive,
+			AfterContext:    afterContext,
+			BeforeContext:   beforeContext,
+			Context:         contextLines,
+			LineNumbers:     lineNumbers,
+			HeadLimit:       headLimit,
+			Multiline:       multiline,
+			Cwd:             optionalString(req, "cwd"),
+		})
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		if result.Output == "" {
+			return toolStructuredSuccess("No matches found.", result), nil
+		}
+		return toolStructuredSuccess(result.Output, result), nil
 	}
 }
 
@@ -865,7 +1098,7 @@ func grepHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func globTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_glob",
-		Description: "Find files matching a glob pattern on the remote codespace. Replaces the local 'glob' tool.",
+		Description: "Find files matching a glob pattern on the remote codespace with local glob-style path selection. Replaces the local 'glob' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -876,11 +1109,27 @@ func globTool() mcpsdk.Tool {
 				},
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory to search in (defaults to '.' within cwd)",
+					"description": "Legacy single directory to search in (defaults to '.' within cwd)",
+				},
+				"paths": map[string]any{
+					"description": "A single directory or multiple directories to search in (defaults to '.' within cwd)",
+					"oneOf": []any{
+						map[string]any{"type": "string"},
+						map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						},
+					},
 				},
 				"cwd": map[string]any{
 					"type":        "string",
 					"description": "Optional working directory for this call. Pass it explicitly for parallel-safe remote_glob usage instead of relying on remote_cd ordering.",
+				},
+				"limit": map[string]any{
+					"type":        "integer",
+					"description": fmt.Sprintf("Maximum number of matches to return (defaults to %d, capped at %d).", ssh.DefaultGlobLimit, ssh.MaxGlobLimit),
+					"minimum":     1,
+					"maximum":     ssh.MaxGlobLimit,
 				},
 			},
 			Required: []string{"pattern"},
@@ -899,17 +1148,75 @@ func globHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			return toolError(err.Error()), nil
 		}
 
-		path := optionalString(req, "path")
-		cwd := optionalString(req, "cwd")
-
-		result, err := c.Glob(ctx, pattern, path, cwd)
+		paths, err := optionalPathsArg(req, "paths")
 		if err != nil {
 			return toolError(err.Error()), nil
 		}
-		if result == "" {
-			return toolSuccess("No matches found."), nil
+		limit, err := optionalIntArg(req, "limit")
+		if err != nil {
+			return toolError(err.Error()), nil
 		}
-		return toolSuccess(result), nil
+
+		result, err := ssh.ExecuteGlob(ctx, c, ssh.GlobRequest{
+			Pattern: pattern,
+			Path:    optionalString(req, "path"),
+			Paths:   paths,
+			Cwd:     optionalString(req, "cwd"),
+			Limit:   limit,
+		})
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		if result.Output == "" {
+			return toolStructuredSuccess("No matches found.", result), nil
+		}
+		return toolStructuredSuccess(result.Output, result), nil
+	}
+}
+
+// --- remote_apply_patch ---
+
+func applyPatchTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "remote_apply_patch",
+		Description: "Apply a canonical apply_patch payload on the remote codespace. Replaces the local 'apply_patch' tool for repository changes that must happen remotely.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"codespace": codespaceParam,
+				"patch": map[string]any{
+					"type":        "string",
+					"description": "The canonical apply_patch payload beginning with '*** Begin Patch' and ending with '*** End Patch'.",
+				},
+				"cwd": map[string]any{
+					"type":        "string",
+					"description": "Optional working directory for this call.",
+				},
+			},
+			Required: []string{"patch"},
+		},
+	}
+}
+
+func applyPatchHandler(reg *registry.Registry) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		patch, err := requiredString(req, "patch")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+
+		result, err := ssh.ExecuteApplyPatch(ctx, c, ssh.ApplyPatchRequest{
+			Patch: patch,
+			Cwd:   optionalString(req, "cwd"),
+		})
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		return toolStructuredSuccess(applyPatchResultText(result), result), nil
 	}
 }
 
@@ -951,6 +1258,125 @@ func optionalFloat(req mcpsdk.CallToolRequest, key string, defaultVal float64) f
 	return f
 }
 
+func optionalBoolArgStrict(req mcpsdk.CallToolRequest, key string) (bool, error) {
+	args := req.GetArguments()
+	val, ok := args[key]
+	if !ok {
+		return false, nil
+	}
+	b, ok := val.(bool)
+	if !ok {
+		return false, fmt.Errorf("parameter %s must be a boolean", key)
+	}
+	return b, nil
+}
+
+func optionalBoolPtrArg(req mcpsdk.CallToolRequest, key string) (*bool, error) {
+	args := req.GetArguments()
+	val, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	b, ok := val.(bool)
+	if !ok {
+		return nil, fmt.Errorf("parameter %s must be a boolean", key)
+	}
+	return &b, nil
+}
+
+func optionalIntArg(req mcpsdk.CallToolRequest, key string) (int, error) {
+	args := req.GetArguments()
+	val, ok := args[key]
+	if !ok {
+		return 0, nil
+	}
+	n, ok := toInt(val)
+	if !ok {
+		return 0, fmt.Errorf("parameter %s must be an integer", key)
+	}
+	return n, nil
+}
+
+func optionalViewRangeArg(req mcpsdk.CallToolRequest) ([]int, error) {
+	args := req.GetArguments()
+	val, ok := args["view_range"]
+	if !ok {
+		return nil, nil
+	}
+	viewRange, err := intSliceArg("view_range", val)
+	if err != nil {
+		return nil, err
+	}
+	if len(viewRange) != 2 {
+		return nil, fmt.Errorf("view_range must contain exactly 2 integers")
+	}
+	start, end := viewRange[0], viewRange[1]
+	if start < 1 {
+		return nil, fmt.Errorf("view_range start_line must be >= 1")
+	}
+	if end != -1 && end < start {
+		return nil, fmt.Errorf("view_range end_line must be -1 or >= start_line")
+	}
+	return viewRange, nil
+}
+
+func optionalPathsArg(req mcpsdk.CallToolRequest, key string) ([]string, error) {
+	args := req.GetArguments()
+	val, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	switch typed := val.(type) {
+	case string:
+		return []string{typed}, nil
+	case []string:
+		return append([]string(nil), typed...), nil
+	case []any:
+		out := make([]string, 0, len(typed))
+		for i, item := range typed {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("parameter %s[%d] must be a string", key, i)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("parameter %s must be a string or array of strings", key)
+	}
+}
+
+func optionalGrepOutputModeArg(req mcpsdk.CallToolRequest, key string) (ssh.GrepOutputMode, error) {
+	mode := optionalString(req, key)
+	switch ssh.GrepOutputMode(mode) {
+	case "":
+		return "", nil
+	case ssh.GrepOutputModeContent, ssh.GrepOutputModeFilesWithMatches, ssh.GrepOutputModeCount:
+		return ssh.GrepOutputMode(mode), nil
+	default:
+		return "", fmt.Errorf("parameter %s must be one of: %s, %s, %s", key, ssh.GrepOutputModeContent, ssh.GrepOutputModeFilesWithMatches, ssh.GrepOutputModeCount)
+	}
+}
+
+func intSliceArg(key string, value any) ([]int, error) {
+	switch typed := value.(type) {
+	case []int:
+		return append([]int(nil), typed...), nil
+	case []any:
+		out := make([]int, 0, len(typed))
+		for i, item := range typed {
+			n, ok := toInt(item)
+			if !ok {
+				return nil, fmt.Errorf("parameter %s[%d] must be an integer", key, i)
+			}
+			out = append(out, n)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("parameter %s must be an array of integers", key)
+	}
+}
+
 func toInt(v any) (int, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -969,6 +1395,80 @@ func toolSuccess(text string) *mcpsdk.CallToolResult {
 				Text: text,
 			},
 		},
+	}
+}
+
+func toolStructuredSuccess(text string, structured any, extra ...mcpsdk.Content) *mcpsdk.CallToolResult {
+	content := make([]mcpsdk.Content, 0, 1+len(extra))
+	content = append(content, mcpsdk.TextContent{
+		Type: "text",
+		Text: text,
+	})
+	content = append(content, extra...)
+	return &mcpsdk.CallToolResult{
+		Content:           content,
+		StructuredContent: structured,
+	}
+}
+
+func viewToolSuccess(path string, result ssh.ViewResult) *mcpsdk.CallToolResult {
+	content := []mcpsdk.Content{
+		mcpsdk.TextContent{
+			Type: "text",
+			Text: viewResultText(path, result),
+		},
+	}
+	structured := result
+	if result.Kind == ssh.ViewKindImage {
+		structured.Base64Data = ""
+		if result.Base64Data != "" && result.MimeType != "" {
+			content = append(content, mcpsdk.ImageContent{
+				Type:     "image",
+				Data:     result.Base64Data,
+				MIMEType: result.MimeType,
+			})
+		}
+	}
+	return &mcpsdk.CallToolResult{
+		Content:           content,
+		StructuredContent: structured,
+	}
+}
+
+func viewResultText(path string, result ssh.ViewResult) string {
+	if result.Content != "" {
+		return result.Content
+	}
+	switch result.Kind {
+	case ssh.ViewKindDirectory:
+		if len(result.Entries) == 0 {
+			return ""
+		}
+		return strings.Join(result.Entries, "\n")
+	case ssh.ViewKindImage:
+		if result.MimeType != "" {
+			return fmt.Sprintf("%s (%s)", path, result.MimeType)
+		}
+		return path
+	default:
+		if result.Content == "" && result.MimeType != "" && (result.Truncated || result.Base64Data != "") {
+			return fmt.Sprintf("%s (%s)", path, result.MimeType)
+		}
+		return result.Content
+	}
+}
+
+func applyPatchResultText(result ssh.ApplyPatchResult) string {
+	if strings.TrimSpace(result.Output) != "" {
+		return result.Output
+	}
+	switch result.FilesChanged {
+	case 1:
+		return "Applied patch to 1 file."
+	case 0:
+		return "Patch applied."
+	default:
+		return fmt.Sprintf("Applied patch to %d files.", result.FilesChanged)
 	}
 }
 

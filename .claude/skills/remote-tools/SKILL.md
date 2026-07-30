@@ -10,13 +10,13 @@ description: >-
 
 # Remote Codespace Tools Reference
 
-This project provides remote tools that execute on a GitHub Codespace via SSH. By default they are supplied by MCP; with `--extension-tools` they are supplied by a generated Copilot extension. In both modes, these tools replace the built-in local tools for source-code and shell operations.
+This project provides remote tools that execute on a GitHub Codespace via SSH. They are supplied by the stable user-scoped Copilot extension and shared extension host. Copilot stays in the current local checkout for context, while repository reads, edits, patches, searches, and commands go through the `remote_*` tools.
 
 ## Tool Routing — When to Use What
 
 | Task | Tool to use | Why |
 |------|------------|-----|
-| View/edit/create **source code** | `remote_view`, `remote_edit`, `remote_create` | Source code lives on the codespace |
+| View/edit/create/patch **source code** | `remote_view`, `remote_edit`, `remote_create`, `remote_apply_patch` | Source code lives on the codespace |
 | Run **shell commands** (build, test, lint) | `remote_bash` | Commands must execute where the code is |
 | **Search** code (grep, find files) | `remote_grep`, `remote_glob` | Files are on the codespace |
 | Copy files between local and remote | `remote_copy` | Explicit one-time transfer between local cwd and a codespace workdir |
@@ -29,11 +29,12 @@ This project provides remote tools that execute on a GitHub Codespace via SSH. B
 
 ### `remote_view`
 
-View a file or directory on the codespace. Returns file contents with line numbers.
+View a file or directory on the codespace. Mirrors the local `view` surface with line-number ranges, large-file overrides, directory listings, image payloads, and binary metadata.
 
 **Parameters:**
-- `path` (required) — Absolute path on the codespace
+- `path` (required) — Path on the codespace
 - `view_range` (optional) — `[start_line, end_line]` to view a range. Use `-1` for end_line to read to EOF.
+- `forceReadLargeFiles` (optional) — bypasses the 20 KB safeguard for large text files and image payloads.
 
 **Example:** View lines 10-20 of a file:
 ```
@@ -58,6 +59,16 @@ Create a new file on the codespace. Parent directories are created automatically
 **Parameters:**
 - `path` (required) — Path for the new file
 - `file_text` (required) — Content of the file
+
+`remote_create` refuses to overwrite an existing file.
+
+### `remote_apply_patch`
+
+Apply the canonical `apply_patch` payload on the codespace.
+
+**Parameters:**
+- `patch` (required) — The canonical patch text beginning with `*** Begin Patch` and ending with `*** End Patch`
+- `cwd` (optional) — Working directory for relative patch paths
 
 ### `remote_copy`
 
@@ -142,20 +153,25 @@ List all active `remote_bash` sessions on the codespace.
 
 ### `remote_grep`
 
-Search for a regex pattern in files on the codespace. Uses `ripgrep` if available, falls back to `grep`.
+Search for a regex pattern in files on the codespace. Mirrors the local `rg` surface. Uses `ripgrep` when available and falls back without losing structured path/type filtering.
 
 **Parameters:**
 - `pattern` (required) — Regex pattern to search for
-- `path` (optional) — Directory or file to search in (defaults to workspace root)
+- `path` (optional) — Legacy single directory or file to search in
+- `paths` (optional) — One path or multiple paths to search in
+- `output_mode` (optional) — `content`, `files_with_matches`, or `count`
 - `glob` (optional) — Glob pattern to filter files (e.g., `"*.go"`, `"*.ts"`)
+- `type` (optional) — File type filter (for example `go`, `ts`, `tsx`, `js`, `jsx`)
+- `-i`, `-A`, `-B`, `-C`, `-n`, `head_limit`, `multiline` — the same options exposed by the local `rg` tool
 
 ### `remote_glob`
 
-Find files matching a glob pattern on the codespace. Uses `fd` if available, falls back to `find`.
+Find files matching a glob pattern on the codespace. Mirrors the local `glob` tool with `path`/`paths` selection. Uses `fd` if available and falls back to the built-in walker.
 
 **Parameters:**
 - `pattern` (required) — Glob pattern (e.g., `"**/*.go"`, `"src/**/*.test.js"`)
-- `path` (optional) — Directory to search in (defaults to workspace root)
+- `path` (optional) — Legacy single directory to search in
+- `paths` (optional) — One directory or multiple directories to search in
 
 ## Navigation
 

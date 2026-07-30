@@ -1,9 +1,12 @@
 package daemonclient
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,9 +17,43 @@ import (
 
 	"github.com/ekroon/gh-copilot-codespace/internal/daemonproto"
 	"github.com/ekroon/gh-copilot-codespace/internal/daemontransport"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
 
 var daemonBinary string
+
+type pipeTransport struct {
+	stream io.ReadWriteCloser
+}
+
+type closeSignalConn struct {
+	net.Conn
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newCloseSignalConn(conn net.Conn) *closeSignalConn {
+	return &closeSignalConn{Conn: conn, closed: make(chan struct{})}
+}
+
+func (c *closeSignalConn) Close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		err = c.Conn.Close()
+		close(c.closed)
+	})
+	return err
+}
+
+func (t *pipeTransport) Name() string { return "pipe" }
+
+func (t *pipeTransport) Deploy(context.Context) (string, error) { return "daemon", nil }
+
+func (t *pipeTransport) Spawn(context.Context, string) (io.ReadWriteCloser, error) {
+	return t.stream, nil
+}
+
+func (t *pipeTransport) Close() error { return nil }
 
 func TestMain(m *testing.M) {
 	wd, err := os.Getwd()
@@ -77,6 +114,16 @@ func testContext(t *testing.T) context.Context {
 	return ctx
 }
 
+func waitForWriterIdle(t *testing.T, e *Executor) {
+	t.Helper()
+	select {
+	case <-e.writeMu:
+		e.writeMu <- struct{}{}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for daemon writer to become idle")
+	}
+}
+
 func TestExecutorPing(t *testing.T) {
 	e := dialDaemon(t)
 	result, err := e.Ping(testContext(t))
@@ -88,6 +135,307 @@ func TestExecutorPing(t *testing.T) {
 	}
 	if result.PID == 0 {
 		t.Fatal("PingResult.PID = 0, want non-zero")
+	}
+}
+
+func TestExecutorRejectsPreCanceledRequestBeforeWrite(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		enc := daemonproto.NewEncoder(server)
+		if err := enc.Write(daemonproto.NewHello(daemonproto.ProtocolVersion, daemonproto.AllVerbs())); err != nil {
+			serverErr <- err
+			return
+		}
+		if err := server.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+			serverErr <- err
+			return
+		}
+		_, err := daemonproto.NewDecoder(server).Read()
+		if err == nil {
+			serverErr <- errors.New("received request for pre-canceled context")
+			return
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			serverErr <- fmt.Errorf("read error = %v, want timeout", err)
+			return
+		}
+		serverErr <- nil
+	}()
+
+	e, err := Dial(context.Background(), &pipeTransport{stream: client})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer e.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.Ping(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Ping() error = %v, want context.Canceled", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecutorBlockedWriteHonorsDeadlineAndKeepsStreamUsable(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		enc := daemonproto.NewEncoder(server)
+		if err := enc.Write(daemonproto.NewHello(daemonproto.ProtocolVersion, daemonproto.AllVerbs())); err != nil {
+			serverErr <- err
+			return
+		}
+
+		time.Sleep(600 * time.Millisecond)
+		frame, err := daemonproto.NewDecoder(server).Read()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if frame.ID != 2 || frame.Verb != daemonproto.VerbPing {
+			serverErr <- fmt.Errorf("first transmitted request = id %d verb %q, want id 2 ping", frame.ID, frame.Verb)
+			return
+		}
+		response, err := daemonproto.NewResponse(frame.ID, daemonproto.PingResult{Pong: true})
+		if err == nil {
+			err = enc.Write(response)
+		}
+		serverErr <- err
+	}()
+
+	e, err := Dial(context.Background(), &pipeTransport{stream: client})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer e.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	started := time.Now()
+	_, err = e.Ping(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked Ping() error = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 400*time.Millisecond {
+		t.Fatalf("blocked Ping() took %v, want prompt cancellation", elapsed)
+	}
+
+	result, err := e.Ping(context.Background())
+	if err != nil {
+		t.Fatalf("second Ping() error = %v", err)
+	}
+	if !result.Pong {
+		t.Fatal("second Ping().Pong = false, want true")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecutorContextCancelWritesCancelFrame(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	requestRead := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		enc := daemonproto.NewEncoder(server)
+		if err := enc.Write(daemonproto.NewHello(daemonproto.ProtocolVersion, daemonproto.AllVerbs())); err != nil {
+			serverErr <- err
+			return
+		}
+		dec := daemonproto.NewDecoder(server)
+		request, err := dec.Read()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		close(requestRead)
+		cancel, err := dec.Read()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if cancel.Type != daemonproto.TypeCancel || cancel.ID != request.ID {
+			serverErr <- fmt.Errorf("cancel frame = type %q id %d, want cancel id %d", cancel.Type, cancel.ID, request.ID)
+			return
+		}
+		serverErr <- enc.Write(daemonproto.NewErrorResponse(request.ID, daemonproto.ErrCodeCanceled, "canceled"))
+	}()
+
+	e, err := Dial(context.Background(), &pipeTransport{stream: client})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer e.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	callErr := make(chan error, 1)
+	go func() {
+		_, err := e.Ping(ctx)
+		callErr <- err
+	}()
+
+	<-requestRead
+	waitForWriterIdle(t, e)
+	cancel()
+	if err := <-callErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Ping() error = %v, want context.Canceled", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecutorContextCancelClosesStreamWhenCancelWriteIsBlocked(t *testing.T) {
+	client, server := net.Pipe()
+	signaledClient := newCloseSignalConn(client)
+	defer server.Close()
+
+	requestRead := make(chan struct{})
+	pendingRequestRead := make(chan struct{})
+	blockedWriterObserved := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		enc := daemonproto.NewEncoder(server)
+		if err := enc.Write(daemonproto.NewHello(daemonproto.ProtocolVersion, daemonproto.AllVerbs())); err != nil {
+			serverErr <- err
+			return
+		}
+		request, err := daemonproto.NewDecoder(server).Read()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if request.Type != daemonproto.TypeRequest || request.Verb != daemonproto.VerbPing {
+			serverErr <- fmt.Errorf("request = type %q verb %q, want ping request", request.Type, request.Verb)
+			return
+		}
+		close(requestRead)
+		pendingRequest, err := daemonproto.NewDecoder(server).Read()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if pendingRequest.Type != daemonproto.TypeRequest || pendingRequest.Verb != daemonproto.VerbPing {
+			serverErr <- fmt.Errorf("pending request = type %q verb %q, want ping request", pendingRequest.Type, pendingRequest.Verb)
+			return
+		}
+		close(pendingRequestRead)
+
+		var firstByte [1]byte
+		if _, err := io.ReadFull(server, firstByte[:]); err != nil {
+			serverErr <- err
+			return
+		}
+		close(blockedWriterObserved)
+
+		select {
+		case <-signaledClient.closed:
+		case <-time.After(2 * time.Second):
+			serverErr <- errors.New("client stream was not closed after blocked cancel write")
+			return
+		}
+		if _, err := server.Read(firstByte[:]); !errors.Is(err, io.EOF) {
+			serverErr <- fmt.Errorf("read after client close = %v, want EOF", err)
+			return
+		}
+		serverErr <- nil
+	}()
+
+	e, err := Dial(context.Background(), &pipeTransport{stream: signaledClient})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer e.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	targetErr := make(chan error, 1)
+	go func() {
+		_, err := e.Ping(ctx)
+		targetErr <- err
+	}()
+	<-requestRead
+
+	pendingErr := make(chan error, 1)
+	go func() {
+		_, err := e.Ping(context.Background())
+		pendingErr <- err
+	}()
+	<-pendingRequestRead
+
+	blockedErr := make(chan error, 1)
+	go func() {
+		_, err := e.call(context.Background(), daemonproto.VerbPing, map[string]string{
+			"payload": strings.Repeat("x", 1<<20),
+		})
+		blockedErr <- err
+	}()
+	<-blockedWriterObserved
+
+	cancel()
+	if err := <-targetErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Ping() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-signaledClient.closed:
+	case <-time.After(time.Second):
+		_ = signaledClient.Close()
+		<-blockedErr
+		<-serverErr
+		t.Fatal("client stream remained open after blocked cancel write")
+	}
+	if err := <-blockedErr; err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked writer error = %v, want explicit stream write error", err)
+	}
+	if err := <-pendingErr; err == nil || !strings.Contains(err.Error(), "deliver cancel") {
+		t.Fatalf("pending Ping() error = %v, want explicit cancel delivery failure", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDialRejectsMissingFilesystemCapabilities(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	go func() {
+		verbs := daemonproto.AllVerbs()
+		for index, verb := range verbs {
+			if verb == daemonproto.VerbReadFile {
+				verbs = append(verbs[:index], verbs[index+1:]...)
+				break
+			}
+		}
+		_ = daemonproto.NewEncoder(server).Write(daemonproto.NewHello(daemonproto.ProtocolVersion, verbs))
+	}()
+
+	_, err := Dial(context.Background(), &pipeTransport{stream: client})
+	if err == nil || !strings.Contains(err.Error(), string(daemonproto.VerbReadFile)) {
+		t.Fatalf("Dial() error = %v, want missing read_file capability", err)
+	}
+}
+
+func TestDialRejectsLegacyProtocolVersion(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	go func() {
+		_ = daemonproto.NewEncoder(server).Write(daemonproto.NewHello("1", daemonproto.AllVerbs()))
+	}()
+
+	_, err := Dial(context.Background(), &pipeTransport{stream: client})
+	if err == nil || !strings.Contains(err.Error(), `unsupported daemon protocol version "1"`) {
+		t.Fatalf("Dial() error = %v, want legacy version rejection", err)
 	}
 }
 
@@ -124,6 +472,177 @@ func TestExecutorCreateThenEdit(t *testing.T) {
 	}
 	if string(content) != "hello daemon\n" {
 		t.Fatalf("file content = %q, want %q", string(content), "hello daemon\n")
+	}
+}
+
+func TestExecutorWriteFileBinaryOverwriteAndPermissions(t *testing.T) {
+	e := dialDaemon(t)
+	dir := testDir(t)
+	path := filepath.Join(dir, "blob.bin")
+	ctx := testContext(t)
+	first := []byte{0x00, 0xff, 'a'}
+
+	if err := e.WriteFile(ctx, path, first, false); err != nil {
+		t.Fatalf("WriteFile(new): %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(new): %v", err)
+	}
+	if !bytes.Equal(got, first) {
+		t.Fatalf("new bytes = %v, want %v", got, first)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(new): %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("new mode = %v, want 0644", got)
+	}
+
+	second := []byte{'n', 0x00, 0xfe, 'w'}
+	if err := e.WriteFile(ctx, path, second, false); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("WriteFile(refuse) error = %v, want already exists", err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(refused): %v", err)
+	}
+	if !bytes.Equal(got, first) {
+		t.Fatalf("refused bytes = %v, want unchanged %v", got, first)
+	}
+
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	if err := e.WriteFile(ctx, path, second, true); err != nil {
+		t.Fatalf("WriteFile(overwrite): %v", err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(overwrite): %v", err)
+	}
+	if !bytes.Equal(got, second) {
+		t.Fatalf("overwrite bytes = %v, want %v", got, second)
+	}
+	info, err = os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(overwrite): %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("overwrite mode = %v, want 0600", got)
+	}
+}
+
+func TestExecutorWriteFileRejectsSymlinkOverwrite(t *testing.T) {
+	e := dialDaemon(t)
+	dir := testDir(t)
+	target := filepath.Join(dir, "target.bin")
+	link := filepath.Join(dir, "link.bin")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile(target): %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	err := e.WriteFile(testContext(t), link, []byte("replace"), true)
+	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("WriteFile(symlink) error = %v, want symbolic link rejection", err)
+	}
+	got, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatalf("ReadFile(target): %v", readErr)
+	}
+	if string(got) != "keep" {
+		t.Fatalf("target = %q, want unchanged", got)
+	}
+}
+
+func TestExecutorWriteFileRejectsParentSymlinkEscape(t *testing.T) {
+	e := dialDaemon(t)
+	root := testDir(t)
+	outside := testDir(t)
+	e.SetWorkdir(root)
+	if err := os.Symlink(outside, filepath.Join(root, "outside")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	err := e.WriteFile(testContext(t), "outside/escaped.bin", []byte("escape"), true)
+	if err == nil || !strings.Contains(err.Error(), "escapes workdir") {
+		t.Fatalf("WriteFile(parent symlink) error = %v, want workdir escape rejection", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(outside, "escaped.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("escaped destination exists or Lstat failed: %v", statErr)
+	}
+}
+
+func TestExecutorRootedCopyIgnoresMutableWorkdirAndProtectsRoot(t *testing.T) {
+	e := dialDaemon(t)
+	root := testDir(t)
+	nested := filepath.Join(root, "internal", "mcp")
+	outside := testDir(t)
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("MkdirAll(nested): %v", err)
+	}
+	e.SetWorkdir(nested)
+
+	path := filepath.Join(root, "root.bin")
+	first := []byte{0x00, 0xff, 'a'}
+	if err := e.WriteFileRooted(testContext(t), ssh.RootedWriteRequest{
+		Path: path,
+		Root: root,
+		Data: first,
+	}); err != nil {
+		t.Fatalf("WriteFileRooted(new): %v", err)
+	}
+	second := []byte{'n', 0x00, 0xfe, 'w'}
+	if err := e.WriteFileRooted(testContext(t), ssh.RootedWriteRequest{
+		Path:      path,
+		Root:      root,
+		Data:      second,
+		Overwrite: true,
+	}); err != nil {
+		t.Fatalf("WriteFileRooted(overwrite): %v", err)
+	}
+	got, err := e.ReadFileRooted(testContext(t), ssh.RootedReadRequest{Path: path, Root: root})
+	if err != nil {
+		t.Fatalf("ReadFileRooted: %v", err)
+	}
+	if !bytes.Equal(got, second) {
+		t.Fatalf("root bytes = %v, want %v", got, second)
+	}
+
+	outsidePath := filepath.Join(outside, "escaped.bin")
+	err = e.WriteFileRooted(testContext(t), ssh.RootedWriteRequest{
+		Path:      outsidePath,
+		Root:      root,
+		Data:      []byte("escape"),
+		Overwrite: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "escapes workdir") {
+		t.Fatalf("WriteFileRooted(outside) error = %v, want root escape rejection", err)
+	}
+	if _, err := e.ReadFileRooted(testContext(t), ssh.RootedReadRequest{Path: outsidePath, Root: root}); err == nil || !strings.Contains(err.Error(), "escapes workdir") {
+		t.Fatalf("ReadFileRooted(outside) error = %v, want root escape rejection", err)
+	}
+
+	target := filepath.Join(root, "target.bin")
+	link := filepath.Join(root, "link.bin")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile(target): %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	err = e.WriteFileRooted(testContext(t), ssh.RootedWriteRequest{
+		Path:      link,
+		Root:      root,
+		Data:      []byte("replace"),
+		Overwrite: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("WriteFileRooted(symlink) error = %v, want symlink rejection", err)
 	}
 }
 

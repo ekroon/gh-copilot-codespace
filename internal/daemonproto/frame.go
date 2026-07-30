@@ -34,9 +34,9 @@
 //
 // # Mutation safety
 //
-// Mutating verbs (create_file, edit_file, write_session, stop_session,
-// run_bash, start_session) accept an optional caller-generated
-// IdempotencyKey. v1 of the protocol reserves the field but neither the
+// Mutating verbs (create_file, write_file, edit_file, apply_patch, write_session,
+// stop_session, run_bash, start_session) accept an optional caller-generated
+// IdempotencyKey. v2 of the protocol reserves the field but neither the
 // client nor the daemon dedupes on it — the client does not auto-retry
 // mutating requests on transport failure, so accidental double-execution does
 // not happen. Servers MAY choose to implement an LRU dedup cache in a later
@@ -53,13 +53,23 @@ package daemonproto
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
 // ProtocolVersion is the current daemonproto version. The server sends it in
 // the TypeHello frame on connect; clients refuse to proceed if the version is
-// not recognized. v1 is the only supported version.
-const ProtocolVersion = "1"
+// not recognized. v2 establishes the safe rooted-filesystem and bounded file
+// transfer contract; clients must fall back rather than use older daemons.
+const ProtocolVersion = "2"
+
+const (
+	// MaxFileTransferBytes bounds raw file-copy payloads before JSON/base64
+	// amplification. View and command-output frames have separate limits.
+	MaxFileTransferBytes = 16 * 1024 * 1024
+)
+
+var ErrFileTransferTooLarge = errors.New("daemonproto: file transfer exceeds safe maximum")
 
 // Frame type discriminators.
 const (
@@ -76,11 +86,14 @@ type Verb string
 
 const (
 	VerbViewFile     Verb = "view_file"
+	VerbReadFile     Verb = "read_file"
 	VerbEditFile     Verb = "edit_file"
 	VerbCreateFile   Verb = "create_file"
+	VerbWriteFile    Verb = "write_file"
 	VerbRunBash      Verb = "run_bash"
 	VerbGrep         Verb = "grep"
 	VerbGlob         Verb = "glob"
+	VerbApplyPatch   Verb = "apply_patch"
 	VerbStartSession Verb = "start_session"
 	VerbWriteSession Verb = "write_session"
 	VerbReadSession  Verb = "read_session"
@@ -89,17 +102,19 @@ const (
 	VerbPing         Verb = "ping"
 )
 
-// AllVerbs returns every verb supported by v1 of the protocol. Used by the
-// daemon to populate the TypeHello frame so clients can verify expected verbs
-// are available without trial-and-error.
+// AllVerbs returns every verb implemented by the current daemon and
+// advertised in the TypeHello handshake.
 func AllVerbs() []Verb {
 	return []Verb{
 		VerbViewFile,
+		VerbReadFile,
 		VerbEditFile,
 		VerbCreateFile,
+		VerbWriteFile,
 		VerbRunBash,
 		VerbGrep,
 		VerbGlob,
+		VerbApplyPatch,
 		VerbStartSession,
 		VerbWriteSession,
 		VerbReadSession,
@@ -109,13 +124,48 @@ func AllVerbs() []Verb {
 	}
 }
 
+// AllDefinedVerbs returns every currently defined protocol verb, including
+// additive verbs that may not yet be advertised by a specific daemon build.
+func AllDefinedVerbs() []Verb {
+	return []Verb{
+		VerbViewFile,
+		VerbReadFile,
+		VerbEditFile,
+		VerbCreateFile,
+		VerbWriteFile,
+		VerbRunBash,
+		VerbGrep,
+		VerbGlob,
+		VerbApplyPatch,
+		VerbStartSession,
+		VerbWriteSession,
+		VerbReadSession,
+		VerbStopSession,
+		VerbListSessions,
+		VerbPing,
+	}
+}
+
+// FilesystemVerbs returns the filesystem/search protocol verbs shared between
+// local tools and remote codespace tools.
+func FilesystemVerbs() []Verb {
+	return []Verb{
+		VerbViewFile,
+		VerbReadFile,
+		VerbWriteFile,
+		VerbGrep,
+		VerbGlob,
+		VerbApplyPatch,
+	}
+}
+
 // IsMutating reports whether a verb has side effects on the sandbox. Callers
-// SHOULD attach an IdempotencyKey to mutating verbs even though v1 of the
+// SHOULD attach an IdempotencyKey to mutating verbs even though v2 of the
 // daemon does not yet enforce dedup; this leaves room for future safe
 // retry-on-reconnect without changing the wire.
 func (v Verb) IsMutating() bool {
 	switch v {
-	case VerbEditFile, VerbCreateFile, VerbWriteSession, VerbStopSession, VerbRunBash, VerbStartSession:
+	case VerbEditFile, VerbCreateFile, VerbWriteFile, VerbApplyPatch, VerbWriteSession, VerbStopSession, VerbRunBash, VerbStartSession:
 		return true
 	default:
 		return false

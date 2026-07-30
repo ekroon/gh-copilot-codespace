@@ -99,7 +99,8 @@ func buildZeroPreamble(ctx PreambleContext) string {
 	}
 
 	sb.WriteString("- After at least one codespace is connected, use `list_codespaces` to confirm aliases, then use the `remote_*` tools for source-code work.\n")
-	sb.WriteString("- After connecting, route source reads, edits, searches, builds, tests, linters, dependency operations, repository scripts, and git commands through the appropriate `remote_*` tools.\n")
+	sb.WriteString("- After connecting, route source reads, edits, creates, patches, and searches through `remote_view`, `remote_edit`, `remote_create`, `remote_apply_patch`, `remote_grep`, and `remote_glob`.\n")
+	sb.WriteString("- Route builds, tests, linters, dependency operations, repository scripts, and git commands through `remote_bash`.\n")
 	sb.WriteString("- Reserve built-in local tools for local project instructions and agents, Copilot session artifacts, and explicit local-only work.\n")
 	sb.WriteString("- Do not make placeholder, empty, or no-op tool calls. Only call tools with the real arguments needed for the task.\n")
 	sb.WriteString("- Use `remote_copy` only for an explicit one-time transfer after connecting; it is not synchronization.\n\n")
@@ -116,7 +117,7 @@ func writeRemoteRoutingGuidance(sb *strings.Builder) {
 }
 
 func writeRemoteRoutingItems(sb *strings.Builder) {
-	sb.WriteString("- **Repository source reads, edits, creates, and searches**: use `remote_view`, `remote_edit`, `remote_create`, `remote_grep`, and `remote_glob`.\n")
+	sb.WriteString("- **Repository source reads, edits, creates, patches, and searches**: use `remote_view`, `remote_edit`, `remote_create`, `remote_apply_patch`, `remote_grep`, and `remote_glob`.\n")
 	sb.WriteString("- **Repository commands**: use `remote_bash` for builds, tests, linters, dependency installs or updates, repository scripts, and git commands.\n")
 	sb.WriteString("- For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when execution must be targeted or parallel-safe; `remote_cd` only changes the default for later sequential calls.\n")
 	sb.WriteString("- Reserve built-in local tools for local project instructions and agents, Copilot session artifacts, and explicit local-only work.\n")

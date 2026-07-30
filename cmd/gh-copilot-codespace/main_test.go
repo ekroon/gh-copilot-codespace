@@ -331,6 +331,11 @@ func TestExtensionSourceIncludesHostBridgeAndTokenGate(t *testing.T) {
 		codespaceExtensionTokenEnv,
 		codespaceExtensionManifestEnv,
 		`manifest?.token !== token`,
+		`function isMcpCallToolResult`,
+		`function convertMcpCallToolResult`,
+		`binaryResultsForLlm`,
+		`case "image":`,
+		`return convertMcpCallToolResult(result);`,
 		`list_tools`,
 		`call_tool`,
 		`resultType: "failure"`,
@@ -487,6 +492,17 @@ func TestRunExtensionHostIOListAndCall(t *testing.T) {
 	if !ok || len(defs) == 0 {
 		t.Fatalf("bootstrap tools = %#v, want non-empty definitions", payload["tools"])
 	}
+	haveRemoteApplyPatch := false
+	for _, def := range defs {
+		tool, _ := def.(map[string]any)
+		if tool["name"] == "remote_apply_patch" {
+			haveRemoteApplyPatch = true
+			break
+		}
+	}
+	if !haveRemoteApplyPatch {
+		t.Fatalf("bootstrap tools missing remote_apply_patch: %#v", defs)
+	}
 	sysMsg, ok := payload["systemMessage"].(map[string]any)
 	if !ok {
 		t.Fatalf("bootstrap systemMessage = %#v, want object", payload["systemMessage"])
@@ -528,7 +544,7 @@ func TestRunExtensionHostIOListAndCall(t *testing.T) {
 }
 
 func TestRunExtensionHostIOAdvertisesRemoteExplorerWhenCodespaceConnected(t *testing.T) {
-	t.Setenv("CODESPACE_REGISTRY", `[{"alias":"github","name":"cs-abc","workdir":"/workspaces/github","execAgent":"/tmp/agent"}]`)
+	t.Setenv("CODESPACE_REGISTRY", `[{"alias":"github","name":"cs-abc","workdir":"/workspaces/github"}]`)
 	t.Setenv(codespaceLifecycleConfigEnv, "")
 	t.Setenv(codespaceLocalWorkdirEnv, "")
 	t.Setenv(codespaceExtensionModeEnv, "mirror")
@@ -562,23 +578,20 @@ func TestRunExtensionHostIOAdvertisesRemoteExplorerWhenCodespaceConnected(t *tes
 	if prompt, _ := agent["prompt"].(string); !strings.Contains(prompt, "remote_grep") {
 		t.Fatalf("custom agent prompt missing remote_grep guidance: %q", prompt)
 	}
-	tools, _ := agent["tools"].([]any)
-	if len(tools) == 0 {
+	toolsAny, _ := agent["tools"].([]any)
+	if len(toolsAny) == 0 {
 		t.Fatalf("custom agent tools empty, want allow-list")
 	}
-	// Ensure the allow-list uses bare names (no `codespace/` MCP prefix).
-	seenRemoteView := false
-	for _, tname := range tools {
+	var tools []string
+	for _, tname := range toolsAny {
 		s, _ := tname.(string)
 		if strings.HasPrefix(s, "codespace/") {
 			t.Fatalf("custom agent tool %q uses MCP namespace; expected bare extension tool name", s)
 		}
-		if s == "remote_view" {
-			seenRemoteView = true
-		}
+		tools = append(tools, s)
 	}
-	if !seenRemoteView {
-		t.Fatalf("custom agent tools = %v, want to include remote_view", tools)
+	if !reflect.DeepEqual(tools, remoteExplorerReadOnlyExtensionTools) {
+		t.Fatalf("custom agent tools = %v, want %v", tools, remoteExplorerReadOnlyExtensionTools)
 	}
 }
 

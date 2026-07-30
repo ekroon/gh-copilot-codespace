@@ -120,6 +120,12 @@ func TestHelloRoundTrip(t *testing.T) {
 	}
 }
 
+func TestProtocolVersionIncludesFilesystemSafetyContract(t *testing.T) {
+	if ProtocolVersion != "2" {
+		t.Fatalf("ProtocolVersion = %q, want 2", ProtocolVersion)
+	}
+}
+
 func TestDecodeEOFUnwrapped(t *testing.T) {
 	_, err := NewDecoder(strings.NewReader("")).Read()
 	if !errors.Is(err, io.EOF) {
@@ -191,8 +197,8 @@ func TestAllVerbsContainsEveryDefinedVerb(t *testing.T) {
 		seen[v] = true
 	}
 	for _, want := range []Verb{
-		VerbViewFile, VerbEditFile, VerbCreateFile, VerbRunBash, VerbGrep,
-		VerbGlob, VerbStartSession, VerbWriteSession, VerbReadSession,
+		VerbViewFile, VerbReadFile, VerbEditFile, VerbCreateFile, VerbWriteFile, VerbRunBash, VerbGrep,
+		VerbGlob, VerbApplyPatch, VerbStartSession, VerbWriteSession, VerbReadSession,
 		VerbStopSession, VerbListSessions, VerbPing,
 	} {
 		if !seen[want] {

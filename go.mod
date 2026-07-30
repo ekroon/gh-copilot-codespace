@@ -2,7 +2,10 @@ module github.com/ekroon/gh-copilot-codespace
 
 go 1.25.0
 
-require github.com/mark3labs/mcp-go v0.44.1
+require (
+	github.com/mark3labs/mcp-go v0.44.1
+	golang.org/x/sys v0.35.0
+)
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect

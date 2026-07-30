@@ -142,6 +142,10 @@ func (m *daemonWireMockExecutor) CreateFile(context.Context, string, string) err
 	return nil
 }
 
+func (m *daemonWireMockExecutor) WriteFile(context.Context, string, []byte, bool) error {
+	return nil
+}
+
 func (m *daemonWireMockExecutor) RunBash(context.Context, string, string) (string, string, int, error) {
 	return "", "", 0, nil
 }

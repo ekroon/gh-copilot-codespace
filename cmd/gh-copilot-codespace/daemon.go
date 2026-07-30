@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -199,11 +198,21 @@ func dispatchDaemonRequest(ctx context.Context, frame daemonproto.Frame, started
 		if err := decodeDaemonParams(frame, &params); err != nil {
 			return nil, daemonBadRequest(frame.Verb, err)
 		}
-		content, err := daemonViewFile(ctx, params.Path, params.ViewRange)
+		result, err := daemonView(ctx, params)
 		if err != nil {
 			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
 		}
-		return daemonproto.ViewFileResult{Content: content}, nil
+		return result, nil
+	case daemonproto.VerbReadFile:
+		var params daemonproto.ReadFileParams
+		if err := decodeDaemonParams(frame, &params); err != nil {
+			return nil, daemonBadRequest(frame.Verb, err)
+		}
+		data, err := daemonReadFile(ctx, params.Path, params.Root)
+		if err != nil {
+			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
+		}
+		return daemonproto.ReadFileResult{Data: data}, nil
 	case daemonproto.VerbEditFile:
 		var params daemonproto.EditFileParams
 		if err := decodeDaemonParams(frame, &params); err != nil {
@@ -222,6 +231,15 @@ func dispatchDaemonRequest(ctx context.Context, frame daemonproto.Frame, started
 			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
 		}
 		return daemonproto.CreateFileResult{Bytes: len([]byte(params.Content))}, nil
+	case daemonproto.VerbWriteFile:
+		var params daemonproto.WriteFileParams
+		if err := decodeDaemonParams(frame, &params); err != nil {
+			return nil, daemonBadRequest(frame.Verb, err)
+		}
+		if err := daemonWriteFile(ctx, params.Path, params.Data, params.Overwrite, params.Root); err != nil {
+			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
+		}
+		return daemonproto.WriteFileResult{Bytes: len(params.Data)}, nil
 	case daemonproto.VerbRunBash:
 		var params daemonproto.RunBashParams
 		if err := decodeDaemonParams(frame, &params); err != nil {
@@ -237,21 +255,34 @@ func dispatchDaemonRequest(ctx context.Context, frame daemonproto.Frame, started
 		if err := decodeDaemonParams(frame, &params); err != nil {
 			return nil, daemonBadRequest(frame.Verb, err)
 		}
-		output, err := daemonGrep(ctx, params.Pattern, params.Path, params.Glob, params.Cwd)
+		result, err := daemonGrepFiles(ctx, params)
 		if err != nil {
 			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
 		}
-		return daemonproto.GrepResult{Output: output}, nil
+		return result, nil
 	case daemonproto.VerbGlob:
 		var params daemonproto.GlobParams
 		if err := decodeDaemonParams(frame, &params); err != nil {
 			return nil, daemonBadRequest(frame.Verb, err)
 		}
-		output, err := daemonGlob(ctx, params.Pattern, params.Path, params.Cwd)
+		result, err := daemonGlobFiles(ctx, params)
 		if err != nil {
 			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
 		}
-		return daemonproto.GlobResult{Output: output}, nil
+		return result, nil
+	case daemonproto.VerbApplyPatch:
+		var params daemonproto.ApplyPatchParams
+		if err := decodeDaemonParams(frame, &params); err != nil {
+			return nil, daemonBadRequest(frame.Verb, err)
+		}
+		result, err := daemonApplyPatch(ctx, params)
+		if err != nil {
+			if daemonIsBadPatch(err) {
+				return nil, &daemonHandlerError{code: daemonproto.ErrCodeBadRequest, message: err.Error()}
+			}
+			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
+		}
+		return result, nil
 	case daemonproto.VerbStartSession:
 		var params daemonproto.StartSessionParams
 		if err := decodeDaemonParams(frame, &params); err != nil {
@@ -323,45 +354,11 @@ func daemonMapError(defaultCode string, err error) *daemonHandlerError {
 }
 
 func daemonViewFile(ctx context.Context, path string, viewRange []int) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", errDaemonCanceled
-	}
-	file, err := os.Open(path)
+	result, err := daemonView(ctx, daemonproto.ViewFileParams{Path: path, ViewRange: viewRange})
 	if err != nil {
-		return "", fmt.Errorf("view file: %w", err)
+		return "", err
 	}
-
-	reader := bufio.NewReader(file)
-	var out strings.Builder
-	lineNo := 1
-	for {
-		if err := ctx.Err(); err != nil {
-			_ = file.Close()
-			return "", errDaemonCanceled
-		}
-		line, readErr := reader.ReadString('\n')
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			_ = file.Close()
-			return "", fmt.Errorf("view file: %w", readErr)
-		}
-		if line != "" {
-			if daemonLineInRange(lineNo, viewRange) {
-				fmt.Fprintf(&out, "%d. %s\n", lineNo, strings.TrimSuffix(line, "\n"))
-			}
-			lineNo++
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		_ = file.Close()
-		return "", errDaemonCanceled
-	}
-	if err := file.Close(); err != nil {
-		return "", fmt.Errorf("view file: %w", err)
-	}
-	return out.String(), nil
+	return result.Content, nil
 }
 
 func daemonLineInRange(lineNo int, viewRange []int) bool {
@@ -376,12 +373,16 @@ func daemonLineInRange(lineNo int, viewRange []int) bool {
 }
 
 func daemonEditFile(ctx context.Context, path, oldStr, newStr string) error {
+	return daemonEditFileWithHook(ctx, path, oldStr, newStr, nil)
+}
+
+func daemonEditFileWithHook(ctx context.Context, path, oldStr, newStr string, afterStage func() error) error {
 	if err := ctx.Err(); err != nil {
 		return errDaemonCanceled
 	}
-	content, err := os.ReadFile(path)
+	content, state, err := daemonReadPatchFile(ctx, path, true, nil)
 	if err != nil {
-		return fmt.Errorf("edit file (read): %w", err)
+		return fmt.Errorf("edit file: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return errDaemonCanceled
@@ -398,75 +399,37 @@ func daemonEditFile(ctx context.Context, path, oldStr, newStr string) error {
 	if err := ctx.Err(); err != nil {
 		return errDaemonCanceled
 	}
-	if err := os.WriteFile(path, []byte(newContent), 0o666); err != nil {
-		return fmt.Errorf("edit file (write): %w", err)
+	actions := []daemonPatchAction{{
+		kind:          daemonPatchUpdate,
+		sourcePath:    path,
+		targetPath:    path,
+		sourceDisplay: path,
+		targetDisplay: path,
+		sourceState:   state,
+		content:       newContent,
+		mode:          state.info.Mode().Perm(),
+	}}
+	if err := daemonCommitPatchPlanWithHook(ctx, actions, afterStage); err != nil {
+		return fmt.Errorf("edit file: changed during edit: %w", err)
 	}
 	return nil
 }
 
 func daemonCreateFile(ctx context.Context, path, content string, allowOverwrite bool) error {
-	if err := ctx.Err(); err != nil {
-		return errDaemonCanceled
-	}
-	if !allowOverwrite {
-		if _, err := os.Stat(path); err == nil {
-			return fmt.Errorf("create file: %s already exists", path)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("create file: %w", err)
-		}
-	}
-	dir := filepath.Dir(path)
-	if dir == "" {
-		dir = "."
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return errDaemonCanceled
-	}
-
-	tmp, err := createDaemonTempFile(dir, filepath.Base(path))
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.WriteString(content); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("create file: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		_ = tmp.Close()
-		return errDaemonCanceled
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return errDaemonCanceled
-	}
-
+	mode := os.FileMode(0o644)
 	if allowOverwrite {
-		if err := os.Rename(tmpName, path); err != nil {
+		if info, err := os.Stat(path); err == nil {
+			mode = info.Mode().Perm()
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("create file: %w", err)
 		}
-		cleanup = false
-		return nil
 	}
-	if err := os.Link(tmpName, path); err != nil {
-		if errors.Is(err, os.ErrExist) {
+	if err := daemonWriteFileAtomic(ctx, path, []byte(content), mode, allowOverwrite); err != nil {
+		if !allowOverwrite && strings.Contains(err.Error(), "already exists") {
 			return fmt.Errorf("create file: %s already exists", path)
 		}
 		return fmt.Errorf("create file: %w", err)
 	}
-	cleanup = true
 	return nil
 }
 
@@ -547,45 +510,28 @@ func runProcessInDir(ctx context.Context, cwd, name string, args ...string) (std
 }
 
 func daemonGrep(ctx context.Context, pattern, path, globPattern, cwd string) (string, error) {
-	var args []string
-	args = append(args, "rg", "--color=never", "-n")
-	if globPattern != "" {
-		args = append(args, "--glob", shellQuote(globPattern))
-	}
-	args = append(args, shellQuote(pattern))
-	searchPath := path
-	if searchPath == "" {
-		searchPath = "."
-	}
-	args = append(args, shellQuote(searchPath))
-	cmd := strings.Join(args, " ")
-	cmd = fmt.Sprintf("(%s) 2>/dev/null || grep -rn %s %s", cmd, shellQuote(pattern), shellQuote(searchPath))
-	stdout, _, exitCode, err := runProcessInDir(ctx, cwd, "bash", "-c", cmd)
+	result, err := daemonGrepFiles(ctx, daemonproto.GrepParams{
+		Pattern: pattern,
+		Path:    path,
+		Glob:    globPattern,
+		Cwd:     cwd,
+	})
 	if err != nil {
-		return "", fmt.Errorf("grep: %w", err)
+		return "", err
 	}
-	if exitCode > 1 {
-		return "", fmt.Errorf("grep failed with exit code %d", exitCode)
-	}
-	return stdout, nil
+	return result.Output, nil
 }
 
 func daemonGlob(ctx context.Context, pattern, path, cwd string) (string, error) {
-	searchPath := path
-	if searchPath == "" {
-		searchPath = "."
-	}
-	cmd := fmt.Sprintf(
-		"(fd --type f --glob %s --exclude .git %s 2>/dev/null || find %s -name %s -not -path '*/.git/*' 2>/dev/null) | head -200",
-		shellQuote(pattern), shellQuote(searchPath), shellQuote(searchPath), shellQuote(daemonGlobToFindName(pattern)))
-	stdout, _, exitCode, err := runProcessInDir(ctx, cwd, "bash", "-c", cmd)
+	result, err := daemonGlobFiles(ctx, daemonproto.GlobParams{
+		Pattern: pattern,
+		Path:    path,
+		Cwd:     cwd,
+	})
 	if err != nil {
-		return "", fmt.Errorf("glob: %w", err)
+		return "", err
 	}
-	if exitCode > 1 {
-		return "", fmt.Errorf("glob failed with exit code %d", exitCode)
-	}
-	return stdout, nil
+	return result.Output, nil
 }
 
 func daemonGlobToFindName(pattern string) string {

@@ -3,14 +3,16 @@ package mcp
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -298,21 +300,289 @@ func TestRemoteCopy_LocalToCodespace(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", resultText(res))
 	}
-	if mock.lastCreatePath != "/workspaces/repo/copied.txt" {
-		t.Fatalf("create path = %q, want /workspaces/repo/copied.txt", mock.lastCreatePath)
+	if mock.lastRootedWrite.Path != "/workspaces/repo/copied.txt" {
+		t.Fatalf("write path = %q, want /workspaces/repo/copied.txt", mock.lastRootedWrite.Path)
 	}
-	if got := []byte(mock.lastCreateContent); !bytes.Equal(got, content) {
-		t.Fatalf("create content bytes = %v, want %v", got, content)
+	if mock.lastRootedWrite.Root != "/workspaces/repo" {
+		t.Fatalf("write root = %q, want /workspaces/repo", mock.lastRootedWrite.Root)
+	}
+	if !bytes.Equal(mock.lastRootedWrite.Data, content) {
+		t.Fatalf("write content bytes = %v, want %v", mock.lastRootedWrite.Data, content)
+	}
+	if mock.lastRootedWrite.Overwrite {
+		t.Fatal("write overwrite = true, want false")
 	}
 	if !strings.Contains(mock.lastRunBashCommand, "test -e") {
 		t.Fatalf("expected remote existence check, got %q", mock.lastRunBashCommand)
 	}
 }
 
+func TestRemoteCopy_LocalToCodespaceOverwrite(t *testing.T) {
+	localRoot := t.TempDir()
+	content := []byte{0x00, 0xff, 'n', 'e', 'w'}
+	if err := os.WriteFile(filepath.Join(localRoot, "src.bin"), content, 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	mock := &mockExecutor{}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "src.bin",
+		"destination": "cs://github/existing.bin",
+		"overwrite":   true,
+	}))
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	if !bytes.Equal(mock.lastRootedWrite.Data, content) || !mock.lastRootedWrite.Overwrite {
+		t.Fatalf("write = (%v, overwrite=%v), want (%v, true)", mock.lastRootedWrite.Data, mock.lastRootedWrite.Overwrite, content)
+	}
+	if mock.runBashCalls != 0 {
+		t.Fatalf("RunBash calls = %d, want no racy preflight for overwrite", mock.runBashCalls)
+	}
+}
+
+func TestRemoteCopy_LocalToCodespaceRequiresRegularSource(t *testing.T) {
+	localRoot := t.TempDir()
+	target := filepath.Join(localRoot, "target.txt")
+	if err := os.WriteFile(target, []byte("target"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(localRoot, "link.txt")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	fifoAvailable := createLocalCopyFIFO(filepath.Join(localRoot, "pipe")) == nil
+
+	tests := []struct {
+		name       string
+		source     string
+		wantError  string
+		maxElapsed time.Duration
+	}{
+		{name: "directory", source: ".", wantError: "regular file"},
+		{name: "symlink", source: "link.txt", wantError: "symbolic link"},
+		{name: "fifo", source: "pipe", wantError: "regular file", maxElapsed: 500 * time.Millisecond},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "fifo" && !fifoAvailable {
+				t.Skip("FIFO creation is unavailable on this platform")
+			}
+			mock := &mockExecutor{runBashExit: 1}
+			reg := testRegWithExecutor(mock)
+			started := time.Now()
+			res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+				"source":      tt.source,
+				"destination": "cs://test/copied.bin",
+			}))
+			if !res.IsError || !strings.Contains(resultText(res), tt.wantError) {
+				t.Fatalf("result = %q, want error containing %q", resultText(res), tt.wantError)
+			}
+			if tt.maxElapsed > 0 && time.Since(started) >= tt.maxElapsed {
+				t.Fatalf("remote_copy took %v, want non-blocking source rejection", time.Since(started))
+			}
+			if mock.runBashCalls != 0 || mock.rootedWriteCalls != 0 {
+				t.Fatalf("remote calls = existence:%d write:%d, want none", mock.runBashCalls, mock.rootedWriteCalls)
+			}
+		})
+	}
+}
+
+func TestRemoteCopy_LocalToCodespaceRejectsOversizedSourceBeforeReading(t *testing.T) {
+	localRoot := t.TempDir()
+	source := filepath.Join(localRoot, "oversized.bin")
+	file, err := os.Create(source)
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if err := file.Truncate(int64(ssh.MaxFileTransferBytes + 1)); err != nil {
+		file.Close()
+		t.Fatalf("truncate source: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close source: %v", err)
+	}
+
+	mock := &mockExecutor{runBashExit: 1}
+	reg := testRegWithExecutor(mock)
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "oversized.bin",
+		"destination": "cs://test/copied.bin",
+	}))
+	if !res.IsError || !strings.Contains(resultText(res), "exceeds") {
+		t.Fatalf("result = %q, want size-limit error", resultText(res))
+	}
+	if mock.runBashCalls != 0 || mock.rootedWriteCalls != 0 {
+		t.Fatalf("remote calls = existence:%d write:%d, want none", mock.runBashCalls, mock.rootedWriteCalls)
+	}
+}
+
+func TestReadLocalCopySourceRejectsGrowthBeyondLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "growing.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("a"), ssh.MaxFileTransferBytes), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	_, err := readLocalCopySourceWithHooks(context.Background(), path, localCopyReadHooks{
+		afterStat: func() error {
+			file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			_, err = file.Write([]byte("b"))
+			return err
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "grew beyond") {
+		t.Fatalf("readLocalCopySourceWithHooks() error = %v, want growth rejection", err)
+	}
+}
+
+func TestReadLocalCopySourceHonorsCancellationWhileReading(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("a"), 256*1024), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := readLocalCopySourceWithHooks(ctx, path, localCopyReadHooks{
+		reader: func(source io.Reader) io.Reader {
+			return readerFunc(func(p []byte) (int, error) {
+				n, err := source.Read(p)
+				if n > 0 {
+					cancel()
+				}
+				return n, err
+			})
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("readLocalCopySourceWithHooks() error = %v, want cancellation", err)
+	}
+}
+
+func TestRemoteCopy_UsesImmutableCodespaceWorkdirAfterRemoteCD(t *testing.T) {
+	localRoot := t.TempDir()
+	upload := []byte{0x00, 0xff, 'u', 'p'}
+	overwrite := []byte{'n', 0x00, 0xfe, 'w'}
+	download := []byte{0xff, 0x00, 'd', 'o', 'w', 'n'}
+	if err := os.WriteFile(filepath.Join(localRoot, "upload.bin"), upload, 0o644); err != nil {
+		t.Fatalf("write upload source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localRoot, "overwrite.bin"), overwrite, 0o644); err != nil {
+		t.Fatalf("write overwrite source: %v", err)
+	}
+
+	const root = "/workspaces/repo"
+	const nested = "/workspaces/repo/internal/mcp"
+	mock := &mockExecutor{
+		workdir:          root,
+		runBashStdouts:   []string{nested + "\n", ""},
+		runBashExitCodes: []int{0, 1},
+		rootedReadData:   download,
+	}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  root,
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	cdResult, _ := cdHandler(reg)(context.Background(), makeReq(map[string]any{
+		"codespace": "github",
+		"path":      "internal/mcp",
+	}))
+	if cdResult.IsError {
+		t.Fatalf("remote_cd error: %s", resultText(cdResult))
+	}
+
+	for _, call := range []map[string]any{
+		{"source": "upload.bin", "destination": "cs://github/root.bin"},
+		{"source": "overwrite.bin", "destination": "cs://github/root.bin", "overwrite": true},
+	} {
+		result, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(call))
+		if result.IsError {
+			t.Fatalf("remote_copy upload error: %s", resultText(result))
+		}
+	}
+	result, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "cs://github/root.bin",
+		"destination": "download.bin",
+	}))
+	if result.IsError {
+		t.Fatalf("remote_copy download error: %s", resultText(result))
+	}
+
+	if mock.workdir != nested {
+		t.Fatalf("current workdir = %q, want %q", mock.workdir, nested)
+	}
+	if mock.rootedWriteCalls != 2 {
+		t.Fatalf("rooted write calls = %d, want 2", mock.rootedWriteCalls)
+	}
+	if mock.lastRootedWrite.Path != root+"/root.bin" || mock.lastRootedWrite.Root != root {
+		t.Fatalf("rooted write request = %+v, want immutable root %q", mock.lastRootedWrite, root)
+	}
+	if !mock.lastRootedWrite.Overwrite || !bytes.Equal(mock.lastRootedWrite.Data, overwrite) {
+		t.Fatalf("overwrite request = %+v, want binary overwrite %v", mock.lastRootedWrite, overwrite)
+	}
+	if mock.lastRootedRead.Path != root+"/root.bin" || mock.lastRootedRead.Root != root {
+		t.Fatalf("rooted read request = %+v, want immutable root %q", mock.lastRootedRead, root)
+	}
+	got, err := os.ReadFile(filepath.Join(localRoot, "download.bin"))
+	if err != nil {
+		t.Fatalf("read download: %v", err)
+	}
+	if !bytes.Equal(got, download) {
+		t.Fatalf("download bytes = %v, want %v", got, download)
+	}
+}
+
+func TestRemoteCopy_LocalToCodespaceRefusesExistingDestination(t *testing.T) {
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "src.bin"), []byte("new"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	mock := &mockExecutor{runBashExit: 0}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "src.bin",
+		"destination": "cs://github/existing.bin",
+	}))
+	if !res.IsError || !strings.Contains(resultText(res), "already exists") {
+		t.Fatalf("result = %+v, want existing destination refusal", res)
+	}
+	if mock.writeFileCalls != 0 {
+		t.Fatalf("WriteFile calls = %d, want 0", mock.writeFileCalls)
+	}
+}
+
 func TestRemoteCopy_CodespaceToLocal(t *testing.T) {
 	localRoot := t.TempDir()
+	content := []byte{0x00, 0xff, 'r', 'e', 'm', 'o', 't', 'e'}
 	mock := &mockExecutor{
-		runBashStdout: base64.StdEncoding.EncodeToString([]byte("remote")),
+		rootedReadData: content,
 	}
 	reg := registry.New()
 	if err := reg.Register(&registry.ManagedCodespace{
@@ -335,11 +605,125 @@ func TestRemoteCopy_CodespaceToLocal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read copied file: %v", err)
 	}
-	if string(got) != "remote" {
-		t.Fatalf("copied content = %q, want remote", got)
+	if !bytes.Equal(got, content) {
+		t.Fatalf("copied content = %v, want %v", got, content)
 	}
-	if !strings.Contains(mock.lastRunBashCommand, "base64 <") {
-		t.Fatalf("expected remote read, got %q", mock.lastRunBashCommand)
+	if mock.lastRootedRead.Path != "/workspaces/repo/remote.txt" || mock.lastRootedRead.Root != "/workspaces/repo" {
+		t.Fatalf("rooted read request = %+v", mock.lastRootedRead)
+	}
+}
+
+func TestRemoteCopy_CodespaceToLocalOverwriteIsAtomicAndPreservesMode(t *testing.T) {
+	localRoot := t.TempDir()
+	localPath := filepath.Join(localRoot, "existing.bin")
+	if err := os.WriteFile(localPath, []byte("old"), 0o600); err != nil {
+		t.Fatalf("write existing: %v", err)
+	}
+	content := []byte{0x00, 0xff, 'n', 'e', 'w'}
+	mock := &mockExecutor{rootedReadData: content}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "cs://github/remote.bin",
+		"destination": "existing.bin",
+		"overwrite":   true,
+	}))
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+	got, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("read copied file: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("copied content = %v, want %v", got, content)
+	}
+	info, err := os.Stat(localPath)
+	if err != nil {
+		t.Fatalf("stat copied file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("mode = %v, want 0600", got)
+	}
+}
+
+func TestRemoteCopy_CodespaceToLocalFailureLeavesDestinationUnchanged(t *testing.T) {
+	localRoot := t.TempDir()
+	localPath := filepath.Join(localRoot, "existing.bin")
+	if err := os.WriteFile(localPath, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write existing: %v", err)
+	}
+	mock := &mockExecutor{rootedReadErr: fmt.Errorf("read failed")}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "cs://github/remote.bin",
+		"destination": "existing.bin",
+		"overwrite":   true,
+	}))
+	if !res.IsError {
+		t.Fatal("expected remote read failure")
+	}
+	got, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("read existing file: %v", err)
+	}
+	if string(got) != "keep" {
+		t.Fatalf("destination = %q, want unchanged", got)
+	}
+}
+
+func TestRemoteCopy_CodespaceToLocalRejectsSymlinkOverwrite(t *testing.T) {
+	localRoot := t.TempDir()
+	target := filepath.Join(localRoot, "target.bin")
+	link := filepath.Join(localRoot, "link.bin")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	mock := &mockExecutor{rootedReadData: []byte("replace")}
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Workdir:  "/workspaces/repo",
+		Executor: mock,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, _ := remoteCopyHandler(reg, localRoot)(context.Background(), makeReq(map[string]any{
+		"source":      "cs://github/remote.bin",
+		"destination": "link.bin",
+		"overwrite":   true,
+	}))
+	if !res.IsError || !strings.Contains(resultText(res), "symbolic link") {
+		t.Fatalf("result = %+v, want symbolic link rejection", res)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(got) != "keep" {
+		t.Fatalf("target = %q, want unchanged", got)
 	}
 }
 
@@ -348,9 +732,7 @@ func TestRemoteCopy_RefusesOverwrite(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(localRoot, "existing.txt"), []byte("local"), 0o644); err != nil {
 		t.Fatalf("write existing: %v", err)
 	}
-	mock := &mockExecutor{
-		runBashStdout: base64.StdEncoding.EncodeToString([]byte("remote")),
-	}
+	mock := &mockExecutor{rootedReadData: []byte("remote")}
 	reg := registry.New()
 	if err := reg.Register(&registry.ManagedCodespace{
 		Alias:    "github",
@@ -414,7 +796,7 @@ func TestRemoteCopy_RejectsSourceSymlinkEscape(t *testing.T) {
 	if !res.IsError {
 		t.Fatal("expected source symlink escape error")
 	}
-	if !strings.Contains(resultText(res), "escapes local workdir") {
+	if !strings.Contains(resultText(res), "symbolic link") {
 		t.Fatalf("unexpected error: %s", resultText(res))
 	}
 }
@@ -426,9 +808,7 @@ func TestRemoteCopy_RejectsDestinationParentSymlinkEscape(t *testing.T) {
 		t.Fatalf("create destination symlink: %v", err)
 	}
 
-	mock := &mockExecutor{
-		runBashStdout: base64.StdEncoding.EncodeToString([]byte("remote")),
-	}
+	mock := &mockExecutor{rootedReadData: []byte("remote")}
 	reg := registry.New()
 	if err := reg.Register(&registry.ManagedCodespace{
 		Alias:    "github",
@@ -520,6 +900,11 @@ type mockExecutor struct {
 	createFileErr       error
 	lastCreatePath      string
 	lastCreateContent   string
+	writeFileErr        error
+	writeFileCalls      int
+	lastWritePath       string
+	lastWriteContent    []byte
+	lastWriteOverwrite  bool
 	runBashCalls        int
 	lastRunBashCommand  string
 	lastRunBashCwd      string
@@ -527,6 +912,14 @@ type mockExecutor struct {
 	runBashStderr       string
 	runBashExit         int
 	runBashErr          error
+	runBashStdouts      []string
+	runBashExitCodes    []int
+	rootedReadData      []byte
+	rootedReadErr       error
+	lastRootedRead      ssh.RootedReadRequest
+	rootedWriteCalls    int
+	rootedWriteErr      error
+	lastRootedWrite     ssh.RootedWriteRequest
 	lastGrepPattern     string
 	lastGrepPath        string
 	lastGrepGlob        string
@@ -555,6 +948,12 @@ type mockExecutor struct {
 	workdir             string
 }
 
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) {
+	return f(p)
+}
+
 func (m *mockExecutor) ViewFile(_ context.Context, _ string, _ []int) (string, error) {
 	return m.viewFileResult, m.viewFileErr
 }
@@ -569,10 +968,40 @@ func (m *mockExecutor) CreateFile(_ context.Context, path, content string) error
 	return m.createFileErr
 }
 
+func (m *mockExecutor) WriteFile(_ context.Context, path string, content []byte, overwrite bool) error {
+	m.writeFileCalls++
+	m.lastWritePath = path
+	m.lastWriteContent = append([]byte(nil), content...)
+	m.lastWriteOverwrite = overwrite
+	return m.writeFileErr
+}
+
+func (m *mockExecutor) ReadFileRooted(_ context.Context, req ssh.RootedReadRequest) ([]byte, error) {
+	m.lastRootedRead = req
+	return append([]byte(nil), m.rootedReadData...), m.rootedReadErr
+}
+
+func (m *mockExecutor) WriteFileRooted(_ context.Context, req ssh.RootedWriteRequest) error {
+	m.rootedWriteCalls++
+	m.lastRootedWrite = req
+	m.lastRootedWrite.Data = append([]byte(nil), req.Data...)
+	return m.rootedWriteErr
+}
+
 func (m *mockExecutor) RunBash(_ context.Context, command, cwd string) (string, string, int, error) {
 	m.runBashCalls++
 	m.lastRunBashCommand = command
 	m.lastRunBashCwd = cwd
+	if len(m.runBashStdouts) > 0 {
+		stdout := m.runBashStdouts[0]
+		m.runBashStdouts = m.runBashStdouts[1:]
+		exitCode := m.runBashExit
+		if len(m.runBashExitCodes) > 0 {
+			exitCode = m.runBashExitCodes[0]
+			m.runBashExitCodes = m.runBashExitCodes[1:]
+		}
+		return stdout, m.runBashStderr, exitCode, m.runBashErr
+	}
 	return m.runBashStdout, m.runBashStderr, m.runBashExit, m.runBashErr
 }
 

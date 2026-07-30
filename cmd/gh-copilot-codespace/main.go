@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -43,6 +44,7 @@ Flags:
 
 Subcommands:
   exec                   Execute a command on the codespace (used internally)
+  filesystem             Execute one structured filesystem request (used internally)
   helper-info            Report helper capabilities (used internally)
   daemon                 Run daemon protocol server (used internally)
 `)
@@ -62,6 +64,20 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "exec" {
 		if err := runExec(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "exec: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "filesystem" {
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "filesystem: exactly one operation is required")
+			os.Exit(1)
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
+		defer cancel()
+		if err := runFilesystemOperation(ctx, os.Args[2], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "filesystem: %v\n", err)
 			os.Exit(1)
 		}
 		return

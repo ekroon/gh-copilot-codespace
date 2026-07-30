@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	pathpkg "path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,8 +25,7 @@ import (
 type Executor struct {
 	transport daemontransport.Transport
 	stream    io.ReadWriteCloser // owned; closed by Close()
-	enc       *daemonproto.Encoder
-	encMu     sync.Mutex
+	writeMu   chan struct{}
 	dec       *daemonproto.Decoder
 
 	nextID  atomic.Uint64
@@ -33,8 +34,9 @@ type Executor struct {
 	workdir   string
 	workdirMu sync.RWMutex
 
-	readerDone chan struct{}
-	readerErr  atomic.Value // error from the reader goroutine; sticky
+	readerDone    chan struct{}
+	readerErr     atomic.Value // terminal stream error; sticky
+	readerErrOnce sync.Once
 
 	helloOnce sync.Once
 	hello     daemonproto.Frame
@@ -66,10 +68,11 @@ func Dial(ctx context.Context, t daemontransport.Transport) (*Executor, error) {
 	e := &Executor{
 		transport:  t,
 		stream:     stream,
-		enc:        daemonproto.NewEncoder(stream),
+		writeMu:    make(chan struct{}, 1),
 		dec:        daemonproto.NewDecoder(stream),
 		readerDone: make(chan struct{}),
 	}
+	e.writeMu <- struct{}{}
 
 	helloCh := make(chan daemonproto.Frame, 1)
 	e.pending.Store(uint64(0), helloCh)
@@ -96,6 +99,11 @@ func Dial(ctx context.Context, t daemontransport.Transport) (*Executor, error) {
 			<-e.readerDone
 			return nil, fmt.Errorf("daemonclient: unsupported daemon protocol version %q (want %q)", frame.Version, daemonproto.ProtocolVersion)
 		}
+		if missing := missingDaemonVerbs(frame.Verbs, daemonproto.FilesystemVerbs()); len(missing) > 0 {
+			_ = stream.Close()
+			<-e.readerDone
+			return nil, fmt.Errorf("daemonclient: daemon missing required filesystem capabilities: %s", strings.Join(missing, ", "))
+		}
 		return e, nil
 	case <-ctx.Done():
 		e.pending.Delete(uint64(0))
@@ -120,7 +128,7 @@ func (e *Executor) readLoop() {
 	for {
 		frame, err := e.dec.Read()
 		if err != nil {
-			e.readerErr.Store(err)
+			e.setReaderErr(err)
 			return
 		}
 
@@ -167,6 +175,9 @@ func (e *Executor) readLoop() {
 }
 
 func (e *Executor) call(ctx context.Context, verb daemonproto.Verb, params any) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	id := e.nextID.Add(1)
 	frame, err := daemonproto.NewRequest(id, verb, params, "")
 	if err != nil {
@@ -177,7 +188,7 @@ func (e *Executor) call(ctx context.Context, verb daemonproto.Verb, params any) 
 	e.pending.Store(id, responseCh)
 	defer e.pending.Delete(id)
 
-	if err := e.writeFrame(frame); err != nil {
+	if err := e.writeFrame(ctx, frame); err != nil {
 		return nil, fmt.Errorf("daemonclient: write %s request: %w", verb, err)
 	}
 
@@ -185,7 +196,12 @@ func (e *Executor) call(ctx context.Context, verb daemonproto.Verb, params any) 
 	case response := <-responseCh:
 		return e.processResponse(verb, response)
 	case <-ctx.Done():
-		_ = e.writeFrame(daemonproto.NewCancel(id))
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		cancelErr := e.writeFrame(cancelCtx, daemonproto.NewCancel(id))
+		cancel()
+		if cancelErr != nil {
+			e.failStream(fmt.Errorf("daemonclient: deliver cancel for request %d: %w", id, cancelErr))
+		}
 		timer := time.NewTimer(250 * time.Millisecond)
 		defer timer.Stop()
 		select {
@@ -199,10 +215,138 @@ func (e *Executor) call(ctx context.Context, verb daemonproto.Verb, params any) 
 	}
 }
 
-func (e *Executor) writeFrame(frame daemonproto.Frame) error {
-	e.encMu.Lock()
-	defer e.encMu.Unlock()
-	return e.enc.Write(frame)
+func (e *Executor) failStream(err error) {
+	e.setReaderErr(err)
+	_ = e.stream.Close()
+}
+
+func (e *Executor) setReaderErr(err error) {
+	if err != nil {
+		e.readerErrOnce.Do(func() {
+			e.readerErr.Store(err)
+		})
+	}
+}
+
+type daemonWriteDeadlineSetter interface {
+	SetWriteDeadline(time.Time) error
+}
+
+func (e *Executor) writeFrame(ctx context.Context, frame daemonproto.Frame) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-e.writeMu:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.readerDone:
+		return e.readErr()
+	}
+	defer func() { e.writeMu <- struct{}{} }()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	data, err := daemonproto.MarshalFrame(frame)
+	if err != nil {
+		return err
+	}
+
+	if deadlineWriter, ok := e.stream.(daemonWriteDeadlineSetter); ok {
+		return e.writeFrameWithDeadline(ctx, deadlineWriter, data)
+	}
+
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = e.stream.Close()
+	})
+	written, writeErr := writeDaemonFrameBytes(e.stream, data)
+	_ = stopClose()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if writeErr != nil {
+		if written > 0 {
+			_ = e.stream.Close()
+		}
+		return writeErr
+	}
+	return nil
+}
+
+func (e *Executor) writeFrameWithDeadline(ctx context.Context, writer daemonWriteDeadlineSetter, data []byte) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := writer.SetWriteDeadline(deadline); err != nil {
+			return fmt.Errorf("set write deadline: %w", err)
+		}
+	}
+
+	deadlineSet := make(chan struct{})
+	stopDeadline := context.AfterFunc(ctx, func() {
+		_ = writer.SetWriteDeadline(time.Now())
+		close(deadlineSet)
+	})
+	written, writeErr := writeDaemonFrameBytes(e.stream, data)
+	if !stopDeadline() {
+		<-deadlineSet
+	}
+	resetErr := writer.SetWriteDeadline(time.Time{})
+
+	if ctx.Err() != nil {
+		if written > 0 {
+			_ = e.stream.Close()
+		}
+		return ctx.Err()
+	}
+	if writeErr != nil {
+		if written > 0 {
+			_ = e.stream.Close()
+		}
+		var timeoutErr interface{ Timeout() bool }
+		if errors.As(writeErr, &timeoutErr) && timeoutErr.Timeout() {
+			if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+				return context.DeadlineExceeded
+			}
+		}
+		return writeErr
+	}
+	if resetErr != nil {
+		_ = e.stream.Close()
+		return fmt.Errorf("reset write deadline: %w", resetErr)
+	}
+	return nil
+}
+
+func writeDaemonFrameBytes(writer io.Writer, data []byte) (int, error) {
+	total := 0
+	for len(data) > 0 {
+		written, err := writer.Write(data)
+		total += written
+		if written > 0 {
+			data = data[written:]
+		}
+		if err != nil {
+			return total, err
+		}
+		if written == 0 {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
+}
+
+func missingDaemonVerbs(advertised []string, required []daemonproto.Verb) []string {
+	available := make(map[string]struct{}, len(advertised))
+	for _, verb := range advertised {
+		available[verb] = struct{}{}
+	}
+	var missing []string
+	for _, verb := range required {
+		if _, ok := available[string(verb)]; !ok {
+			missing = append(missing, string(verb))
+		}
+	}
+	return missing
 }
 
 func (e *Executor) processResponse(verb daemonproto.Verb, frame daemonproto.Frame) (json.RawMessage, error) {
@@ -237,20 +381,30 @@ func (e *Executor) Ping(ctx context.Context) (daemonproto.PingResult, error) {
 	return result, nil
 }
 
+func (e *Executor) View(ctx context.Context, req ssh.ViewRequest) (ssh.ViewResult, error) {
+	req = req.Normalize()
+	req.Path = e.resolvePath(req.Path)
+	raw, err := e.call(ctx, daemonproto.VerbViewFile, daemonproto.ViewFileParams(req))
+	if err != nil {
+		return ssh.ViewResult{}, err
+	}
+	var result ssh.ViewResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return ssh.ViewResult{}, fmt.Errorf("daemonclient: decode view_file result: %w", err)
+	}
+	return result, nil
+}
+
 func (e *Executor) ViewFile(ctx context.Context, path string, viewRange []int) (string, error) {
-	raw, err := e.call(ctx, daemonproto.VerbViewFile, daemonproto.ViewFileParams{Path: path, ViewRange: viewRange})
+	result, err := e.View(ctx, ssh.ViewRequest{Path: path, ViewRange: viewRange})
 	if err != nil {
 		return "", err
-	}
-	var result daemonproto.ViewFileResult
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", fmt.Errorf("daemonclient: decode view_file result: %w", err)
 	}
 	return result.Content, nil
 }
 
 func (e *Executor) EditFile(ctx context.Context, path, oldStr, newStr string) error {
-	raw, err := e.call(ctx, daemonproto.VerbEditFile, daemonproto.EditFileParams{Path: path, OldStr: oldStr, NewStr: newStr})
+	raw, err := e.call(ctx, daemonproto.VerbEditFile, daemonproto.EditFileParams{Path: e.resolvePath(path), OldStr: oldStr, NewStr: newStr})
 	if err != nil {
 		return err
 	}
@@ -262,13 +416,56 @@ func (e *Executor) EditFile(ctx context.Context, path, oldStr, newStr string) er
 }
 
 func (e *Executor) CreateFile(ctx context.Context, path, content string) error {
-	raw, err := e.call(ctx, daemonproto.VerbCreateFile, daemonproto.CreateFileParams{Path: path, Content: content})
+	raw, err := e.call(ctx, daemonproto.VerbCreateFile, daemonproto.CreateFileParams{Path: e.resolvePath(path), Content: content})
 	if err != nil {
 		return err
 	}
 	var result daemonproto.CreateFileResult
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return fmt.Errorf("daemonclient: decode create_file result: %w", err)
+	}
+	return nil
+}
+
+func (e *Executor) WriteFile(ctx context.Context, path string, content []byte, overwrite bool) error {
+	return e.WriteFileRooted(ctx, ssh.RootedWriteRequest{
+		Path:      e.resolvePath(path),
+		Root:      e.GetWorkdir(),
+		Data:      content,
+		Overwrite: overwrite,
+	})
+}
+
+func (e *Executor) ReadFileRooted(ctx context.Context, req ssh.RootedReadRequest) ([]byte, error) {
+	req.Path = resolveRootedPath(req.Path, req.Root)
+	raw, err := e.call(ctx, daemonproto.VerbReadFile, daemonproto.ReadFileParams(req))
+	if err != nil {
+		return nil, err
+	}
+	var result daemonproto.ReadFileResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("daemonclient: decode read_file result: %w", err)
+	}
+	return result.Data, nil
+}
+
+func (e *Executor) WriteFileRooted(ctx context.Context, req ssh.RootedWriteRequest) error {
+	if len(req.Data) > daemonproto.MaxFileTransferBytes {
+		return fmt.Errorf("%w: %d bytes exceeds %d", daemonproto.ErrFileTransferTooLarge, len(req.Data), daemonproto.MaxFileTransferBytes)
+	}
+	req.Path = resolveRootedPath(req.Path, req.Root)
+	raw, err := e.call(ctx, daemonproto.VerbWriteFile, daemonproto.WriteFileParams{
+		Path:      req.Path,
+		Data:      req.Data,
+		Overwrite: req.Overwrite,
+		Root:      req.Root,
+	})
+	if err != nil {
+		return err
+	}
+	var result daemonproto.WriteFileResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("daemonclient: decode write_file result: %w", err)
 	}
 	return nil
 }
@@ -288,34 +485,67 @@ func (e *Executor) RunBash(ctx context.Context, command, cwd string) (stdout, st
 	return result.Stdout, result.Stderr, result.ExitCode, nil
 }
 
-func (e *Executor) Grep(ctx context.Context, pattern, path, globPattern, cwd string) (string, error) {
-	if cwd == "" {
-		cwd = e.GetWorkdir()
+func (e *Executor) GrepFiles(ctx context.Context, req ssh.GrepRequest) (ssh.GrepResult, error) {
+	req = req.Normalize()
+	if req.Cwd == "" {
+		req.Cwd = e.GetWorkdir()
 	}
-	raw, err := e.call(ctx, daemonproto.VerbGrep, daemonproto.GrepParams{Pattern: pattern, Path: path, Glob: globPattern, Cwd: cwd})
+	raw, err := e.call(ctx, daemonproto.VerbGrep, daemonproto.GrepParams(req))
+	if err != nil {
+		return ssh.GrepResult{}, err
+	}
+	var result ssh.GrepResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return ssh.GrepResult{}, fmt.Errorf("daemonclient: decode grep result: %w", err)
+	}
+	return result, nil
+}
+
+func (e *Executor) Grep(ctx context.Context, pattern, path, globPattern, cwd string) (string, error) {
+	result, err := e.GrepFiles(ctx, ssh.GrepRequest{Pattern: pattern, Path: path, Glob: globPattern, Cwd: cwd})
 	if err != nil {
 		return "", err
-	}
-	var result daemonproto.GrepResult
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", fmt.Errorf("daemonclient: decode grep result: %w", err)
 	}
 	return result.Output, nil
 }
 
-func (e *Executor) Glob(ctx context.Context, pattern, path, cwd string) (string, error) {
-	if cwd == "" {
-		cwd = e.GetWorkdir()
+func (e *Executor) GlobFiles(ctx context.Context, req ssh.GlobRequest) (ssh.GlobResult, error) {
+	req = req.Normalize()
+	if req.Cwd == "" {
+		req.Cwd = e.GetWorkdir()
 	}
-	raw, err := e.call(ctx, daemonproto.VerbGlob, daemonproto.GlobParams{Pattern: pattern, Path: path, Cwd: cwd})
+	raw, err := e.call(ctx, daemonproto.VerbGlob, daemonproto.GlobParams(req))
+	if err != nil {
+		return ssh.GlobResult{}, err
+	}
+	var result ssh.GlobResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return ssh.GlobResult{}, fmt.Errorf("daemonclient: decode glob result: %w", err)
+	}
+	return result, nil
+}
+
+func (e *Executor) Glob(ctx context.Context, pattern, path, cwd string) (string, error) {
+	result, err := e.GlobFiles(ctx, ssh.GlobRequest{Pattern: pattern, Path: path, Cwd: cwd})
 	if err != nil {
 		return "", err
 	}
-	var result daemonproto.GlobResult
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", fmt.Errorf("daemonclient: decode glob result: %w", err)
-	}
 	return result.Output, nil
+}
+
+func (e *Executor) ApplyPatch(ctx context.Context, req ssh.ApplyPatchRequest) (ssh.ApplyPatchResult, error) {
+	if req.Cwd == "" {
+		req.Cwd = e.GetWorkdir()
+	}
+	raw, err := e.call(ctx, daemonproto.VerbApplyPatch, daemonproto.ApplyPatchParams(req))
+	if err != nil {
+		return ssh.ApplyPatchResult{}, err
+	}
+	var result ssh.ApplyPatchResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return ssh.ApplyPatchResult{}, fmt.Errorf("daemonclient: decode apply_patch result: %w", err)
+	}
+	return result, nil
 }
 
 func (e *Executor) StartSession(ctx context.Context, sessionID, command, cwd string) error {
@@ -393,6 +623,23 @@ func (e *Executor) GetWorkdir() string {
 	return e.workdir
 }
 
+func (e *Executor) resolvePath(path string) string {
+	if path == "" || pathpkg.IsAbs(path) {
+		return path
+	}
+	if workdir := e.GetWorkdir(); workdir != "" {
+		return pathpkg.Join(workdir, path)
+	}
+	return path
+}
+
+func resolveRootedPath(path, root string) string {
+	if path == "" || pathpkg.IsAbs(path) || root == "" {
+		return path
+	}
+	return pathpkg.Join(root, path)
+}
+
 func (e *Executor) Close() error {
 	if e.stream != nil {
 		_ = e.stream.Close()
@@ -406,3 +653,6 @@ func (e *Executor) Close() error {
 
 // Compile-time check: Executor must implement ssh.Executor.
 var _ ssh.Executor = (*Executor)(nil)
+var _ ssh.FilesystemExecutor = (*Executor)(nil)
+var _ ssh.ApplyPatchExecutor = (*Executor)(nil)
+var _ ssh.RootedFileExecutor = (*Executor)(nil)

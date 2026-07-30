@@ -474,7 +474,31 @@ func TestGrepUsesExplicitCwd(t *testing.T) {
 	}
 
 	wantCalls := []fakeExecCall{
-		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && cd '/workspaces/repo' && (rg --color=never -n --glob '*.go' 'match' 'cmd') 2>/dev/null || grep -rn 'match' 'cmd'"}},
+		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && cd '/workspaces/repo' && (rg --color=never -n --with-filename --no-heading --glob '*.go' -- 'match' 'cmd') 2>/dev/null || grep -Hrn -- 'match' 'cmd'"}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestGrepSeparatesDashPrefixedPatternAndPath(t *testing.T) {
+	client := NewClient("demo")
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "--search-root/flags.txt:1:--force\n"},
+	})
+
+	got, err := client.Grep(context.Background(), "--force", "--search-root", "", "/workspaces/repo")
+	if err != nil {
+		t.Fatalf("Grep() error = %v", err)
+	}
+	if got != "--search-root/flags.txt:1:--force\n" {
+		t.Fatalf("Grep() = %q", got)
+	}
+
+	wantCalls := []fakeExecCall{
+		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && cd '/workspaces/repo' && (rg --color=never -n --with-filename --no-heading -- '--force' '--search-root') 2>/dev/null || grep -Hrn -- '--force' '--search-root'"}},
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)

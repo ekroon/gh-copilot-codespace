@@ -24,6 +24,7 @@ func TestBuildPreamble_SingleCodespaceUsesCurrentDirectoryModel(t *testing.T) {
 		"remote_view",
 		"remote_edit",
 		"remote_create",
+		"remote_apply_patch",
 		"remote_grep",
 		"remote_glob",
 		"builds, tests, linters",
@@ -82,6 +83,7 @@ func TestBuildPreamble_MultiCodespaceRetainsAliasesAndCwdGuidance(t *testing.T) 
 		"(default)",
 		"`codespace` parameter",
 		"list_codespaces",
+		"remote_apply_patch",
 		"pass `cwd` explicitly",
 		"current directory",
 		"NOT synchronized",
@@ -111,6 +113,7 @@ func TestBuildPreamble_ZeroCodespacesRetainsLifecycleWithoutResumeWorkspace(t *t
 		"project instructions, agents, and context",
 		"repository work",
 		"remote_*",
+		"remote_apply_patch",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in zero-codespace preamble:\n%s", want, got)

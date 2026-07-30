@@ -1,5 +1,7 @@
 package daemonproto
 
+import "github.com/ekroon/gh-copilot-codespace/internal/ssh"
+
 // Verb param/result types. One struct pair per Verb. The wire layout is
 // inlined into Frame.Params / Frame.Result as json.RawMessage; decode via
 // json.Unmarshal(frame.Params, &VerbXxxParams{}).
@@ -15,15 +17,20 @@ type (
 	}
 )
 
-// ViewFileParams / ViewFileResult — read a file with optional line range.
-// Mirrors ssh.Executor.ViewFile.
+// ViewFileParams / ViewFileResult — read a file with optional line range plus
+// additive fields for local-view parity. Legacy callers still rely on
+// Path/ViewRange and Content.
 type (
-	ViewFileParams struct {
-		Path      string `json:"path"`
-		ViewRange []int  `json:"view_range,omitempty"` // [start, end]; -1 end = EOF
-	}
-	ViewFileResult struct {
-		Content string `json:"content"`
+	ViewFileParams = ssh.ViewRequest
+	ViewFileResult = ssh.ViewResult
+)
+
+// ReadFileParams / ReadFileResult — read arbitrary bytes after resolving the
+// path against an explicit immutable root.
+type (
+	ReadFileParams = ssh.RootedReadRequest
+	ReadFileResult struct {
+		Data []byte `json:"data"`
 	}
 )
 
@@ -56,6 +63,16 @@ type (
 	}
 )
 
+// WriteFileParams / WriteFileResult — atomically write arbitrary bytes.
+// Existing destinations are refused unless Overwrite is true. Implementations
+// preserve regular-file permissions on overwrite and reject symbolic links.
+type (
+	WriteFileParams = ssh.RootedWriteRequest
+	WriteFileResult struct {
+		Bytes int `json:"bytes"`
+	}
+)
+
 // RunBashParams / RunBashResult — run a bash command. The daemon spawns
 // `bash -c <command>` in its own process group so a TypeCancel frame can kill
 // the whole tree. Mutating (commands can have arbitrary side effects).
@@ -71,30 +88,25 @@ type (
 	}
 )
 
-// GrepParams / GrepResult — search file contents with ripgrep (or grep
-// fallback). Read-only.
+// GrepParams / GrepResult — search file contents with legacy-compatible
+// defaults plus additive fields for local search parity. Read-only.
 type (
-	GrepParams struct {
-		Pattern string `json:"pattern"`
-		Path    string `json:"path,omitempty"`
-		Glob    string `json:"glob,omitempty"`
-		Cwd     string `json:"cwd,omitempty"`
-	}
-	GrepResult struct {
-		Output string `json:"output"`
-	}
+	GrepParams = ssh.GrepRequest
+	GrepResult = ssh.GrepResult
 )
 
-// GlobParams / GlobResult — find files by pattern. Read-only.
+// GlobParams / GlobResult — find files by pattern with additive local glob
+// parity fields. Read-only.
 type (
-	GlobParams struct {
-		Pattern string `json:"pattern"`
-		Path    string `json:"path,omitempty"`
-		Cwd     string `json:"cwd,omitempty"`
-	}
-	GlobResult struct {
-		Output string `json:"output"`
-	}
+	GlobParams = ssh.GlobRequest
+	GlobResult = ssh.GlobResult
+)
+
+// ApplyPatchParams / ApplyPatchResult — apply an additive multi-file patch.
+// Mutating.
+type (
+	ApplyPatchParams = ssh.ApplyPatchRequest
+	ApplyPatchResult = ssh.ApplyPatchResult
 )
 
 // StartSessionParams / StartSessionResult — create a named long-running

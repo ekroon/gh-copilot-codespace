@@ -235,6 +235,205 @@ function loadManifest() {
 
 const manifest = loadManifest();
 
+function isToolResultContent(entry) {
+  if (typeof entry !== "object" || entry === null || typeof entry.type !== "string") return false;
+  switch (entry.type) {
+    case "text":
+    case "terminal":
+      return typeof entry.text === "string";
+    case "shell_exit":
+      return typeof entry.shellId === "string" && typeof entry.exitCode === "number";
+    case "image":
+    case "audio":
+      return typeof entry.data === "string" && typeof entry.mimeType === "string";
+    case "resource_link":
+      return typeof entry.uri === "string" && typeof entry.name === "string";
+    case "resource": {
+      const resource = entry.resource;
+      if (typeof resource !== "object" || resource === null) return false;
+      if (typeof resource.uri !== "string") return false;
+      if ("mimeType" in resource && typeof resource.mimeType !== "string") return false;
+      if ("text" in resource && typeof resource.text !== "string") return false;
+      if ("blob" in resource && typeof resource.blob !== "string") return false;
+      return "text" in resource || "blob" in resource;
+    }
+    default:
+      return false;
+  }
+}
+
+function isMcpCallToolResult(value) {
+  if (typeof value !== "object" || value === null) return false;
+  if (!Array.isArray(value.content)) return false;
+  if ("isError" in value && typeof value.isError !== "boolean") return false;
+  return value.content.every(isToolResultContent);
+}
+
+function normalizeBinaryResults(value) {
+  if (!Array.isArray(value)) return [];
+  const results = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null) continue;
+    if (typeof entry.data !== "string" || !entry.data) continue;
+    if (typeof entry.mimeType !== "string") continue;
+    if (entry.type !== "image" && entry.type !== "resource") continue;
+    const normalized = {
+      data: entry.data,
+      mimeType: entry.mimeType,
+      type: entry.type,
+    };
+    if (typeof entry.description === "string") {
+      normalized.description = entry.description;
+    }
+    results.push(normalized);
+  }
+  return results;
+}
+
+function isSDKToolResult(value) {
+  if (typeof value !== "object" || value === null) return false;
+  if (typeof value.textResultForLlm !== "string") return false;
+  return ["success", "failure", "rejected", "denied", "timeout"].includes(value.resultType);
+}
+
+const truncatedResultWarning = "WARNING: The result is truncated and incomplete. Make a narrower request to retrieve complete output.";
+const truncatedImageWarning = "ERROR: The image result is truncated or incomplete, so no binary image was returned. Retry with forceReadLargeFiles=true or make a narrower request.";
+
+function normalizedStructuredKey(key) {
+  return key.toLowerCase().replaceAll("_", "").replaceAll("-", "");
+}
+
+function structuredTruncation(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { truncated: false, image: false };
+  }
+  let truncated = false;
+  let image = false;
+  for (const [key, field] of Object.entries(value)) {
+    switch (normalizedStructuredKey(key)) {
+      case "truncated":
+        truncated = field === true;
+        break;
+      case "kind":
+      case "type":
+        image = image || (typeof field === "string" && field.toLowerCase() === "image");
+        break;
+    }
+  }
+  return { truncated, image };
+}
+
+function prependResultWarning(text, warning) {
+  if (!text) return warning;
+  if (text.startsWith(warning)) return text;
+  return warning + "\n\n" + text;
+}
+
+function applyStructuredTruncationPolicy(normalized, structuredContent) {
+  const { truncated, image } = structuredTruncation(structuredContent);
+  if (!truncated) return normalized;
+  if (image) {
+    normalized.resultType = "failure";
+    delete normalized.binaryResultsForLlm;
+    normalized.textResultForLlm = prependResultWarning(normalized.textResultForLlm, truncatedImageWarning);
+    return normalized;
+  }
+  normalized.textResultForLlm = prependResultWarning(normalized.textResultForLlm, truncatedResultWarning);
+  return normalized;
+}
+
+function normalizeSDKToolResult(result) {
+  const normalized = {
+    textResultForLlm: result.textResultForLlm,
+    resultType: result.resultType,
+  };
+  const binaryResults = normalizeBinaryResults(result.binaryResultsForLlm);
+  if (binaryResults.length > 0) {
+    normalized.binaryResultsForLlm = binaryResults;
+  }
+  for (const field of ["error", "sessionLog"]) {
+    if (typeof result[field] === "string") normalized[field] = result[field];
+  }
+  if (typeof result.toolTelemetry === "object" && result.toolTelemetry !== null && !Array.isArray(result.toolTelemetry)) {
+    normalized.toolTelemetry = result.toolTelemetry;
+  }
+  if (Array.isArray(result.toolReferences) && result.toolReferences.every((entry) => typeof entry === "string")) {
+    normalized.toolReferences = [...result.toolReferences];
+  }
+  return applyStructuredTruncationPolicy(normalized, result.structuredContent);
+}
+
+function convertMcpCallToolResult(result) {
+  const textParts = [];
+  const binaryResults = [];
+  for (const entry of result.content) {
+    switch (entry.type) {
+      case "text":
+        if (typeof entry.text === "string") {
+          textParts.push(entry.text);
+        }
+        break;
+      case "terminal":
+        if (typeof entry.text === "string") {
+          textParts.push(entry.text);
+        }
+        break;
+      case "shell_exit":
+      case "resource_link":
+        textParts.push(JSON.stringify(entry));
+        break;
+      case "image":
+        if (typeof entry.data === "string" && entry.data && typeof entry.mimeType === "string") {
+          binaryResults.push({
+            data: entry.data,
+            mimeType: entry.mimeType,
+            type: "image",
+          });
+        }
+        break;
+      case "audio":
+        if (typeof entry.data === "string" && entry.data && typeof entry.mimeType === "string") {
+          binaryResults.push({
+            data: entry.data,
+            mimeType: entry.mimeType,
+            type: "resource",
+            description: "audio",
+          });
+        }
+        break;
+      case "resource":
+        if (entry.resource?.text) {
+          textParts.push(entry.resource.text);
+        }
+        if (entry.resource?.blob) {
+          const mimeType = entry.resource.mimeType;
+          binaryResults.push({
+            data: entry.resource.blob,
+            mimeType: typeof mimeType === "string" && mimeType ? mimeType : "application/octet-stream",
+            type: "resource",
+            description: entry.resource.uri,
+          });
+        }
+        break;
+    }
+  }
+  return applyStructuredTruncationPolicy({
+    textResultForLlm: textParts.join("\n"),
+    resultType: result.isError ? "failure" : "success",
+    ...(binaryResults.length > 0 ? { binaryResultsForLlm: binaryResults } : {}),
+  }, result.structuredContent);
+}
+
+function normalizeToolResult(result) {
+  if (isMcpCallToolResult(result)) {
+    return convertMcpCallToolResult(result);
+  }
+  if (isSDKToolResult(result)) {
+    return normalizeSDKToolResult(result);
+  }
+  return result;
+}
+
 if (!manifest) {
   await joinSession({ tools: [] });
 } else {
@@ -312,7 +511,7 @@ if (!manifest) {
     parameters: definition.parameters,
     handler: async (args) => {
       try {
-        return await request("call_tool", { tool: definition.name, args });
+        return normalizeToolResult(await request("call_tool", { tool: definition.name, args }));
       } catch (error) {
         return {
           textResultForLlm: String(error?.message || error),

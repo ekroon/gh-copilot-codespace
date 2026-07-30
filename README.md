@@ -15,7 +15,7 @@ Copilot remains in the checkout where you ran `gh copilot-codespace`. Local inst
 
 All built-in local tools remain enabled. The extension adds the first-party Codespaces tools, but repository implementation must happen in the Codespace working copy:
 
-- Use `remote_view`, `remote_edit`, `remote_create`, `remote_grep`, and `remote_glob` for repository files.
+- Use `remote_view`, `remote_edit`, `remote_create`, `remote_apply_patch`, `remote_grep`, and `remote_glob` for repository files.
 - Use `remote_bash` for builds, tests, linters, dependency operations, repository scripts, and Git commands.
 - Reserve local tools for local context, Copilot session artifacts, and explicit local-only work.
 
@@ -27,7 +27,7 @@ The Go binary has four modes:
 
 1. **Launcher** (default) — connects Codespaces, prepares the extension session, and replaces itself with Copilot.
 2. **Exec agent** (`gh-copilot-codespace exec`) — deployed to a Codespace for structured remote process execution.
-3. **Extension host** (`gh-copilot-codespace extension-host`) — exposes the 20 first-party remote and lifecycle tools through the Copilot extension API.
+3. **Extension host** (`gh-copilot-codespace extension-host`) — exposes the 21 first-party remote and lifecycle tools through the Copilot extension API.
 4. **Sandbox daemon** (`gh-copilot-codespace daemon`) — runs inside each connected Codespace and handles remote operations over a long-lived JSON protocol stream.
 
 The stable user-scoped extension at `~/.copilot/extensions/copilot-codespace/extension.mjs` activates only when the launcher supplies a valid per-session manifest and token. It forwards the extension host's tools, appended `systemMessage`, and inline `@remote-explorer` agent to `joinSession`.
@@ -87,6 +87,7 @@ If neither `-c/--codespace` nor `--no-codespace` is supplied, the interactive pi
 The extension registers:
 
 - `remote_view`, `remote_edit`, `remote_create`
+- `remote_apply_patch`
 - `remote_bash`, `remote_grep`, `remote_glob`
 - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash`
 - `remote_cd`, `remote_cwd`
@@ -96,6 +97,12 @@ The extension registers:
 - `open_shell`
 
 For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when parallel calls or precise targeting require it. `remote_cd` changes only the default directory for later sequential calls.
+
+- `remote_view` mirrors the local `view` surface with line ranges, `forceReadLargeFiles`, directory listings, image results, and binary metadata.
+- `remote_create` creates parent directories and refuses to overwrite an existing file.
+- `remote_grep` mirrors local `rg` options including `path`/`paths`, `output_mode`, `-i`, `-A`, `-B`, `-C`, `-n`, `head_limit`, and `multiline`.
+- `remote_glob` mirrors local `glob` path selection with `path`/`paths`; results default to 1,000 matches, accept an optional `limit` capped at 10,000, and report truncation in structured metadata.
+- `remote_apply_patch` accepts the canonical `apply_patch` payload and applies it atomically on the Codespace.
 
 ### Explicit file transfer
 

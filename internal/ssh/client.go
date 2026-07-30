@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -37,6 +37,7 @@ type Executor interface {
 	ViewFile(ctx context.Context, path string, viewRange []int) (string, error)
 	EditFile(ctx context.Context, path, oldStr, newStr string) error
 	CreateFile(ctx context.Context, path, content string) error
+	WriteFile(ctx context.Context, path string, content []byte, overwrite bool) error
 	RunBash(ctx context.Context, command, cwd string) (stdout, stderr string, exitCode int, err error)
 	Grep(ctx context.Context, pattern, path, glob, cwd string) (string, error)
 	Glob(ctx context.Context, pattern, path, cwd string) (string, error)
@@ -89,7 +90,7 @@ func (c *Client) GetWorkdir() string {
 // SelectFilesystemHelper records a helper only after its compatibility
 // metadata has been verified by deployment or restore probing.
 func (c *Client) SelectFilesystemHelper(path string, info helperinfo.Info) error {
-	if !filepath.IsAbs(path) {
+	if !pathpkg.IsAbs(path) {
 		return fmt.Errorf("filesystem helper path %q is not absolute", path)
 	}
 	if err := helperinfo.Validate(info); err != nil {
@@ -470,12 +471,20 @@ func (c *Client) resolveWorkdir(cwd string) string {
 	return c.GetWorkdir()
 }
 
+func (c *Client) resolveRemotePath(remotePath string) string {
+	if remotePath == "" || pathpkg.IsAbs(remotePath) {
+		return remotePath
+	}
+	return pathpkg.Join(c.GetWorkdir(), remotePath)
+}
+
 func wrapCommandInWorkdir(command, cwd string) string {
 	return fmt.Sprintf("cd %s && %s", shellQuote(cwd), command)
 }
 
 // ViewFile reads a file with line numbers. If viewRange is provided [start, end], only those lines are shown.
 func (c *Client) ViewFile(ctx context.Context, path string, viewRange []int) (string, error) {
+	path = c.resolveRemotePath(path)
 	var cmd string
 	if len(viewRange) == 2 {
 		if viewRange[1] == -1 {
@@ -501,61 +510,17 @@ func (c *Client) ViewFile(ctx context.Context, path string, viewRange []int) (st
 
 // EditFile replaces exactly one occurrence of oldStr with newStr in the file.
 func (c *Client) EditFile(ctx context.Context, path, oldStr, newStr string) error {
-	// Read file content via SSH
-	stdout, stderr, exitCode, err := c.Exec(ctx, fmt.Sprintf("base64 < %s", shellQuote(path)))
-	if err != nil {
-		return fmt.Errorf("edit file (read): %w", err)
-	}
-	if exitCode != 0 {
-		return fmt.Errorf("edit file (read) failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
-	}
-
-	content, err := base64.StdEncoding.DecodeString(strings.TrimSpace(stdout))
-	if err != nil {
-		return fmt.Errorf("edit file (decode): %w", err)
-	}
-
-	// Do the replacement in Go
-	contentStr := string(content)
-	count := strings.Count(contentStr, oldStr)
-	if count == 0 {
-		return fmt.Errorf("old_str not found in file")
-	}
-	if count > 1 {
-		return fmt.Errorf("old_str found %d times, must be unique", count)
-	}
-
-	newContent := strings.Replace(contentStr, oldStr, newStr, 1)
-
-	// Write back via SSH
-	b64 := base64.StdEncoding.EncodeToString([]byte(newContent))
-	cmd := fmt.Sprintf("echo %s | base64 -d > %s", shellQuote(b64), shellQuote(path))
-	_, stderr, exitCode, err = c.Exec(ctx, cmd)
-	if err != nil {
-		return fmt.Errorf("edit file (write): %w", err)
-	}
-	if exitCode != 0 {
-		return fmt.Errorf("edit file (write) failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
-	}
-	return nil
+	return c.editFileWithRunner(ctx, path, oldStr, newStr)
 }
 
 // CreateFile creates a new file with the given content, creating parent directories as needed.
 func (c *Client) CreateFile(ctx context.Context, path, content string) error {
-	b64 := base64.StdEncoding.EncodeToString([]byte(content))
-	dir := pathDir(path)
+	return c.createFileWithRunner(ctx, path, content)
+}
 
-	cmd := fmt.Sprintf("mkdir -p %s && echo %s | base64 -d > %s",
-		shellQuote(dir), shellQuote(b64), shellQuote(path))
-
-	_, stderr, exitCode, err := c.Exec(ctx, cmd)
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	if exitCode != 0 {
-		return fmt.Errorf("create file failed (exit %d): %s", exitCode, stderr)
-	}
-	return nil
+// WriteFile atomically writes binary content, optionally replacing a regular file.
+func (c *Client) WriteFile(ctx context.Context, path string, content []byte, overwrite bool) error {
+	return c.writeFileWithRunner(ctx, path, content, overwrite)
 }
 
 // RunBash executes a bash command on the codespace.
@@ -566,13 +531,13 @@ func (c *Client) RunBash(ctx context.Context, command, cwd string) (stdout strin
 // Grep searches for a pattern in files on the codespace.
 func (c *Client) Grep(ctx context.Context, pattern, path, globPattern, cwd string) (string, error) {
 	var args []string
-	args = append(args, "rg", "--color=never", "-n")
+	args = append(args, "rg", "--color=never", "-n", "--with-filename", "--no-heading")
 
 	if globPattern != "" {
 		args = append(args, "--glob", shellQuote(globPattern))
 	}
 
-	args = append(args, shellQuote(pattern))
+	args = append(args, "--", shellQuote(pattern))
 
 	searchPath := path
 	if searchPath == "" {
@@ -583,7 +548,7 @@ func (c *Client) Grep(ctx context.Context, pattern, path, globPattern, cwd strin
 	cmd := strings.Join(args, " ")
 
 	// Fallback to grep if rg is not available
-	cmd = fmt.Sprintf("(%s) 2>/dev/null || grep -rn %s %s",
+	cmd = fmt.Sprintf("(%s) 2>/dev/null || grep -Hrn -- %s %s",
 		cmd, shellQuote(pattern), shellQuote(searchPath))
 
 	stdout, _, exitCode, err := c.execReadOnly(ctx, wrapCommandInWorkdir(cmd, c.resolveWorkdir(cwd)))

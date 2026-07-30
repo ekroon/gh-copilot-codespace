@@ -1,6 +1,7 @@
 package daemonproto
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,22 +17,46 @@ import (
 // the framing the corresponding Decoder relies on (and is convenient for
 // `tee` debugging on the wire).
 type Encoder struct {
-	enc *json.Encoder
+	w io.Writer
 }
 
 // NewEncoder constructs an Encoder writing to w.
 func NewEncoder(w io.Writer) *Encoder {
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	return &Encoder{enc: enc}
+	return &Encoder{w: w}
 }
 
 // Write serializes the frame as JSON followed by a newline.
 func (e *Encoder) Write(f Frame) error {
-	if err := e.enc.Encode(f); err != nil {
-		return fmt.Errorf("daemonproto: encode frame: %w", err)
+	data, err := MarshalFrame(f)
+	if err != nil {
+		return err
+	}
+	for len(data) > 0 {
+		written, writeErr := e.w.Write(data)
+		if written > 0 {
+			data = data[written:]
+		}
+		if writeErr != nil {
+			return fmt.Errorf("daemonproto: write frame: %w", writeErr)
+		}
+		if written == 0 {
+			return fmt.Errorf("daemonproto: write frame: %w", io.ErrShortWrite)
+		}
 	}
 	return nil
+}
+
+// MarshalFrame serializes one complete newline-delimited frame without
+// writing it. Callers that need cancellation-aware writes can then track
+// partial progress without risking interleaved JSON.
+func MarshalFrame(f Frame) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(f); err != nil {
+		return nil, fmt.Errorf("daemonproto: encode frame: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // Decoder reads daemonproto frames from an io.Reader. Like Encoder, it uses

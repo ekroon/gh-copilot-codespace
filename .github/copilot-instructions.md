@@ -30,7 +30,7 @@ The single Go binary operates in four modes:
 
 3. **Extension host** (`gh-copilot-codespace extension-host`) — `cmd/gh-copilot-codespace/extension_host.go`
    - Is spawned locally by the user-scoped Copilot extension.
-   - Owns the shared `mcp.ToolRuntime`, exposing its 20 first-party remote and lifecycle tools through a small stdio JSON protocol.
+   - Owns the shared `mcp.ToolRuntime`, exposing its 21 first-party remote and lifecycle tools through a small stdio JSON protocol.
    - Returns `{tools, systemMessage, customAgents}` from `list_tools`; the JavaScript extension forwards these values to `joinSession`.
    - Always builds current-directory guidance: local files supply project context, while repository reads, edits, commands, tests, dependencies, scripts, and Git operations must use the appropriate `remote_*` tools.
    - Supplies `@remote-explorer` as an inline custom agent whenever at least one Codespace is connected; no project agent file is generated.
@@ -48,7 +48,7 @@ The single Go binary operates in four modes:
 - Copilot always stays in the current local checkout.
 - Local project components are context only and are not synchronized with a Codespace.
 - All local tools remain enabled, but repository implementation work belongs in the remote working copy.
-- Use `remote_view`, `remote_edit`, `remote_create`, `remote_grep`, and `remote_glob` for repository files.
+- Use `remote_view`, `remote_edit`, `remote_create`, `remote_apply_patch`, `remote_grep`, and `remote_glob` for repository files.
 - Use `remote_bash` for builds, tests, linters, dependency operations, repository scripts, and Git.
 - Use `remote_copy` only for an explicit one-time file transfer between the local checkout and `cs://<alias>/<path>`; it is not synchronization.
 - Use the inline `@remote-explorer` agent for remote codebase exploration.
@@ -69,6 +69,7 @@ The single Go binary operates in four modes:
 - Extension-host tool calls return transport-neutral `RuntimeCallResult` values.
 - Tool handlers report operational failures as tool results instead of protocol errors.
 - Async bash sessions use tmux names prefixed with `copilot-`.
+- `remote_view` mirrors local `view` capabilities for ranges, directory listings, large-file overrides, and image metadata.
 - `remote_bash`, `remote_grep`, and `remote_glob` should receive explicit working directories when parallel ordering matters.
 - The launcher uses `syscall.Exec`, so it does not remain resident after Copilot starts.
 - The user-scoped extension activates only when its per-session manifest and token validate; unrelated Copilot sessions receive no tools from it.
