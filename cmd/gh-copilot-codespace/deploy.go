@@ -1,52 +1,59 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/daemonproto"
+	"github.com/ekroon/gh-copilot-codespace/internal/helperinfo"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
 
-const remoteBinaryDir = "/tmp/gh-copilot-codespace-bin"
+// Published helpers are intentionally retained. A helper may still back a
+// daemon or per-call fallback, so automatic cleanup must never unlink it.
+const (
+	legacyRemoteBinaryPath = "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace"
+	remoteHelperCacheDir   = ".cache/gh-copilot-codespace/helpers"
+)
+
+type deployBinaryDeps struct {
+	detectArch     func(codespaceName string) (string, error)
+	getLinuxBinary func(arch string) (string, func(), error)
+	binaryVersion  func(binaryPath string) (string, error)
+	remoteCommand  func(codespaceName, command string, stdin []byte) (string, error)
+}
 
 // deployBinary copies this binary to the codespace for use as a remote exec agent.
 // In dev mode (go run / local build), it cross-compiles for linux.
 // In release mode (installed via mise/gh), it downloads the matching linux binary.
 // Returns the remote path to the deployed binary.
 func deployBinary(sshClient *ssh.Client, codespaceName string) (string, error) {
-	// Detect codespace architecture
-	arch, err := detectCodespaceArch(codespaceName)
+	return deployBinaryWithDeps(sshClient, codespaceName, deployBinaryDeps{
+		detectArch:     detectCodespaceArch,
+		getLinuxBinary: getLinuxBinary,
+		binaryVersion:  binaryVersion,
+		remoteCommand:  runDeployRemoteCommand,
+	})
+}
+
+func deployBinaryWithDeps(sshClient *ssh.Client, codespaceName string, deps deployBinaryDeps) (string, error) {
+	arch, err := deps.detectArch(codespaceName)
 	if err != nil {
 		return "", fmt.Errorf("detecting codespace arch: %w", err)
 	}
 
-	remotePath := remoteBinaryDir + "/gh-copilot-codespace"
-
-	// Check if binary already exists on codespace and is current
-	localBin, _ := os.Executable()
-	localInfo, err := os.Stat(localBin)
-	if err != nil {
-		return "", fmt.Errorf("stat local binary: %w", err)
-	}
-
-	// Quick check: if remote binary exists and has the same size, skip deploy
-	sizeCheck := fmt.Sprintf("stat -c %%s %s 2>/dev/null || echo 0", remotePath)
-	out, _ := sshCommand(codespaceName, sizeCheck)
-	remoteSize := strings.TrimSpace(out)
-	if remoteSize == fmt.Sprintf("%d", localInfo.Size()) && runtime.GOOS == "linux" && runtime.GOARCH == arch {
-		// Same binary, skip deploy
-		return remotePath, nil
-	}
-
-	fmt.Fprintln(os.Stderr, "Deploying exec agent to codespace...")
-
-	// Get a linux binary for the codespace
-	linuxBinary, cleanup, err := getLinuxBinary(arch)
+	linuxBinary, cleanup, err := deps.getLinuxBinary(arch)
 	if err != nil {
 		return "", fmt.Errorf("getting linux binary: %w", err)
 	}
@@ -54,29 +61,178 @@ func deployBinary(sshClient *ssh.Client, codespaceName string) (string, error) {
 		defer cleanup()
 	}
 
-	// Transfer via base64 over SSH (gh codespace cp uses SCP which is unreliable)
 	binData, err := os.ReadFile(linuxBinary)
 	if err != nil {
 		return "", fmt.Errorf("reading binary: %w", err)
 	}
-
-	encoded := base64.StdEncoding.EncodeToString(binData)
-	installCmd := fmt.Sprintf("mkdir -p %s && base64 -d > %s && chmod +x %s",
-		remoteBinaryDir, remotePath, remotePath)
-
-	cmd := exec.Command("gh", "codespace", "ssh", "-c", codespaceName, "--", installCmd)
-	cmd.Stdin = strings.NewReader(encoded)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("copying binary to codespace: %w: %s", err, out)
+	digestBytes := sha256.Sum256(binData)
+	digest := hex.EncodeToString(digestBytes[:])
+	version, err := deps.binaryVersion(linuxBinary)
+	if err != nil {
+		return "", fmt.Errorf("reading binary version: %w", err)
 	}
 
+	homeOut, err := deps.remoteCommand(codespaceName, `printf '%s\n' "$HOME"`, nil)
+	if err != nil {
+		return "", fmt.Errorf("detecting remote home: %w", err)
+	}
+	remoteHome := strings.TrimSpace(homeOut)
+	if !pathpkg.IsAbs(remoteHome) {
+		return "", fmt.Errorf("detecting remote home: got non-absolute path %q", remoteHome)
+	}
+
+	compatibilityDir := fmt.Sprintf(
+		"layout-v%d-daemon-v%s-filesystem-v%s",
+		helperinfo.SchemaVersion,
+		daemonproto.ProtocolVersion,
+		helperinfo.FilesystemProtocolVersion,
+	)
+	remotePath := pathpkg.Join(
+		remoteHome,
+		remoteHelperCacheDir,
+		compatibilityDir,
+		sanitizeHelperPathComponent(version),
+		digest,
+		"gh-copilot-codespace",
+	)
+
+	remoteDigest, err := deployedHelperDigest(deps, codespaceName, remotePath)
+	if err != nil {
+		return "", err
+	}
+	if remoteDigest != "" && remoteDigest != digest {
+		return "", fmt.Errorf("content-addressed helper %q has digest %q, want %q; refusing to replace it", remotePath, remoteDigest, digest)
+	}
+
+	if remoteDigest == "" {
+		fmt.Fprintln(os.Stderr, "Deploying exec agent to codespace...")
+		remoteDir := pathpkg.Dir(remotePath)
+		installCmd := fmt.Sprintf(`set -eu
+dir=%s
+dest=%s
+mkdir -p "$dir"
+tmp="$dir/.upload-$$"
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+umask 077
+base64 -d > "$tmp"
+chmod 0755 "$tmp"
+mv -n "$tmp" "$dest"
+test -x "$dest"`,
+			deployShellQuote(remoteDir),
+			deployShellQuote(remotePath),
+		)
+		encoded := []byte(base64.StdEncoding.EncodeToString(binData))
+		if _, err := deps.remoteCommand(codespaceName, installCmd, encoded); err != nil {
+			return "", fmt.Errorf("installing content-addressed helper: %w", err)
+		}
+
+		remoteDigest, err = deployedHelperDigest(deps, codespaceName, remotePath)
+		if err != nil {
+			return "", err
+		}
+		if remoteDigest != digest {
+			return "", fmt.Errorf("deployed helper digest %q does not match local digest %q", remoteDigest, digest)
+		}
+	}
+
+	info, err := probeDeployedHelper(deps, codespaceName, remotePath)
+	if err != nil {
+		return "", err
+	}
+	if info.Version != version {
+		return "", fmt.Errorf("deployed helper version %q does not match candidate version %q", info.Version, version)
+	}
+	if err := sshClient.SelectFilesystemHelper(remotePath, info); err != nil {
+		return "", err
+	}
 	fmt.Fprintf(os.Stderr, "  ✓ Deployed exec agent (%s)\n", arch)
 	return remotePath, nil
 }
 
+func deployedHelperDigest(deps deployBinaryDeps, codespaceName, remotePath string) (string, error) {
+	command := fmt.Sprintf(
+		"if [ -f %s ]; then sha256sum -- %s | awk '{print $1}'; fi",
+		deployShellQuote(remotePath),
+		deployShellQuote(remotePath),
+	)
+	out, err := deps.remoteCommand(codespaceName, command, nil)
+	if err != nil {
+		return "", fmt.Errorf("checking deployed helper digest: %w", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func probeDeployedHelper(deps deployBinaryDeps, codespaceName, remotePath string) (helperinfo.Info, error) {
+	out, err := deps.remoteCommand(codespaceName, deployShellQuote(remotePath)+" helper-info", nil)
+	if err != nil {
+		return helperinfo.Info{}, fmt.Errorf("probing deployed helper compatibility: %w", err)
+	}
+	info, err := helperinfo.Parse([]byte(strings.TrimSpace(out)))
+	if err != nil {
+		return helperinfo.Info{}, fmt.Errorf("probing deployed helper compatibility: %w", err)
+	}
+	return info, nil
+}
+
+func restoreDeployedHelper(sshClient *ssh.Client, codespaceName, remotePath string) error {
+	return restoreDeployedHelperWithDeps(
+		sshClient,
+		codespaceName,
+		remotePath,
+		deployBinaryDeps{remoteCommand: runDeployRemoteCommand},
+	)
+}
+
+func restoreDeployedHelperWithDeps(sshClient *ssh.Client, codespaceName, remotePath string, deps deployBinaryDeps) error {
+	info, err := probeDeployedHelper(deps, codespaceName, remotePath)
+	if err != nil {
+		return err
+	}
+	return sshClient.SelectFilesystemHelper(remotePath, info)
+}
+
+func runDeployRemoteCommand(codespaceName, command string, stdin []byte) (string, error) {
+	cmd := exec.Command("gh", "codespace", "ssh", "-c", codespaceName, "--", command)
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+func deployShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func binaryVersion(binaryPath string) (string, error) {
+	build, err := buildinfo.ReadFile(binaryPath)
+	if err != nil {
+		return "", err
+	}
+	return helperinfo.VersionFromBuildInfo(build), nil
+}
+
+func sanitizeHelperPathComponent(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, value)
+}
+
 // detectCodespaceArch returns the codespace's CPU architecture (amd64 or arm64).
 func detectCodespaceArch(codespaceName string) (string, error) {
-	out, err := sshCommand(codespaceName, "uname -m")
+	out, err := runDeployRemoteCommand(codespaceName, "uname -m", nil)
 	if err != nil {
 		return "", err
 	}
@@ -187,7 +343,9 @@ func findModuleRoot() (string, error) {
 	return "", fmt.Errorf("go.mod not found")
 }
 
-// downloadReleaseBinary downloads the linux binary from the latest GitHub release.
+// downloadReleaseBinary downloads the linux binary from the exact release
+// associated with this build. It deliberately never resolves an untagged
+// "latest" asset.
 func downloadReleaseBinary(arch string) (string, func(), error) {
 	tmpDir, err := os.MkdirTemp("", "gh-copilot-codespace-download-*")
 	if err != nil {
@@ -197,8 +355,15 @@ func downloadReleaseBinary(arch string) (string, func(), error) {
 
 	pattern := fmt.Sprintf("gh-copilot-codespace-linux-%s", arch)
 	outPath := filepath.Join(tmpDir, "gh-copilot-codespace")
+	currentBuild, _ := debug.ReadBuildInfo()
+	releaseTag, err := helperinfo.ReleaseTagFromBuildInfo(currentBuild)
+	if err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("resolving exact release: %w", err)
+	}
 
 	cmd := exec.Command("gh", "release", "download",
+		releaseTag,
 		"--repo", "ekroon/gh-copilot-codespace",
 		"--pattern", pattern,
 		"--output", outPath)

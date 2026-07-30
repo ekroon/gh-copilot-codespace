@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/helperinfo"
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
@@ -42,6 +43,7 @@ Flags:
 
 Subcommands:
   exec                   Execute a command on the codespace (used internally)
+  helper-info            Report helper capabilities (used internally)
   daemon                 Run daemon protocol server (used internally)
 `)
 }
@@ -60,6 +62,18 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "exec" {
 		if err := runExec(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "exec: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "helper-info" {
+		if len(os.Args) != 2 {
+			fmt.Fprintln(os.Stderr, "helper-info: no arguments are accepted")
+			os.Exit(1)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(helperinfo.Current()); err != nil {
+			fmt.Fprintf(os.Stderr, "helper-info: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -100,6 +114,7 @@ func toolRuntimeInputsFromEnv() (*registry.Registry, mcp.LifecycleConfig, error)
 	}
 	lifecycleCfg.LocalWorkdir = os.Getenv(codespaceLocalWorkdirEnv)
 	lifecycleCfg.Provisioners = loadProvisioners()
+	lifecycleCfg.DeployFunc = deployBinary
 
 	var reg *registry.Registry
 	if registryJSON != "" {
@@ -133,11 +148,13 @@ func toolRuntimeInputsFromEnv() (*registry.Registry, mcp.LifecycleConfig, error)
 
 // registryEntry is the JSON-serializable form of a codespace for extension-host.
 type registryEntry struct {
-	Alias      string `json:"alias"`
-	Name       string `json:"name"`
-	Repository string `json:"repository"`
-	Branch     string `json:"branch"`
-	Workdir    string `json:"workdir"`
+	Alias           string `json:"alias"`
+	Name            string `json:"name"`
+	Repository      string `json:"repository"`
+	Branch          string `json:"branch"`
+	Workdir         string `json:"workdir"`
+	HelperPath      string `json:"helperPath,omitempty"`
+	LegacyExecAgent string `json:"execAgent,omitempty"`
 }
 
 type lifecycleConfigEnvData struct {
@@ -196,6 +213,16 @@ func registryFromJSON(data string) (*registry.Registry, error) {
 		if e.Workdir != "" {
 			sshClient.SetWorkdir(e.Workdir)
 		}
+		helperPath := e.HelperPath
+		if helperPath == "" {
+			helperPath = e.LegacyExecAgent
+		}
+		if helperPath != "" {
+			if err := restoreDeployedHelper(sshClient, e.Name, helperPath); err != nil {
+				fmt.Fprintf(os.Stderr, "extension-host: ignoring incompatible helper for %s: %v\n", e.Alias, err)
+				helperPath = ""
+			}
+		}
 		return &registry.ManagedCodespace{
 			Alias:      e.Alias,
 			Name:       e.Name,
@@ -203,6 +230,7 @@ func registryFromJSON(data string) (*registry.Registry, error) {
 			Branch:     e.Branch,
 			Workdir:    e.Workdir,
 			Executor:   sshClient,
+			HelperPath: helperPath,
 		}, nil
 	})
 }
@@ -426,7 +454,7 @@ func runLauncher(args []string) error {
 			Branch:     branch,
 			Workdir:    workdir,
 			Executor:   sshClient,
-			ExecAgent:  remoteBinary,
+			HelperPath: remoteBinary,
 		}); err != nil {
 			return fmt.Errorf("registering selected codespace %q: %w", selected.Name, err)
 		}

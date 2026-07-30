@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -418,6 +420,39 @@ func TestConnectCodespaceHandler_PreservesInMemoryAllowlist(t *testing.T) {
 	policy := state.accessPolicy()
 	if !slices.Equal(policy.AllowedCodespaceNames, []string{"cs-selected"}) {
 		t.Fatalf("allowed codespace names = %v, want [cs-selected]", policy.AllowedCodespaceNames)
+	}
+}
+
+func TestConnectCodespaceHandlerFailedDeployLeavesHelperUnavailable(t *testing.T) {
+	installFakeCodespaceCLI(t, `[{"name":"cs-selected","repository":"owner/repo"}]`, "/workspaces/repo/")
+
+	reg := registry.New()
+	handler := connectCodespaceHandler(reg, LifecycleConfig{
+		DeployFunc: func(*ssh.Client, string) (string, error) {
+			return "", errors.New("deploy failed")
+		},
+	})
+
+	res, _ := handler(context.Background(), makeReq(map[string]any{
+		"name": "cs-selected",
+	}))
+	if res.IsError {
+		t.Fatalf("unexpected connection error: %s", resultText(res))
+	}
+
+	cs, err := reg.Resolve("cs-selected")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if cs.HelperPath != "" {
+		t.Fatalf("HelperPath = %q, want empty", cs.HelperPath)
+	}
+	client, ok := cs.Executor.(*ssh.Client)
+	if !ok {
+		t.Fatalf("Executor = %T, want *ssh.Client", cs.Executor)
+	}
+	if client.FilesystemHelperPath() != "" {
+		t.Fatalf("client helper path = %q, want empty", client.FilesystemHelperPath())
 	}
 }
 

@@ -45,7 +45,7 @@ func wrapExecutorsWithDaemon(ctx context.Context, reg *registry.Registry) []func
 			continue
 		}
 
-		transport := daemontransport.NewSSHTransport(sshClient, cs.Name, daemonDeployBinary)
+		transport := daemontransport.NewSSHTransport(sshClient, cs.Name, daemonDeployerFor(cs, sshClient))
 		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		exec, err := daemonclient.Dial(dialCtx, transport)
 		cancel()
@@ -62,4 +62,14 @@ func wrapExecutorsWithDaemon(ctx context.Context, reg *registry.Registry) []func
 		closers = append(closers, func() { _ = exec.Close() })
 	}
 	return closers
+}
+
+func daemonDeployerFor(cs *registry.ManagedCodespace, sshClient *ssh.Client) daemontransport.Deployer {
+	if cs.HelperPath != "" && sshClient.FilesystemHelperPath() == cs.HelperPath {
+		helperPath := cs.HelperPath
+		return func(*ssh.Client, string) (string, error) {
+			return helperPath, nil
+		}
+	}
+	return daemonDeployBinary
 }

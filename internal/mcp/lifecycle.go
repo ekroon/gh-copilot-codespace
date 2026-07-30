@@ -324,14 +324,16 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 			return toolError(fmt.Sprintf("SSH multiplexing failed: %v", err)), nil
 		}
 
-		// Deploy exec agent binary
-		var execAgent string
+		// Deploy and select a compatible helper binary.
+		var helperPath string
 		if state.cfg.DeployFunc != nil {
 			remotePath, err := state.cfg.DeployFunc(sshClient, csName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed: %v\n", err)
+			} else if selected := sshClient.FilesystemHelperPath(); selected == "" || selected != remotePath {
+				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy returned an unverified helper path %q\n", remotePath)
 			} else {
-				execAgent = remotePath
+				helperPath = selected
 			}
 		}
 
@@ -354,7 +356,7 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 			Branch:     branch,
 			Workdir:    workdir,
 			Executor:   sshClient,
-			ExecAgent:  execAgent,
+			HelperPath: helperPath,
 		}
 		if err := reg.Register(cs); err != nil {
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
@@ -474,14 +476,16 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 			return toolError(fmt.Sprintf("SSH setup failed: %v", err)), nil
 		}
 
-		// Deploy exec agent binary
-		var execAgent string
+		// Deploy and select a compatible helper binary.
+		var helperPath string
 		if state.cfg.DeployFunc != nil {
 			remotePath, err := state.cfg.DeployFunc(sshClient, csName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed for %s: %v\n", csName, err)
+			} else if selected := sshClient.FilesystemHelperPath(); selected == "" || selected != remotePath {
+				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy returned an unverified helper path %q for %s\n", remotePath, csName)
 			} else {
-				execAgent = remotePath
+				helperPath = selected
 			}
 		}
 
@@ -493,7 +497,7 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 			Repository: repoInfo,
 			Workdir:    workdir,
 			Executor:   sshClient,
-			ExecAgent:  execAgent,
+			HelperPath: helperPath,
 		}
 		if err := reg.Register(cs); err != nil {
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil

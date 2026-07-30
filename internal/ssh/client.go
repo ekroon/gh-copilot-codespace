@@ -17,17 +17,19 @@ import (
 	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/codespaceenv"
+	"github.com/ekroon/gh-copilot-codespace/internal/helperinfo"
 )
 
 // Client manages SSH connections to a GitHub Codespace via gh CLI.
 type Client struct {
-	codespaceName  string
-	mu             sync.Mutex
-	sshConfigPath  string // path to generated SSH config with ControlMaster
-	sshHost        string // SSH host alias (e.g., "cs.develop-xxx")
-	controlSocket  string // path to control socket
-	workdir        string // current working directory on the codespace
-	commandContext func(ctx context.Context, name string, args ...string) *exec.Cmd
+	codespaceName        string
+	mu                   sync.Mutex
+	sshConfigPath        string // path to generated SSH config with ControlMaster
+	sshHost              string // SSH host alias (e.g., "cs.develop-xxx")
+	controlSocket        string // path to control socket
+	workdir              string // current working directory on the codespace
+	filesystemHelperPath string
+	commandContext       func(ctx context.Context, name string, args ...string) *exec.Cmd
 }
 
 // Executor defines the operations that MCP handlers use to interact with a codespace.
@@ -82,6 +84,28 @@ func (c *Client) GetWorkdir() string {
 		return wd
 	}
 	return "/workspaces"
+}
+
+// SelectFilesystemHelper records a helper only after its compatibility
+// metadata has been verified by deployment or restore probing.
+func (c *Client) SelectFilesystemHelper(path string, info helperinfo.Info) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("filesystem helper path %q is not absolute", path)
+	}
+	if err := helperinfo.Validate(info); err != nil {
+		return fmt.Errorf("select filesystem helper: %w", err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.filesystemHelperPath = path
+	return nil
+}
+
+// FilesystemHelperPath returns the configured deployed filesystem helper.
+func (c *Client) FilesystemHelperPath() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.filesystemHelperPath
 }
 
 func (c *Client) sshState() (sshConfigPath, sshHost, controlSocket string) {

@@ -54,6 +54,7 @@ func extensionHostEnv(reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig, 
 			Repository: cs.Repository,
 			Branch:     cs.Branch,
 			Workdir:    cs.Workdir,
+			HelperPath: cs.HelperPath,
 		})
 	}
 	registryJSON, _ := json.Marshal(entries)

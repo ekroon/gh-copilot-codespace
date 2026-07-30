@@ -17,7 +17,7 @@ type ManagedCodespace struct {
 	Branch     string
 	Workdir    string       // detected workspace directory on the codespace
 	Executor   ssh.Executor // SSH client for this codespace
-	ExecAgent  string       // remote path to deployed binary (may be empty)
+	HelperPath string       // verified remote helper path (may be empty)
 }
 
 // Registry manages multiple codespace connections keyed by alias.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/helperinfo"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
@@ -102,6 +103,26 @@ func TestWrapExecutorsHandlesDialFailureGracefully(t *testing.T) {
 	}
 	if cs.Executor != sshClient {
 		t.Fatalf("expected original ssh executor after dial failure")
+	}
+}
+
+func TestDaemonDeployerReusesVerifiedHelperPath(t *testing.T) {
+	client := ssh.NewClient("test-codespace")
+	if err := client.SelectFilesystemHelper("/home/codespace/helper", helperinfo.Current()); err != nil {
+		t.Fatalf("SelectFilesystemHelper() error = %v", err)
+	}
+	cs := &registry.ManagedCodespace{
+		Name:       "test-codespace",
+		HelperPath: "/home/codespace/helper",
+		Executor:   client,
+	}
+
+	path, err := daemonDeployerFor(cs, client)(client, cs.Name)
+	if err != nil {
+		t.Fatalf("daemon deployer error = %v", err)
+	}
+	if path != cs.HelperPath {
+		t.Fatalf("daemon path = %q, want %q", path, cs.HelperPath)
 	}
 }
 
