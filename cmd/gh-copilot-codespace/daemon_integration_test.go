@@ -259,6 +259,30 @@ func TestIntegration_DaemonSessionLifecycle(t *testing.T) {
 	}
 }
 
+func TestIntegration_DaemonProcessSessionDoesNotShadowTmuxAfterReconnect(t *testing.T) {
+	cs := testCodespace(t)
+	sessionID := fmt.Sprintf("it-reconnect-%d", time.Now().UnixNano())
+
+	first := dialDaemon(t, cs)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := first.StartSession(ctx, sessionID, "sleep 30", "/tmp"); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first daemon: %v", err)
+	}
+
+	second := dialDaemon(t, cs)
+	t.Cleanup(func() { _ = second.StopSession(context.Background(), sessionID) })
+	if !second.SupportsProcessSessions() {
+		t.Fatal("second daemon does not advertise process sessions")
+	}
+	if err := second.StartProcessSession(ctx, sessionID, "printf shadowed", "/tmp"); err == nil {
+		t.Fatal("StartProcessSession with retained tmux ID error = nil")
+	}
+}
+
 func TestIntegration_DaemonViewFileLineNumbers(t *testing.T) {
 	cs := testCodespace(t)
 	exec := dialDaemon(t, cs)
@@ -666,6 +690,8 @@ func TestIntegration_ExtensionHostRemoteBashReceivesGitHubAuthEnvironment(t *tes
 test "$GH_TOKEN" = "$GITHUB_TOKEN" &&
 test -n "$GITHUB_SERVER_URL" &&
 test -n "$(gh auth token)" &&
+case ":$PATH:" in *":$HOME/.local/bin:"*) true;; *) false;; esac &&
+case ":$PATH:" in *":$HOME/.local/share/mise/shims:"*) true;; *) false;; esac &&
 printf auth-environment-ok`,
 		"initial_wait": 5,
 	})

@@ -66,13 +66,69 @@ type daemonProcessSession struct {
 	waitErr   error
 	stopErr   error
 
-	done     chan struct{}
-	stopOnce sync.Once
-	stopped  chan struct{}
+	done      chan struct{}
+	stopOnce  sync.Once
+	stopped   chan struct{}
+	forceStop chan struct{}
+	forceOnce sync.Once
 }
 
 var daemonProcessSessions sync.Map
 var daemonSessionIDs sync.Map
+
+func daemonProcessEnvironment(base []string) []string {
+	result := append([]string(nil), base...)
+	home := ""
+	pathValue := ""
+	pathIndex := -1
+	for i, entry := range result {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "HOME":
+			home = value
+		case "PATH":
+			pathValue = value
+			pathIndex = i
+		}
+	}
+	if home == "" {
+		return result
+	}
+
+	pathValue = strings.Join([]string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".local", "share", "mise", "shims"),
+		pathValue,
+	}, ":")
+	if pathIndex >= 0 {
+		result[pathIndex] = "PATH=" + pathValue
+	} else {
+		result = append(result, "PATH="+pathValue)
+	}
+	return result
+}
+
+func daemonTmuxSessionExists(ctx context.Context, sessionID string) (bool, error) {
+	command := fmt.Sprintf(
+		"command -v tmux >/dev/null 2>&1 && tmux has-session -t %s 2>/dev/null",
+		shellQuote(daemonTmuxSessionName(sessionID)),
+	)
+	_, stderr, exitCode, err := daemonExecTmux(ctx, command)
+	if err != nil {
+		return false, fmt.Errorf("check existing tmux session: %w", err)
+	}
+	switch exitCode {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		return false, daemonFormatCommandFailure("check existing tmux session", exitCode, stderr)
+	}
+}
 
 func daemonReserveSessionID(sessionID, backend string) error {
 	if sessionID == "" {
@@ -92,6 +148,13 @@ func daemonStartProcessSession(ctx context.Context, sessionID, command, cwd stri
 	if err := ctx.Err(); err != nil {
 		return errDaemonCanceled
 	}
+	tmuxExists, err := daemonTmuxSessionExists(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if tmuxExists {
+		return fmt.Errorf("session %q already exists with backend tmux", sessionID)
+	}
 	if err := daemonReserveSessionID(sessionID, "process"); err != nil {
 		return err
 	}
@@ -102,10 +165,11 @@ func daemonStartProcessSession(ctx context.Context, sessionID, command, cwd stri
 		}
 	}()
 	state := &daemonProcessSession{
-		output:   &daemonProcessOutput{},
-		done:     make(chan struct{}),
-		stopped:  make(chan struct{}),
-		exitCode: -1,
+		output:    &daemonProcessOutput{},
+		done:      make(chan struct{}),
+		stopped:   make(chan struct{}),
+		forceStop: make(chan struct{}),
+		exitCode:  -1,
 	}
 
 	cgroup, cgroupErr := daemonCreateProcessCgroup(sessionID)
@@ -131,7 +195,7 @@ func daemonStartProcessSession(ctx context.Context, sessionID, command, cwd stri
 		cmd.Dir = cwd
 	}
 	cmd.ExtraFiles = []*os.File{gateRead}
-	cmd.Env = os.Environ()
+	cmd.Env = daemonProcessEnvironment(os.Environ())
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdout = state.output
 	cmd.Stderr = state.output
@@ -302,6 +366,8 @@ func (s *daemonProcessSession) beginStop(sessionID string) {
 			case <-s.done:
 				timer.Stop()
 				return
+			case <-s.forceStop:
+				timer.Stop()
 			case <-timer.C:
 			}
 
@@ -319,6 +385,10 @@ func (s *daemonProcessSession) beginStop(sessionID string) {
 	})
 }
 
+func (s *daemonProcessSession) forceStopNow() {
+	s.forceOnce.Do(func() { close(s.forceStop) })
+}
+
 func (s *daemonProcessSession) stopCgroupSession(sessionID string) {
 	select {
 	case <-s.done:
@@ -327,6 +397,8 @@ func (s *daemonProcessSession) stopCgroupSession(sessionID string) {
 		timer := time.NewTimer(2 * time.Second)
 		select {
 		case <-s.done:
+			timer.Stop()
+		case <-s.forceStop:
 			timer.Stop()
 		case <-timer.C:
 		}
@@ -525,6 +597,7 @@ func daemonStopAllProcessSessions() {
 	daemonProcessSessions.Range(func(key, value any) bool {
 		state := value.(*daemonProcessSession)
 		states = append(states, state)
+		state.forceStopNow()
 		state.beginStop(key.(string))
 		return true
 	})

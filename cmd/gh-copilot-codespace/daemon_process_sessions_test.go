@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -41,6 +42,18 @@ func TestDaemonSessionIDReservationRejectsCrossBackendDuplicate(t *testing.T) {
 
 	if err := daemonReserveSessionID(sessionID, "tmux"); err == nil {
 		t.Fatal("second daemonReserveSessionID() error = nil")
+	}
+}
+
+func TestDaemonProcessEnvironmentPrependsMisePaths(t *testing.T) {
+	got := daemonProcessEnvironment([]string{
+		"HOME=/home/codespace",
+		"PATH=/usr/local/bin:/usr/bin",
+		"OTHER=value",
+	})
+	wantPath := "PATH=/home/codespace/.local/bin:/home/codespace/.local/share/mise/shims:/usr/local/bin:/usr/bin"
+	if !slices.Contains(got, wantPath) {
+		t.Fatalf("daemonProcessEnvironment() = %v, want %q", got, wantPath)
 	}
 }
 
@@ -224,4 +237,24 @@ func TestDaemonProcessSessionStopKillsSetsidDescendant(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("setsid child process %d survived session stop", childPID)
+}
+
+func TestDaemonProcessSessionForcedStopSkipsGracePeriod(t *testing.T) {
+	sessionID := "process-force-stop"
+	if err := daemonStartProcessSession(context.Background(), sessionID, "trap '' TERM; sleep 30", t.TempDir()); err != nil {
+		t.Fatalf("daemonStartProcessSession() error = %v", err)
+	}
+	value, ok := daemonProcessSessions.Load(sessionID)
+	if !ok {
+		t.Fatalf("session %q is not tracked", sessionID)
+	}
+	value.(*daemonProcessSession).forceStopNow()
+
+	start := time.Now()
+	if err := daemonStopProcessSession(context.Background(), sessionID); err != nil {
+		t.Fatalf("daemonStopProcessSession() error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("forced stop took %v, want <= 1s", elapsed)
+	}
 }
