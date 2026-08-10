@@ -3,10 +3,13 @@ package helperinfo
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"runtime/debug"
 	"slices"
 	"strings"
 )
+
+var pseudoVersionRevisionRE = regexp.MustCompile(`-\d{14}-([0-9a-fA-F]{7,})$`)
 
 const (
 	SchemaVersion             = 1
@@ -60,7 +63,11 @@ func VersionFromBuildInfo(build *debug.BuildInfo) string {
 
 func ReleaseTagFromBuildInfo(build *debug.BuildInfo) (string, error) {
 	if build != nil {
-		if version := strings.TrimSpace(build.Main.Version); strings.HasPrefix(version, "v") {
+		version := strings.TrimSpace(build.Main.Version)
+		if match := pseudoVersionRevisionRE.FindStringSubmatch(version); len(match) == 2 {
+			return "dev-" + strings.ToLower(match[1][:7]), nil
+		}
+		if strings.HasPrefix(version, "v") {
 			return version, nil
 		}
 		for _, setting := range build.Settings {

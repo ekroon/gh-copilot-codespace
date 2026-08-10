@@ -44,3 +44,17 @@ func TestReleaseTagFromBuildInfoRequiresExactBuildIdentity(t *testing.T) {
 		t.Fatal("ReleaseTagFromBuildInfo() error = nil for modified build")
 	}
 }
+
+func TestReleaseTagFromBuildInfoMapsGoPseudoVersionToDevRelease(t *testing.T) {
+	build := &debug.BuildInfo{
+		Main: debug.Module{Version: "v0.0.0-20260810143503-3010c1869036"},
+	}
+
+	tag, err := ReleaseTagFromBuildInfo(build)
+	if err != nil {
+		t.Fatalf("ReleaseTagFromBuildInfo() error = %v", err)
+	}
+	if tag != "dev-3010c18" {
+		t.Fatalf("release tag = %q, want dev-3010c18", tag)
+	}
+}
