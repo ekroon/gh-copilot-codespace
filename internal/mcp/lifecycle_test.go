@@ -179,7 +179,13 @@ func TestCreateCodespaceHandler_CreateFails(t *testing.T) {
 
 func TestDeleteCodespaceHandler_Disconnect(t *testing.T) {
 	reg := registry.New()
-	reg.Register(&registry.ManagedCodespace{Alias: "github", Name: "cs-abc", Executor: &mockExecutor{}})
+	cleanupCalls := 0
+	reg.Register(&registry.ManagedCodespace{
+		Alias:    "github",
+		Name:     "cs-abc",
+		Executor: &mockExecutor{},
+		Cleanup:  func() { cleanupCalls++ },
+	})
 
 	gh := &mockGHRunner{}
 	handler := deleteCodespaceHandler(reg, gh)
@@ -200,6 +206,9 @@ func TestDeleteCodespaceHandler_Disconnect(t *testing.T) {
 	// Verify deregistered
 	if reg.Len() != 0 {
 		t.Error("expected registry to be empty after disconnect")
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", cleanupCalls)
 	}
 }
 
@@ -453,6 +462,34 @@ func TestConnectCodespaceHandlerFailedDeployLeavesHelperUnavailable(t *testing.T
 	}
 	if client.FilesystemHelperPath() != "" {
 		t.Fatalf("client helper path = %q, want empty", client.FilesystemHelperPath())
+	}
+}
+
+func TestConnectCodespaceHandlerSetsUpConfiguredExecutor(t *testing.T) {
+	installFakeCodespaceCLI(t, `[{"name":"cs-selected","repository":"owner/repo"}]`, "/workspaces/repo/")
+
+	reg := registry.New()
+	wrapped := &mockExecutor{}
+	handler := connectCodespaceHandler(reg, LifecycleConfig{
+		ExecutorSetup: func(_ context.Context, cs *registry.ManagedCodespace) error {
+			cs.Executor = wrapped
+			return nil
+		},
+	})
+
+	res, _ := handler(context.Background(), makeReq(map[string]any{
+		"name": "cs-selected",
+	}))
+	if res.IsError {
+		t.Fatalf("unexpected connection error: %s", resultText(res))
+	}
+
+	cs, err := reg.Resolve("cs-selected")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if cs.Executor != wrapped {
+		t.Fatalf("Executor = %T, want configured executor", cs.Executor)
 	}
 }
 
@@ -783,6 +820,41 @@ func TestCreateCodespaceHandler_RegistersWithoutWorkspacePersistence(t *testing.
 	}
 	if reg.Len() != 1 {
 		t.Fatalf("expected registered codespace, got %d entries", reg.Len())
+	}
+}
+
+func TestCreateCodespaceHandlerSetsUpConfiguredExecutor(t *testing.T) {
+	installFakeCodespaceCLI(t, `[{"name":"cs-created","repository":"owner/repo"}]`, "/workspaces/repo/")
+
+	reg := registry.New()
+	wrapped := &mockExecutor{}
+	gh := &mockGHRunner{
+		results: map[string]mockGHResult{
+			"codespace create": {output: "cs-created"},
+			"codespace ssh":    {output: "ready"},
+		},
+	}
+	handler := createCodespaceHandler(reg, LifecycleConfig{
+		GHRunner: gh,
+		ExecutorSetup: func(_ context.Context, cs *registry.ManagedCodespace) error {
+			cs.Executor = wrapped
+			return nil
+		},
+	})
+
+	res, _ := handler(context.Background(), makeReq(map[string]any{
+		"repository": "owner/repo",
+	}))
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", resultText(res))
+	}
+
+	cs, err := reg.Resolve("repo")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if cs.Executor != wrapped {
+		t.Fatalf("Executor = %T, want configured executor", cs.Executor)
 	}
 }
 

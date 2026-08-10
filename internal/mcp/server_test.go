@@ -941,8 +941,10 @@ type mockExecutor struct {
 	readSessionResults  []string
 	readSessionResult   string
 	readSessionErr      error
+	readSessionFunc     func(context.Context) (string, error)
 	stopSessionCalls    int
 	stopSessionErr      error
+	stopSessionCtxErr   error
 	listSessionsResult  string
 	listSessionsErr     error
 	workdir             string
@@ -1032,8 +1034,11 @@ func (m *mockExecutor) WriteSession(_ context.Context, _, _ string) error {
 	return m.writeSessionErr
 }
 
-func (m *mockExecutor) ReadSession(_ context.Context, _ string) (string, error) {
+func (m *mockExecutor) ReadSession(ctx context.Context, _ string) (string, error) {
 	m.readSessionCalls++
+	if m.readSessionFunc != nil {
+		return m.readSessionFunc(ctx)
+	}
 	if len(m.readSessionResults) > 0 {
 		result := m.readSessionResults[0]
 		m.readSessionResults = m.readSessionResults[1:]
@@ -1042,8 +1047,9 @@ func (m *mockExecutor) ReadSession(_ context.Context, _ string) (string, error) 
 	return m.readSessionResult, m.readSessionErr
 }
 
-func (m *mockExecutor) StopSession(_ context.Context, _ string) error {
+func (m *mockExecutor) StopSession(ctx context.Context, _ string) error {
 	m.stopSessionCalls++
+	m.stopSessionCtxErr = ctx.Err()
 	return m.stopSessionErr
 }
 
@@ -1258,6 +1264,93 @@ func TestBashHandler_DefaultReturnsCompletedSessionOutput(t *testing.T) {
 	}
 	if mock.runBashCalls != 0 {
 		t.Fatalf("runBashCalls = %d, want 0", mock.runBashCalls)
+	}
+}
+
+func TestBashHandler_DefaultReturnsAsSoonAsSessionCompletes(t *testing.T) {
+	mock := &mockExecutor{
+		readSessionResults: []string{
+			"starting",
+			"done\n[session exited]",
+		},
+	}
+
+	handler := bashHandler(testReg(mock))
+	start := time.Now()
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command":      "echo done",
+		"shellId":      "s-fast",
+		"initial_wait": 1.0,
+	}))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if got := resultText(res); got != "done" {
+		t.Fatalf("result text = %q, want %q", got, "done")
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("completed session returned after %v, want less than 500ms", elapsed)
+	}
+	if mock.readSessionCalls < 2 {
+		t.Fatalf("readSessionCalls = %d, want at least 2", mock.readSessionCalls)
+	}
+}
+
+func TestBashHandler_DefaultBoundsSlowSessionReads(t *testing.T) {
+	mock := &mockExecutor{
+		readSessionFunc: func(ctx context.Context) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+
+	handler := bashHandler(testReg(mock))
+	start := time.Now()
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command":      "sleep 10",
+		"shellId":      "s-slow-read",
+		"initial_wait": 0.05,
+	}))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected running session result, got tool error: %s", resultText(res))
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("slow session read returned after %v, want less than 500ms", elapsed)
+	}
+	if !strings.Contains(resultText(res), "[shellId: s-slow-read") {
+		t.Fatalf("unexpected result text: %q", resultText(res))
+	}
+}
+
+func TestBashHandler_DefaultUsesFreshContextForCancellationCleanup(t *testing.T) {
+	mock := &mockExecutor{}
+	handler := bashHandler(testReg(mock))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := handler(ctx, makeReq(map[string]any{
+		"command": "sleep 10",
+		"shellId": "s-cancelled",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected cancellation tool error")
+	}
+	if mock.stopSessionCalls != 1 {
+		t.Fatalf("stopSessionCalls = %d, want 1", mock.stopSessionCalls)
+	}
+	if mock.stopSessionCtxErr != nil {
+		t.Fatalf("cleanup context error = %v, want nil", mock.stopSessionCtxErr)
 	}
 }
 

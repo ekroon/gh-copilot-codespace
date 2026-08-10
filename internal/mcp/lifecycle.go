@@ -23,6 +23,10 @@ import (
 // Returns the remote path to the deployed binary, or error.
 type DeployFunc func(sshClient *ssh.Client, codespaceName string) (string, error)
 
+// ExecutorSetup upgrades a newly connected codespace executor when available.
+// Implementations may replace cs.Executor and should leave it unchanged on error.
+type ExecutorSetup func(ctx context.Context, cs *registry.ManagedCodespace) error
+
 // CodespaceAccessPolicy carries launcher-selected connection policy state.
 type CodespaceAccessPolicy struct {
 	SelectedOnly          bool     `json:"selectedOnly,omitempty"`
@@ -31,11 +35,12 @@ type CodespaceAccessPolicy struct {
 
 // LifecycleConfig holds dependencies and launcher context for lifecycle tool handlers.
 type LifecycleConfig struct {
-	GHRunner     GHRunner
-	DeployFunc   DeployFunc                // optional: deploy exec agent after SSH setup
-	Provisioners []provisioner.Provisioner // optional: run after setup
-	AccessPolicy CodespaceAccessPolicy
-	LocalWorkdir string // optional local root for tools that bridge local and remote files
+	GHRunner      GHRunner
+	DeployFunc    DeployFunc                // optional: deploy exec agent after SSH setup
+	ExecutorSetup ExecutorSetup             // optional: replace the direct SSH executor after setup
+	Provisioners  []provisioner.Provisioner // optional: run after setup
+	AccessPolicy  CodespaceAccessPolicy
+	LocalWorkdir  string // optional local root for tools that bridge local and remote files
 }
 
 // LifecycleConfigData is the serializable launcher context for lifecycle handlers.
@@ -339,6 +344,7 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 
 		// Detect workdir
 		workdir := detectCSWorkdir(ctx, sshClient, repo)
+		sshClient.SetWorkdir(workdir)
 
 		// Checkout branch if specified
 		if branch != "" {
@@ -357,6 +363,11 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 			Workdir:    workdir,
 			Executor:   sshClient,
 			HelperPath: helperPath,
+		}
+		if state.cfg.ExecutorSetup != nil {
+			if err := state.cfg.ExecutorSetup(ctx, cs); err != nil {
+				fmt.Fprintf(os.Stderr, "  ⚠ executor setup failed: %v\n", err)
+			}
 		}
 		if err := reg.Register(cs); err != nil {
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
@@ -490,6 +501,7 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 		}
 
 		workdir := detectCSWorkdir(ctx, sshClient, repoInfo)
+		sshClient.SetWorkdir(workdir)
 
 		cs := &registry.ManagedCodespace{
 			Alias:      alias,
@@ -498,6 +510,11 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 			Workdir:    workdir,
 			Executor:   sshClient,
 			HelperPath: helperPath,
+		}
+		if state.cfg.ExecutorSetup != nil {
+			if err := state.cfg.ExecutorSetup(ctx, cs); err != nil {
+				fmt.Fprintf(os.Stderr, "  ⚠ executor setup failed for %s: %v\n", csName, err)
+			}
 		}
 		if err := reg.Register(cs); err != nil {
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
@@ -587,7 +604,10 @@ func deleteCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 			}
 		}
 
-		reg.Deregister(alias)
+		removed := reg.Deregister(alias)
+		if removed != nil && removed.Cleanup != nil {
+			removed.Cleanup()
+		}
 
 		if shouldDelete {
 			if _, err := state.cfg.GHRunner.Run(ctx, "codespace", "delete", "-c", csName, "--force"); err != nil {

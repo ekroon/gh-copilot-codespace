@@ -18,6 +18,7 @@ type ManagedCodespace struct {
 	Workdir    string       // detected workspace directory on the codespace
 	Executor   ssh.Executor // SSH client for this codespace
 	HelperPath string       // verified remote helper path (may be empty)
+	Cleanup    func()       // optional executor cleanup, safe to call once
 }
 
 // Registry manages multiple codespace connections keyed by alias.
@@ -49,10 +50,12 @@ func (r *Registry) Register(cs *ManagedCodespace) error {
 }
 
 // Deregister removes a codespace from the registry.
-func (r *Registry) Deregister(alias string) {
+func (r *Registry) Deregister(alias string) *ManagedCodespace {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	cs := r.codespaces[alias]
 	delete(r.codespaces, alias)
+	return cs
 }
 
 // Resolve finds a codespace by alias. When alias is empty and exactly one

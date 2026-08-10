@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
+	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 )
 
 type extensionHostRequest struct {
@@ -61,6 +62,16 @@ func runExtensionHostIO(in io.Reader, out io.Writer) error {
 	}
 	ctx := context.Background()
 	closers := wrapExecutorsWithDaemon(ctx, reg)
+	lifecycleCfg.ExecutorSetup = func(ctx context.Context, cs *registry.ManagedCodespace) error {
+		closeExecutor, err := wrapExecutorWithDaemon(ctx, cs)
+		if err != nil {
+			return err
+		}
+		if closeExecutor != nil {
+			closers = append(closers, closeExecutor)
+		}
+		return nil
+	}
 	defer func() {
 		for _, c := range closers {
 			c()

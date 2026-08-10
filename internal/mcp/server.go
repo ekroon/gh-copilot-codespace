@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -695,10 +696,9 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		if err := c.StartSession(ctx, shellId, command, cwd); err != nil {
 			return runBashSyncFallback(ctx, c, command, cwd), nil
 		}
-		time.Sleep(time.Duration(initialWait * float64(time.Second)))
-		output, err := c.ReadSession(ctx, shellId)
+		output, err := waitForSessionOutput(ctx, c, shellId, time.Duration(initialWait*float64(time.Second)))
 		if err != nil {
-			if stopErr := c.StopSession(ctx, shellId); stopErr != nil {
+			if stopErr := stopSessionForCleanup(c, shellId); stopErr != nil {
 				return toolError(fmt.Sprintf("%s\n\nAdditionally, failed to stop session %s after read failure: %v", err.Error(), shellId, stopErr)), nil
 			}
 			return toolError(err.Error()), nil
@@ -706,7 +706,7 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		if sessionOutputExited(output) {
 			finalOutput := trimSessionExitMarker(output)
-			if err := c.StopSession(ctx, shellId); err != nil {
+			if err := stopSessionForCleanup(c, shellId); err != nil {
 				if finalOutput != "" {
 					finalOutput += "\n"
 				}
@@ -717,6 +717,68 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		return toolSuccess(fmt.Sprintf("%s\n\n[shellId: %s — use remote_read_bash to check for more output]", output, shellId)), nil
 	}
+}
+
+func waitForSessionOutput(ctx context.Context, c ssh.Executor, shellID string, wait time.Duration) (string, error) {
+	deadline := time.Now().Add(wait)
+	delay := 100 * time.Millisecond
+	var output string
+
+	for {
+		readCtx := ctx
+		cancel := func() {}
+		if wait > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return output, nil
+			}
+			readCtx, cancel = context.WithTimeout(ctx, remaining)
+		}
+
+		nextOutput, err := c.ReadSession(readCtx, shellID)
+		cancel()
+		if err != nil && ctx.Err() == nil && wait > 0 && errors.Is(err, context.DeadlineExceeded) {
+			return output, nil
+		}
+		if err != nil || wait <= 0 {
+			return nextOutput, err
+		}
+		output = nextOutput
+		if sessionOutputExited(output) {
+			return output, nil
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return output, nil
+		}
+		if delay > remaining {
+			delay = remaining
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
+}
+
+func stopSessionForCleanup(c ssh.Executor, shellID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return c.StopSession(ctx, shellID)
 }
 
 func runBashSyncFallback(ctx context.Context, c ssh.Executor, command, cwd string) *mcpsdk.CallToolResult {

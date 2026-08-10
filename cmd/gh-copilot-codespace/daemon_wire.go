@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/daemonclient"
@@ -40,28 +41,43 @@ func wrapExecutorsWithDaemon(ctx context.Context, reg *registry.Registry) []func
 
 	var closers []func()
 	for _, cs := range reg.All() {
-		sshClient, ok := cs.Executor.(*ssh.Client)
-		if !ok {
-			continue
-		}
-
-		transport := daemontransport.NewSSHTransport(sshClient, cs.Name, daemonDeployerFor(cs, sshClient))
-		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		exec, err := daemonclient.Dial(dialCtx, transport)
-		cancel()
+		closeExecutor, err := wrapExecutorWithDaemon(ctx, cs)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "daemon: dial failed for %s, falling back to ssh: %v\n", cs.Alias, err)
-			_ = transport.Close()
 			continue
 		}
-
-		if wd := sshClient.GetWorkdir(); wd != "" {
-			exec.SetWorkdir(wd)
+		if closeExecutor != nil {
+			closers = append(closers, closeExecutor)
 		}
-		cs.Executor = exec
-		closers = append(closers, func() { _ = exec.Close() })
 	}
 	return closers
+}
+
+func wrapExecutorWithDaemon(ctx context.Context, cs *registry.ManagedCodespace) (func(), error) {
+	if daemonDisabled() {
+		return nil, nil
+	}
+
+	sshClient, ok := cs.Executor.(*ssh.Client)
+	if !ok {
+		return nil, nil
+	}
+
+	transport := daemontransport.NewSSHTransport(sshClient, cs.Name, daemonDeployerFor(cs, sshClient))
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	exec, err := daemonclient.Dial(dialCtx, transport)
+	cancel()
+	if err != nil {
+		_ = transport.Close()
+		return nil, err
+	}
+
+	if wd := sshClient.GetWorkdir(); wd != "" {
+		exec.SetWorkdir(wd)
+	}
+	cs.Executor = exec
+	cs.Cleanup = sync.OnceFunc(func() { _ = exec.Close() })
+	return cs.Cleanup, nil
 }
 
 func daemonDeployerFor(cs *registry.ManagedCodespace, sshClient *ssh.Client) daemontransport.Deployer {
