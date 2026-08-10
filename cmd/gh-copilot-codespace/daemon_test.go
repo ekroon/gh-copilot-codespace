@@ -292,12 +292,14 @@ func TestDaemonRemoveSessionStateCancelsWaiter(t *testing.T) {
 }
 
 func TestDaemonSessionSupervisorSignalsCompletion(t *testing.T) {
-	got := daemonSessionSupervisorCommand("copilot-start-123", "copilot-exit-123", "printf first")
+	got := daemonSessionSupervisorCommand("copilot-session-123", "copilot-start-123", "copilot-exit-123", "printf first")
 	for _, want := range []string{
 		"bash -c ",
 		"tmux wait-for",
 		"bash -c",
 		"copilot_exit_code=$?",
+		"tmux set-option",
+		daemonExitStatusOption,
 		"tmux wait-for -S",
 		"exit $copilot_exit_code",
 	} {

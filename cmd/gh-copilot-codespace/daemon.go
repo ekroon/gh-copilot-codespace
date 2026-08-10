@@ -28,6 +28,7 @@ const (
 	daemonMisePATH          = `PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"`
 	daemonSessionExitMarker = "[session exited]"
 	daemonCompletionOption  = "@copilot_completion_channel"
+	daemonExitStatusOption  = "@copilot_exit_status"
 )
 
 var errDaemonCanceled = errors.New("request canceled")
@@ -649,12 +650,14 @@ func daemonNewTmuxChannel(kind string) (string, error) {
 	return fmt.Sprintf("copilot-%s-%x", kind, nonce[:]), nil
 }
 
-func daemonSessionSupervisorCommand(startChannel, completionChannel, command string) string {
+func daemonSessionSupervisorCommand(sessionName, startChannel, completionChannel, command string) string {
 	script := fmt.Sprintf(
-		"%s && tmux wait-for %s && bash -c %s; copilot_exit_code=$?; tmux wait-for -S %s; exit $copilot_exit_code",
+		"%s && tmux wait-for %s && bash -c %s; copilot_exit_code=$?; tmux set-option -t %s %s \"$copilot_exit_code\"; tmux wait-for -S %s; exit $copilot_exit_code",
 		daemonMisePATH,
 		shellQuote(startChannel),
 		shellQuote(command),
+		shellQuote(sessionName),
+		daemonExitStatusOption,
 		shellQuote(completionChannel),
 	)
 	return "bash -c " + shellQuote(script)
@@ -762,7 +765,7 @@ func daemonStartSession(ctx context.Context, sessionID, command, cwd string) err
 	}
 
 	sessionCommand := daemonWrapCommandInWorkdir(command, cwd)
-	wrappedCommand := daemonSessionSupervisorCommand(startChannel, completionChannel, sessionCommand)
+	wrappedCommand := daemonSessionSupervisorCommand(name, startChannel, completionChannel, sessionCommand)
 	createCmd := fmt.Sprintf(
 		"tmux new-session -d -s %s -x 200 -y 50 %s",
 		shellQuote(name),
@@ -793,11 +796,13 @@ func daemonStartSession(ctx context.Context, sessionID, command, cwd string) err
 		daemonRemoveSessionState(sessionID)
 	}
 	configureCmd := fmt.Sprintf(
-		"tmux set-option -t %s remain-on-exit on && tmux set-option -t %s %s %s",
+		"tmux set-option -t %s remain-on-exit on && tmux set-option -t %s %s %s && tmux set-option -t %s %s ''",
 		shellQuote(name),
 		shellQuote(name),
 		daemonCompletionOption,
 		shellQuote(completionChannel),
+		shellQuote(name),
+		daemonExitStatusOption,
 	)
 	_, stderr, exitCode, err = daemonExecTmux(ctx, configureCmd)
 	if err != nil {
@@ -928,19 +933,41 @@ func daemonReadSessionState(ctx context.Context, sessionID string) (string, bool
 		return "", false, daemonFormatCommandFailure("read session", exitCode, stderr)
 	}
 	stdout = daemonCleanPaneOutput(stdout)
+	exitStatusCmd := fmt.Sprintf("tmux show-options -t %s -v %s 2>/dev/null", shellQuote(name), daemonExitStatusOption)
+	exitStatusOut, _, _, _ := daemonExecTmux(ctx, exitStatusCmd)
+	if exitStatus := strings.TrimSpace(exitStatusOut); exitStatus != "" {
+		exitCode, err := strconv.Atoi(exitStatus)
+		if err != nil {
+			return "", false, fmt.Errorf("parse session exit status: %w", err)
+		}
+		stdout, stderr, exitCodeCapture, err := daemonExecTmux(ctx, cmd)
+		if err != nil {
+			return "", false, fmt.Errorf("capture completed session: %w", err)
+		}
+		if exitCodeCapture != 0 {
+			return "", false, daemonFormatCommandFailure("capture completed session", exitCodeCapture, stderr)
+		}
+		stdout = daemonCleanPaneOutput(stdout)
+		return daemonAppendSessionExit(stdout, exitCode), true, nil
+	}
 	statusCmd := fmt.Sprintf("tmux list-panes -t %s -F '#{pane_dead} #{pane_dead_status}' 2>/dev/null", shellQuote(name))
 	statusOut, _, _, _ := daemonExecTmux(ctx, statusCmd)
 	paneDead, paneExitCode, err := daemonParsePaneStatus(statusOut)
 	if err == nil && paneDead {
-		if stdout != "" {
-			stdout += "\n"
-		}
-		stdout += "[session exited]"
-		if paneExitCode != 0 {
-			stdout += fmt.Sprintf("\n[exit code: %d]", paneExitCode)
-		}
+		stdout = daemonAppendSessionExit(stdout, paneExitCode)
 	}
 	return stdout, paneDead, nil
+}
+
+func daemonAppendSessionExit(output string, exitCode int) string {
+	if output != "" {
+		output += "\n"
+	}
+	output += daemonSessionExitMarker
+	if exitCode != 0 {
+		output += fmt.Sprintf("\n[exit code: %d]", exitCode)
+	}
+	return output
 }
 
 func daemonWaitSession(ctx context.Context, sessionID string, timeout time.Duration) (string, bool, error) {
