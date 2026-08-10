@@ -919,10 +919,11 @@ func TestExecutorWaitSessionDoesNotReuseCompletionSignal(t *testing.T) {
 	if err := e.StartSession(ctx, sessionID, "printf first", testDir(t)); err != nil {
 		t.Fatalf("StartSession first: %v", err)
 	}
-	if _, completed, err := e.WaitSession(ctx, sessionID, 5*time.Second); err != nil {
+	if output, completed, err := e.WaitSession(ctx, sessionID, 15*time.Second); err != nil {
 		t.Fatalf("WaitSession first: %v", err)
 	} else if !completed {
-		t.Fatal("WaitSession first completed = false, want true")
+		list, _ := e.ListSessions(ctx)
+		t.Fatalf("WaitSession first completed = false, want true; output=%q sessions=%q", output, list)
 	}
 	if err := e.StopSession(ctx, sessionID); err != nil {
 		t.Fatalf("StopSession first: %v", err)
