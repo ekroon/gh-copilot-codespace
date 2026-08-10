@@ -167,18 +167,19 @@ func TestLargeFrameSurvivesScannerLimit(t *testing.T) {
 
 func TestVerbIsMutating(t *testing.T) {
 	mutating := map[Verb]bool{
-		VerbEditFile:     true,
-		VerbCreateFile:   true,
-		VerbRunBash:      true,
-		VerbStartSession: true,
-		VerbWriteSession: true,
-		VerbStopSession:  true,
-		VerbViewFile:     false,
-		VerbGrep:         false,
-		VerbGlob:         false,
-		VerbReadSession:  false,
-		VerbListSessions: false,
-		VerbPing:         false,
+		VerbEditFile:            true,
+		VerbCreateFile:          true,
+		VerbRunBash:             true,
+		VerbStartSession:        true,
+		VerbStartProcessSession: true,
+		VerbWriteSession:        true,
+		VerbStopSession:         true,
+		VerbViewFile:            false,
+		VerbGrep:                false,
+		VerbGlob:                false,
+		VerbReadSession:         false,
+		VerbListSessions:        false,
+		VerbPing:                false,
 	}
 	for v, want := range mutating {
 		if got := v.IsMutating(); got != want {
@@ -198,7 +199,7 @@ func TestAllVerbsContainsEveryDefinedVerb(t *testing.T) {
 	}
 	for _, want := range []Verb{
 		VerbViewFile, VerbReadFile, VerbEditFile, VerbCreateFile, VerbWriteFile, VerbRunBash, VerbGrep,
-		VerbGlob, VerbApplyPatch, VerbStartSession, VerbWriteSession, VerbReadSession,
+		VerbGlob, VerbApplyPatch, VerbStartSession, VerbStartProcessSession, VerbWriteSession, VerbReadSession,
 		VerbStopSession, VerbListSessions, VerbPing,
 	} {
 		if !seen[want] {

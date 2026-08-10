@@ -103,6 +103,7 @@ For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when 
 - `remote_grep` mirrors local `rg` options including `path`/`paths`, `output_mode`, `-i`, `-A`, `-B`, `-C`, `-n`, `head_limit`, and `multiline`.
 - `remote_glob` mirrors local `glob` path selection with `path`/`paths`; results default to 1,000 matches, accept an optional `limit` capped at 10,000, and report truncation in structured metadata.
 - `remote_apply_patch` accepts the canonical `apply_patch` payload and applies it atomically on the Codespace.
+- `remote_bash` uses a lightweight daemon-managed process for normal sync commands. Commands that exceed `initial_wait` keep running once under the returned `shellId`; use `mode=async` when stdin or a PTY is required.
 
 ### Explicit file transfer
 

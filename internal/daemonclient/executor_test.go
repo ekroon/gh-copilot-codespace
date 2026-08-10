@@ -804,6 +804,66 @@ func TestExecutorSessionLifecycle(t *testing.T) {
 	}
 }
 
+func TestExecutorProcessSessionLifecycle(t *testing.T) {
+	e := dialDaemon(t)
+	ctx := testContext(t)
+	if !e.SupportsProcessSessions() {
+		t.Skip("daemon process sessions require delegated cgroup v2 support")
+	}
+
+	sessionID := fmt.Sprintf("daemonclient-process-%d", time.Now().UnixNano())
+	if err := e.StartProcessSession(ctx, sessionID, "printf process-session", testDir(t)); err != nil {
+		t.Fatalf("StartProcessSession: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopSession(context.Background(), sessionID) })
+
+	output, completed, err := e.WaitSession(ctx, sessionID, time.Second)
+	if err != nil {
+		t.Fatalf("WaitSession: %v", err)
+	}
+	if !completed {
+		t.Fatal("WaitSession completed = false, want true")
+	}
+	if !strings.Contains(output, "process-session") {
+		t.Fatalf("WaitSession output = %q, want process-session", output)
+	}
+	if err := e.StopSession(ctx, sessionID); err != nil {
+		t.Fatalf("StopSession: %v", err)
+	}
+}
+
+func TestExecutorDuplicateProcessSessionDoesNotRerun(t *testing.T) {
+	e := dialDaemon(t)
+	if !e.SupportsProcessSessions() {
+		t.Skip("daemon process sessions require delegated cgroup v2 support")
+	}
+	ctx := testContext(t)
+	sessionID := fmt.Sprintf("daemonclient-process-duplicate-%d", time.Now().UnixNano())
+	path := filepath.Join(testDir(t), sessionID)
+	command := fmt.Sprintf("printf x >> %q; sleep 0.2", path)
+	if err := e.StartProcessSession(ctx, sessionID, command, testDir(t)); err != nil {
+		t.Fatalf("StartProcessSession first: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = e.StopSession(context.Background(), sessionID)
+		_ = os.Remove(path)
+	})
+
+	if err := e.StartProcessSession(ctx, sessionID, command, testDir(t)); err == nil {
+		t.Fatal("StartProcessSession duplicate error = nil")
+	}
+	if _, _, err := e.WaitSession(ctx, sessionID, time.Second); err != nil {
+		t.Fatalf("WaitSession: %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(content) != "x" {
+		t.Fatalf("side effects = %q, want one execution", content)
+	}
+}
+
 func TestExecutorWaitSessionReturnsOnCompletion(t *testing.T) {
 	e := dialDaemon(t)
 	ctx := testContext(t)

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -102,7 +103,7 @@ func requireHello(t *testing.T, frame daemonproto.Frame) {
 	for _, verb := range frame.Verbs {
 		verbs[verb] = true
 	}
-	for _, verb := range daemonproto.AllVerbs() {
+	for _, verb := range daemonAdvertisedVerbs() {
 		if !verbs[string(verb)] {
 			t.Fatalf("hello verbs missing %q in %v", verb, frame.Verbs)
 		}
@@ -295,6 +296,22 @@ func TestDaemonCompletionHookTargetsOriginalPane(t *testing.T) {
 	want := `if-shell -F '#{==:#{hook_pane},%3}' 'wait-for -S copilot-exit-123'`
 	if got != want {
 		t.Fatalf("daemonCompletionHook() = %q, want %q", got, want)
+	}
+}
+
+func TestDaemonTmuxUpdateEnvironmentCommand(t *testing.T) {
+	got := daemonTmuxUpdateEnvironmentCommand([]string{"GH_TOKEN", "GITHUB_TOKEN"})
+	want := `tmux set-option -g update-environment 'GH_TOKEN GITHUB_TOKEN'`
+	if got != want {
+		t.Fatalf("daemonTmuxUpdateEnvironmentCommand() = %q, want %q", got, want)
+	}
+}
+
+func TestDaemonMergeTmuxEnvironmentKeysPreservesExistingValues(t *testing.T) {
+	got := daemonMergeTmuxEnvironmentKeys("SSH_AUTH_SOCK DISPLAY GH_TOKEN", []string{"GITHUB_TOKEN", "GH_TOKEN"})
+	want := []string{"DISPLAY", "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("daemonMergeTmuxEnvironmentKeys() = %v, want %v", got, want)
 	}
 }
 

@@ -563,6 +563,34 @@ func (e *Executor) StartSession(ctx context.Context, sessionID, command, cwd str
 	return nil
 }
 
+func (e *Executor) SupportsProcessSessions() bool {
+	for _, verb := range e.hello.Verbs {
+		if verb == string(daemonproto.VerbStartProcessSession) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Executor) StartProcessSession(ctx context.Context, sessionID, command, cwd string) error {
+	if cwd == "" {
+		cwd = e.GetWorkdir()
+	}
+	raw, err := e.call(ctx, daemonproto.VerbStartProcessSession, daemonproto.StartProcessSessionParams{
+		SessionID: sessionID,
+		Command:   command,
+		Cwd:       cwd,
+	})
+	if err != nil {
+		return err
+	}
+	var result daemonproto.StartProcessSessionResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("daemonclient: decode start_process_session result: %w", err)
+	}
+	return nil
+}
+
 func (e *Executor) WriteSession(ctx context.Context, sessionID, input string) error {
 	raw, err := e.call(ctx, daemonproto.VerbWriteSession, daemonproto.WriteSessionParams{SessionID: sessionID, Input: input})
 	if err != nil {

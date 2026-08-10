@@ -22,7 +22,7 @@ This project provides remote tools that execute on a GitHub Codespace via SSH. T
 | Copy files between local and remote | `remote_copy` | Explicit one-time transfer between local cwd and a codespace workdir |
 | Edit **local session files** (plan.md, notes) | `view`, `edit`, `create` (built-in local) | Session state lives locally |
 | **Change directory** on codespace | `remote_cd` | Affects all subsequent remote commands |
-| **Interactive/long-running** commands | `remote_bash` or `remote_bash mode=async` + `remote_write_bash`/`remote_read_bash` | Backed by tmux sessions on the codespace |
+| **Interactive/PTY** commands | `remote_bash mode=async` + `remote_write_bash`/`remote_read_bash` | Backed by tmux sessions on the codespace |
 | **Open a terminal** to the codespace | `open_shell` | Opens `gh codespace ssh` in a new terminal window |
 
 ## File Operations
@@ -91,11 +91,13 @@ remote_copy(source="cs://github/src/generated.go", destination="src/generated.go
 
 ### `remote_bash`
 
-Execute a bash command on the codespace. By default it is session-backed even for quick commands:
+Execute a bash command on the codespace. By default it uses a lightweight daemon-managed non-PTY process:
 
-**Default mode** — starts a tmux-backed session, waits briefly, then:
+**Default mode** — starts the command once, waits briefly, then:
 - returns final output immediately if the command exits quickly, or
-- returns partial output plus a `shellId` if it is still running.
+- retains the same process and returns partial output plus a `shellId` if it is still running.
+
+Retained default-mode sessions support reads, waits, and stops, but not stdin or PTY behavior. Use `mode=async` for interactive commands.
 
 Example quick command:
 ```
@@ -119,11 +121,11 @@ remote_bash(command="npm run dev", mode="async", description="Start dev server")
 - `description` (optional) — Short description of what the command does
 - `mode` (optional) — `"sync"` (default) or `"async"`
 - `initial_wait` (optional) — Seconds to wait in default/sync mode before returning partial output (default: 2). Use larger values when you want more inline output before switching to follow-up reads.
-- `shellId` (optional) — Custom session ID for async mode or for session-backed sync commands
+- `shellId` (optional) — Custom session ID for async mode or retained sync commands
 
 ### `remote_write_bash`
 
-Send input to a `remote_bash` session. Supports special keys.
+Send input to an async/tmux `remote_bash` session. Supports special keys. Retained default-mode process sessions are non-interactive and reject writes.
 
 **Parameters:**
 - `shellId` (required) — Session ID from `remote_bash`
@@ -238,7 +240,7 @@ For broad tracked changes, prefer a deliberate patch workflow (`git diff --binar
 ## Tips
 
 - **All remote paths are absolute** on the codespace (e.g., `/workspaces/repo/...`)
-- **Remote bash is session-backed by default** — quick commands may finish inline, but long ones naturally continue with a shellId
+- **Remote bash starts commands once** — quick sync commands finish inline; slow sync commands retain the same non-PTY process under a shellId
 - **Async sessions survive disconnects** — they run in tmux on the codespace
 - **`remote_cd` is sticky** — it affects all subsequent commands until changed
 - **grep falls back gracefully** — if ripgrep isn't installed, it uses grep

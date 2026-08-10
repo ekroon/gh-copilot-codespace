@@ -85,22 +85,23 @@ const (
 type Verb string
 
 const (
-	VerbViewFile     Verb = "view_file"
-	VerbReadFile     Verb = "read_file"
-	VerbEditFile     Verb = "edit_file"
-	VerbCreateFile   Verb = "create_file"
-	VerbWriteFile    Verb = "write_file"
-	VerbRunBash      Verb = "run_bash"
-	VerbGrep         Verb = "grep"
-	VerbGlob         Verb = "glob"
-	VerbApplyPatch   Verb = "apply_patch"
-	VerbStartSession Verb = "start_session"
-	VerbWriteSession Verb = "write_session"
-	VerbReadSession  Verb = "read_session"
-	VerbWaitSession  Verb = "wait_session"
-	VerbStopSession  Verb = "stop_session"
-	VerbListSessions Verb = "list_sessions"
-	VerbPing         Verb = "ping"
+	VerbViewFile            Verb = "view_file"
+	VerbReadFile            Verb = "read_file"
+	VerbEditFile            Verb = "edit_file"
+	VerbCreateFile          Verb = "create_file"
+	VerbWriteFile           Verb = "write_file"
+	VerbRunBash             Verb = "run_bash"
+	VerbGrep                Verb = "grep"
+	VerbGlob                Verb = "glob"
+	VerbApplyPatch          Verb = "apply_patch"
+	VerbStartSession        Verb = "start_session"
+	VerbStartProcessSession Verb = "start_process_session"
+	VerbWriteSession        Verb = "write_session"
+	VerbReadSession         Verb = "read_session"
+	VerbWaitSession         Verb = "wait_session"
+	VerbStopSession         Verb = "stop_session"
+	VerbListSessions        Verb = "list_sessions"
+	VerbPing                Verb = "ping"
 )
 
 // AllVerbs returns every verb implemented by the current daemon and
@@ -117,6 +118,7 @@ func AllVerbs() []Verb {
 		VerbGlob,
 		VerbApplyPatch,
 		VerbStartSession,
+		VerbStartProcessSession,
 		VerbWriteSession,
 		VerbReadSession,
 		VerbWaitSession,
@@ -140,6 +142,7 @@ func AllDefinedVerbs() []Verb {
 		VerbGlob,
 		VerbApplyPatch,
 		VerbStartSession,
+		VerbStartProcessSession,
 		VerbWriteSession,
 		VerbReadSession,
 		VerbWaitSession,
@@ -168,7 +171,7 @@ func FilesystemVerbs() []Verb {
 // retry-on-reconnect without changing the wire.
 func (v Verb) IsMutating() bool {
 	switch v {
-	case VerbEditFile, VerbCreateFile, VerbWriteFile, VerbApplyPatch, VerbWriteSession, VerbStopSession, VerbRunBash, VerbStartSession:
+	case VerbEditFile, VerbCreateFile, VerbWriteFile, VerbApplyPatch, VerbWriteSession, VerbStopSession, VerbRunBash, VerbStartSession, VerbStartProcessSession:
 		return true
 	default:
 		return false

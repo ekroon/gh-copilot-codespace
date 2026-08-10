@@ -958,6 +958,21 @@ type waitSessionMockExecutor struct {
 	waitCalls int
 }
 
+type processSessionMockExecutor struct {
+	*waitSessionMockExecutor
+	startProcessCalls int
+	startProcessErr   error
+}
+
+func (m *processSessionMockExecutor) SupportsProcessSessions() bool {
+	return true
+}
+
+func (m *processSessionMockExecutor) StartProcessSession(context.Context, string, string, string) error {
+	m.startProcessCalls++
+	return m.startProcessErr
+}
+
 func (m *waitSessionMockExecutor) SupportsWaitSession() bool {
 	return true
 }
@@ -1350,6 +1365,65 @@ func TestBashHandler_UsesDaemonSessionWaiter(t *testing.T) {
 	}
 	if base.readSessionCalls != 0 {
 		t.Fatalf("readSessionCalls = %d, want 0", base.readSessionCalls)
+	}
+}
+
+func TestBashHandler_UsesDirectProcessSessionForSyncCommands(t *testing.T) {
+	base := &mockExecutor{}
+	mock := &processSessionMockExecutor{
+		waitSessionMockExecutor: &waitSessionMockExecutor{
+			mockExecutor: base,
+			output:       "done\n[session exited]",
+			completed:    true,
+		},
+	}
+
+	handler := bashHandler(testRegWithExecutor(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command":      "echo done",
+		"shellId":      "process-1",
+		"initial_wait": 1,
+	}))
+	if err != nil {
+		t.Fatalf("handler error = %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("result error = %s", resultText(res))
+	}
+	if mock.startProcessCalls != 1 {
+		t.Fatalf("startProcessCalls = %d, want 1", mock.startProcessCalls)
+	}
+	if base.startSessionCalls != 0 {
+		t.Fatalf("startSessionCalls = %d, want 0", base.startSessionCalls)
+	}
+	if base.runBashCalls != 0 {
+		t.Fatalf("runBashCalls = %d, want 0", base.runBashCalls)
+	}
+}
+
+func TestBashHandler_DoesNotFallbackAfterProcessSessionStartError(t *testing.T) {
+	base := &mockExecutor{runBashStdout: "must not run"}
+	mock := &processSessionMockExecutor{
+		waitSessionMockExecutor: &waitSessionMockExecutor{mockExecutor: base},
+		startProcessErr:         fmt.Errorf("duplicate session"),
+	}
+
+	handler := bashHandler(testRegWithExecutor(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command": "echo duplicate",
+		"shellId": "process-duplicate",
+	}))
+	if err != nil {
+		t.Fatalf("handler error = %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("result error = false, want true; result = %s", resultText(res))
+	}
+	if base.startSessionCalls != 0 {
+		t.Fatalf("startSessionCalls = %d, want 0", base.startSessionCalls)
+	}
+	if base.runBashCalls != 0 {
+		t.Fatalf("runBashCalls = %d, want 0", base.runBashCalls)
 	}
 }
 

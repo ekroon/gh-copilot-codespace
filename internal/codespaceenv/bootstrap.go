@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -95,6 +96,32 @@ func ApplyProcessBootstrapFromPath(path string) {
 	if os.Getenv("GITHUB_SERVER_URL") == "" {
 		_ = os.Setenv("GITHUB_SERVER_URL", githubServerURL(os.Getenv("GITHUB_API_URL")))
 	}
+}
+
+// ProcessBootstrapKeys returns the environment names refreshed by the
+// Codespaces bootstrap, including derived GitHub authentication variables.
+func ProcessBootstrapKeys() []string {
+	return ProcessBootstrapKeysFromPath(SecretsPath)
+}
+
+// ProcessBootstrapKeysFromPath is a test seam for ProcessBootstrapKeys.
+func ProcessBootstrapKeysFromPath(path string) []string {
+	keys := map[string]struct{}{
+		"GITHUB_API_URL":    {},
+		"GITHUB_SERVER_URL": {},
+		"GITHUB_TOKEN":      {},
+		"GH_TOKEN":          {},
+	}
+	for key := range loadSecrets(path) {
+		keys[key] = struct{}{}
+	}
+
+	result := make([]string, 0, len(keys))
+	for key := range keys {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func loadSecrets(path string) map[string]string {

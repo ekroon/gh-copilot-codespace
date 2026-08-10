@@ -123,6 +123,13 @@ type (
 	}
 )
 
+// StartProcessSessionParams / StartProcessSessionResult — create a named
+// daemon-managed non-PTY process session.
+type (
+	StartProcessSessionParams = StartSessionParams
+	StartProcessSessionResult = StartSessionResult
+)
+
 // WriteSessionParams / WriteSessionResult — send input to a running session.
 // Mutating. Supports key macros like {enter}, {up} per ssh.Executor contract.
 type (

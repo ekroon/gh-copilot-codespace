@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -608,5 +609,171 @@ func TestIntegration_ExtensionHostEndToEnd(t *testing.T) {
 	resp = rpc.call(t, "wat", "", nil)
 	if resp.Error == nil {
 		t.Fatal("unknown method should produce an error response")
+	}
+}
+
+func TestIntegration_ExtensionHostWarmRemoteBashUnder500Milliseconds(t *testing.T) {
+	cs := testCodespace(t)
+	rpc := startExtensionHost(t, cs, "/tmp")
+
+	callBash := func(command string) (string, time.Duration) {
+		t.Helper()
+		start := time.Now()
+		resp := rpc.call(t, "call_tool", "remote_bash", map[string]any{
+			"codespace":    "it",
+			"command":      command,
+			"initial_wait": 5,
+		})
+		elapsed := time.Since(start)
+		if resp.Error != nil {
+			t.Fatalf("remote_bash error: %v", resp.Error)
+		}
+		var result struct {
+			TextResultForLlm string `json:"textResultForLlm"`
+			ResultType       string `json:"resultType"`
+		}
+		if err := json.Unmarshal(resp.Result, &result); err != nil {
+			t.Fatalf("decode remote_bash result: %v", err)
+		}
+		if result.ResultType != "success" {
+			t.Fatalf("remote_bash result_type = %q, want success; result: %s", result.ResultType, result.TextResultForLlm)
+		}
+		return result.TextResultForLlm, elapsed
+	}
+
+	callBash("true")
+
+	for i := 0; i < 5; i++ {
+		sentinel := fmt.Sprintf("warm-%d", i)
+		output, elapsed := callBash("printf %s " + sentinel)
+		t.Logf("warm remote_bash %d: %v", i+1, elapsed)
+		if !strings.Contains(output, sentinel) {
+			t.Fatalf("warm remote_bash output = %q, want %q", output, sentinel)
+		}
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("warm remote_bash %d took %v, want <= 500ms", i+1, elapsed)
+		}
+	}
+}
+
+func TestIntegration_ExtensionHostRemoteBashReceivesGitHubAuthEnvironment(t *testing.T) {
+	cs := testCodespace(t)
+	rpc := startExtensionHost(t, cs, "/tmp")
+
+	resp := rpc.call(t, "call_tool", "remote_bash", map[string]any{
+		"codespace": "it",
+		"command": `test -n "$GITHUB_TOKEN" &&
+test "$GH_TOKEN" = "$GITHUB_TOKEN" &&
+test -n "$GITHUB_SERVER_URL" &&
+test -n "$(gh auth token)" &&
+printf auth-environment-ok`,
+		"initial_wait": 5,
+	})
+	if resp.Error != nil {
+		t.Fatalf("remote_bash error: %v", resp.Error)
+	}
+	var result struct {
+		TextResultForLlm string `json:"textResultForLlm"`
+		ResultType       string `json:"resultType"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("decode remote_bash result: %v", err)
+	}
+	if result.ResultType != "success" {
+		t.Fatalf("remote_bash result_type = %q, want success; result: %s", result.ResultType, result.TextResultForLlm)
+	}
+	if !strings.Contains(result.TextResultForLlm, "auth-environment-ok") {
+		t.Fatalf("remote_bash output = %q, want auth-environment-ok", result.TextResultForLlm)
+	}
+}
+
+func TestIntegration_ExtensionHostRetainsTimedOutProcessSession(t *testing.T) {
+	cs := testCodespace(t)
+	rpc := startExtensionHost(t, cs, "/tmp")
+	shellID := fmt.Sprintf("retained-%d", time.Now().UnixNano())
+
+	resp := rpc.call(t, "call_tool", "remote_bash", map[string]any{
+		"codespace":    "it",
+		"command":      "printf started; sleep 0.3; printf finished",
+		"shellId":      shellID,
+		"initial_wait": 0.05,
+	})
+	if resp.Error != nil {
+		t.Fatalf("remote_bash error: %v", resp.Error)
+	}
+	var result struct {
+		TextResultForLlm string `json:"textResultForLlm"`
+		ResultType       string `json:"resultType"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("decode remote_bash result: %v", err)
+	}
+	if result.ResultType != "success" || !strings.Contains(result.TextResultForLlm, shellID) {
+		t.Fatalf("remote_bash did not retain session %q: %+v", shellID, result)
+	}
+
+	resp = rpc.call(t, "call_tool", "remote_read_bash", map[string]any{
+		"codespace": "it",
+		"shellId":   shellID,
+		"delay":     0.5,
+	})
+	if resp.Error != nil {
+		t.Fatalf("remote_read_bash error: %v", resp.Error)
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("decode remote_read_bash result: %v", err)
+	}
+	if !strings.Contains(result.TextResultForLlm, "started") ||
+		!strings.Contains(result.TextResultForLlm, "finished") ||
+		!strings.Contains(result.TextResultForLlm, daemonSessionExitMarker) {
+		t.Fatalf("remote_read_bash output = %q, want retained final output", result.TextResultForLlm)
+	}
+
+	resp = rpc.call(t, "call_tool", "remote_stop_bash", map[string]any{
+		"codespace": "it",
+		"shellId":   shellID,
+	})
+	if resp.Error != nil {
+		t.Fatalf("remote_stop_bash error: %v", resp.Error)
+	}
+}
+
+func TestIntegration_ExtensionHostCleansBackgroundProcessAfterShellExit(t *testing.T) {
+	cs := testCodespace(t)
+	rpc := startExtensionHost(t, cs, "/tmp")
+
+	resp := rpc.call(t, "call_tool", "remote_bash", map[string]any{
+		"codespace":    "it",
+		"command":      "sleep 30 & printf %s $!",
+		"initial_wait": 5,
+	})
+	if resp.Error != nil {
+		t.Fatalf("remote_bash error: %v", resp.Error)
+	}
+	var result struct {
+		TextResultForLlm string `json:"textResultForLlm"`
+		ResultType       string `json:"resultType"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("decode remote_bash result: %v", err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(result.TextResultForLlm))
+	if err != nil {
+		t.Fatalf("parse background child pid from %q: %v", result.TextResultForLlm, err)
+	}
+
+	resp = rpc.call(t, "call_tool", "remote_bash", map[string]any{
+		"codespace":    "it",
+		"command":      fmt.Sprintf("test ! -e /proc/%d && printf background-cleaned", childPID),
+		"initial_wait": 5,
+	})
+	if resp.Error != nil {
+		t.Fatalf("background cleanup check error: %v", resp.Error)
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("decode background cleanup result: %v", err)
+	}
+	if !strings.Contains(result.TextResultForLlm, "background-cleaned") {
+		t.Fatalf("background child %d survived shell cleanup: %s", childPID, result.TextResultForLlm)
 	}
 }

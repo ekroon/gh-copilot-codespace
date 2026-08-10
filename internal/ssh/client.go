@@ -57,6 +57,13 @@ type SessionWaiter interface {
 	WaitSession(ctx context.Context, sessionID string, timeout time.Duration) (output string, completed bool, err error)
 }
 
+// ProcessSessionStarter is implemented by executors that can start retained
+// non-PTY processes without paying the cost of a terminal multiplexer.
+type ProcessSessionStarter interface {
+	SupportsProcessSessions() bool
+	StartProcessSession(ctx context.Context, sessionID, command, cwd string) error
+}
+
 // NewClient creates a new SSH client for the given codespace.
 func NewClient(codespaceName string) *Client {
 	return &Client{

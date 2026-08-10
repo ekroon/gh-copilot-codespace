@@ -11,6 +11,7 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
@@ -625,10 +626,12 @@ const (
 	sessionExitedMarker          = "[session exited]"
 )
 
+var remoteShellIDSequence atomic.Uint64
+
 func bashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_bash",
-		Description: "Execute a bash command on the remote codespace. By default, it starts a remote session, waits briefly for quick completion, and returns final output when the command exits quickly. If the command is still running, it returns partial output and a shellId for follow-up reads with remote_read_bash. Use mode 'async' for interactive or explicitly backgrounded commands. Replaces the local 'bash' tool.",
+		Description: "Execute a bash command on the remote codespace. By default, it starts one lightweight non-PTY process, waits briefly for quick completion, and retains that same process under a shellId if it is still running. Use mode 'async' for stdin, PTY, or explicitly backgrounded commands. Replaces the local 'bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -679,7 +682,7 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		shellId := optionalString(req, "shellId")
 		cwd := optionalString(req, "cwd")
 		if shellId == "" {
-			shellId = fmt.Sprintf("sh-%d", time.Now().UnixMilli())
+			shellId = fmt.Sprintf("sh-%d-%d", time.Now().UnixMilli(), remoteShellIDSequence.Add(1))
 		}
 
 		if mode == "async" {
@@ -693,7 +696,11 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		initialWait := optionalFloat(req, "initial_wait", defaultRemoteBashInitialWait)
-		if err := c.StartSession(ctx, shellId, command, cwd); err != nil {
+		if starter, ok := c.(ssh.ProcessSessionStarter); ok && starter.SupportsProcessSessions() {
+			if err := starter.StartProcessSession(ctx, shellId, command, cwd); err != nil {
+				return toolError(err.Error()), nil
+			}
+		} else if err := c.StartSession(ctx, shellId, command, cwd); err != nil {
 			return runBashSyncFallback(ctx, c, command, cwd), nil
 		}
 		wait := time.Duration(initialWait * float64(time.Second))
@@ -837,7 +844,7 @@ func trimSessionExitMarker(output string) string {
 func writeBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_write_bash",
-		Description: "Send input to a remote bash session on the codespace. Supports special keys: {enter}, {up}, {down}, {left}, {right}, {backspace}. Replaces the local 'write_bash' tool.",
+		Description: "Send input to an async remote bash session on the codespace. Sync process sessions are non-interactive. Supports special keys: {enter}, {up}, {down}, {left}, {right}, {backspace}. Replaces the local 'write_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{

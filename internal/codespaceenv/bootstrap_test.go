@@ -107,6 +107,26 @@ func TestApplyProcessBootstrapFromPathBackfillsGitHubTokenFromGHToken(t *testing
 	}
 }
 
+func TestProcessBootstrapKeysFromPathIncludesSecretsAndDerivedAuth(t *testing.T) {
+	path := writeSecretsFile(t, map[string]string{
+		"Z_SECRET":     "z",
+		"OTHER_SECRET": "other",
+	})
+
+	got := ProcessBootstrapKeysFromPath(path)
+	want := []string{
+		"GH_TOKEN",
+		"GITHUB_API_URL",
+		"GITHUB_SERVER_URL",
+		"GITHUB_TOKEN",
+		"OTHER_SECRET",
+		"Z_SECRET",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("ProcessBootstrapKeysFromPath() = %v, want %v", got, want)
+	}
+}
+
 func writeSecretsFile(t *testing.T, entries map[string]string) string {
 	t.Helper()
 
