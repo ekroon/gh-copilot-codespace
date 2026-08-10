@@ -950,6 +950,23 @@ type mockExecutor struct {
 	workdir             string
 }
 
+type waitSessionMockExecutor struct {
+	*mockExecutor
+	output    string
+	completed bool
+	err       error
+	waitCalls int
+}
+
+func (m *waitSessionMockExecutor) SupportsWaitSession() bool {
+	return true
+}
+
+func (m *waitSessionMockExecutor) WaitSession(context.Context, string, time.Duration) (string, bool, error) {
+	m.waitCalls++
+	return m.output, m.completed, m.err
+}
+
 type readerFunc func([]byte) (int, error)
 
 func (f readerFunc) Read(p []byte) (int, error) {
@@ -1297,6 +1314,79 @@ func TestBashHandler_DefaultReturnsAsSoonAsSessionCompletes(t *testing.T) {
 	}
 	if mock.readSessionCalls < 2 {
 		t.Fatalf("readSessionCalls = %d, want at least 2", mock.readSessionCalls)
+	}
+}
+
+func TestBashHandler_UsesDaemonSessionWaiter(t *testing.T) {
+	base := &mockExecutor{}
+	mock := &waitSessionMockExecutor{
+		mockExecutor: base,
+		output:       "done\n[session exited]",
+		completed:    true,
+	}
+
+	handler := bashHandler(testRegWithExecutor(mock))
+	start := time.Now()
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command":      "echo done",
+		"shellId":      "s-waiter",
+		"initial_wait": 30.0,
+	}))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if got := resultText(res); got != "done" {
+		t.Fatalf("result text = %q, want %q", got, "done")
+	}
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("daemon waiter returned after %v, want less than 100ms", elapsed)
+	}
+	if mock.waitCalls != 1 {
+		t.Fatalf("waitCalls = %d, want 1", mock.waitCalls)
+	}
+	if base.readSessionCalls != 0 {
+		t.Fatalf("readSessionCalls = %d, want 0", base.readSessionCalls)
+	}
+}
+
+func TestBashHandler_DaemonWaiterDoesNotTrustOutputMarker(t *testing.T) {
+	base := &mockExecutor{}
+	mock := &waitSessionMockExecutor{
+		mockExecutor: base,
+		output:       "[session exited]\nstill running",
+		completed:    false,
+	}
+
+	handler := bashHandler(testRegWithExecutor(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command":      "printf '[session exited]\\n'; sleep 30",
+		"shellId":      "s-marker",
+		"initial_wait": 0.01,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected running session result, got tool error: %s", resultText(res))
+	}
+	if !strings.Contains(resultText(res), "[shellId: s-marker") {
+		t.Fatalf("unexpected result text: %q", resultText(res))
+	}
+	if base.stopSessionCalls != 0 {
+		t.Fatalf("stopSessionCalls = %d, want 0", base.stopSessionCalls)
+	}
+}
+
+func TestTrimSessionExitMarkerPreservesUserMarker(t *testing.T) {
+	output := "[session exited]\nactual output\n[session exited]\n[exit code: 1]"
+	got := trimSessionExitMarker(output)
+	want := "[session exited]\nactual output\n[exit code: 1]"
+	if got != want {
+		t.Fatalf("trimSessionExitMarker() = %q, want %q", got, want)
 	}
 }
 

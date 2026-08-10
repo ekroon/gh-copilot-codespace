@@ -587,6 +587,30 @@ func (e *Executor) ReadSession(ctx context.Context, sessionID string) (string, e
 	return result.Output, nil
 }
 
+func (e *Executor) SupportsWaitSession() bool {
+	for _, verb := range e.hello.Verbs {
+		if verb == string(daemonproto.VerbWaitSession) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Executor) WaitSession(ctx context.Context, sessionID string, timeout time.Duration) (string, bool, error) {
+	raw, err := e.call(ctx, daemonproto.VerbWaitSession, daemonproto.WaitSessionParams{
+		SessionID: sessionID,
+		TimeoutMS: timeout.Milliseconds(),
+	})
+	if err != nil {
+		return "", false, err
+	}
+	var result daemonproto.WaitSessionResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", false, fmt.Errorf("daemonclient: decode wait_session result: %w", err)
+	}
+	return result.Output, result.Completed, nil
+}
+
 func (e *Executor) StopSession(ctx context.Context, sessionID string) error {
 	raw, err := e.call(ctx, daemonproto.VerbStopSession, daemonproto.StopSessionParams{SessionID: sessionID})
 	if err != nil {

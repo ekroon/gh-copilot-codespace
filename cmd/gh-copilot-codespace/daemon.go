@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,17 +23,74 @@ import (
 )
 
 const (
-	daemonTmuxPrefix = "copilot-"
-	daemonMisePATH   = `PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"`
+	daemonTmuxPrefix        = "copilot-"
+	daemonMisePATH          = `PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"`
+	daemonSessionExitMarker = "[session exited]"
+	daemonCompletionOption  = "@copilot_completion_channel"
 )
 
 var errDaemonCanceled = errors.New("request canceled")
+var daemonPaneIDRe = regexp.MustCompile(`^%[0-9]+$`)
 
 type daemonInflight struct {
 	ctxCancel context.CancelFunc
 
 	mu   sync.Mutex
 	pgid int
+}
+
+type daemonSessionState struct {
+	done chan struct{}
+	once sync.Once
+
+	mu           sync.Mutex
+	waiterCancel context.CancelFunc
+}
+
+var daemonSessions sync.Map
+
+func newDaemonSessionState() *daemonSessionState {
+	return &daemonSessionState{done: make(chan struct{})}
+}
+
+func (s *daemonSessionState) complete() {
+	s.once.Do(func() { close(s.done) })
+}
+
+func (s *daemonSessionState) setWaiterCancel(cancel context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-s.done:
+		cancel()
+	default:
+		s.waiterCancel = cancel
+	}
+}
+
+func (s *daemonSessionState) cancelWaiter() {
+	s.mu.Lock()
+	cancel := s.waiterCancel
+	s.waiterCancel = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func daemonRemoveSessionState(sessionID string) {
+	if state, ok := daemonSessions.LoadAndDelete(sessionID); ok {
+		sessionState := state.(*daemonSessionState)
+		sessionState.cancelWaiter()
+		sessionState.complete()
+	}
+}
+
+func daemonCancelAllSessionWaiters() {
+	daemonSessions.Range(func(key, _ any) bool {
+		daemonRemoveSessionState(key.(string))
+		return true
+	})
 }
 
 type daemonInflightKey struct{}
@@ -72,6 +130,7 @@ func runDaemon(args []string) error {
 
 func runDaemonIO(ctx context.Context, in io.Reader, out io.Writer) error {
 	codespaceenv.ApplyProcessBootstrap()
+	defer daemonCancelAllSessionWaiters()
 
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	dec := daemonproto.NewDecoder(in)
@@ -311,6 +370,16 @@ func dispatchDaemonRequest(ctx context.Context, frame daemonproto.Frame, started
 			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
 		}
 		return daemonproto.ReadSessionResult{Output: output}, nil
+	case daemonproto.VerbWaitSession:
+		var params daemonproto.WaitSessionParams
+		if err := decodeDaemonParams(frame, &params); err != nil {
+			return nil, daemonBadRequest(frame.Verb, err)
+		}
+		output, completed, err := daemonWaitSession(ctx, params.SessionID, time.Duration(params.TimeoutMS)*time.Millisecond)
+		if err != nil {
+			return nil, daemonMapError(daemonproto.ErrCodeExecFailed, err)
+		}
+		return daemonproto.WaitSessionResult{Output: output, Completed: completed}, nil
 	case daemonproto.VerbStopSession:
 		var params daemonproto.StopSessionParams
 		if err := decodeDaemonParams(frame, &params); err != nil {
@@ -543,6 +612,18 @@ func daemonTmuxSessionName(sessionID string) string {
 	return daemonTmuxPrefix + sessionID
 }
 
+func daemonNewTmuxChannel(kind string) (string, error) {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generate tmux %s channel: %w", kind, err)
+	}
+	return fmt.Sprintf("copilot-%s-%x", kind, nonce[:]), nil
+}
+
+func daemonCompletionHook(paneID, channel string) string {
+	return fmt.Sprintf("if-shell -F '#{==:#{hook_pane},%s}' 'wait-for -S %s'", paneID, channel)
+}
+
 func daemonExecTmux(ctx context.Context, tmuxCmd string) (string, string, int, error) {
 	return runProcess(ctx, "bash", "-c", daemonMisePATH+" && "+tmuxCmd)
 }
@@ -575,21 +656,88 @@ func daemonEnsureTmux(ctx context.Context) error {
 
 func daemonStartSession(ctx context.Context, sessionID, command, cwd string) error {
 	name := daemonTmuxSessionName(sessionID)
+	completionChannel, err := daemonNewTmuxChannel("exit")
+	if err != nil {
+		return err
+	}
+	startChannel, err := daemonNewTmuxChannel("start")
+	if err != nil {
+		return err
+	}
 	if err := daemonEnsureTmux(ctx); err != nil {
 		return err
 	}
-	wrappedCommand := codespaceenv.BuildShellBootstrap() + " && " + daemonWrapCommandInWorkdir(command, cwd)
-	cmd := fmt.Sprintf(
-		"tmux new-session -d -s %s -x 200 -y 50 %s && tmux set-option -t %s remain-on-exit on",
-		shellQuote(name), shellQuote(wrappedCommand), shellQuote(name))
-	_, stderr, exitCode, err := daemonExecTmux(ctx, cmd)
+	sessionCommand := codespaceenv.BuildShellBootstrap() + " && " + daemonWrapCommandInWorkdir(command, cwd)
+	wrappedCommand := fmt.Sprintf("tmux wait-for %s; %s", shellQuote(startChannel), sessionCommand)
+	createCmd := fmt.Sprintf(
+		"tmux new-session -d -P -F '#{pane_id}' -s %s -x 200 -y 50 %s",
+		shellQuote(name),
+		shellQuote(wrappedCommand),
+	)
+	paneOut, stderr, exitCode, err := daemonExecTmux(ctx, createCmd)
 	if err != nil {
 		return fmt.Errorf("start session: %w", err)
 	}
 	if exitCode != 0 {
 		return daemonFormatCommandFailure("start session", exitCode, stderr)
 	}
+	paneID := strings.TrimSpace(paneOut)
+	if !daemonPaneIDRe.MatchString(paneID) {
+		_, _, _, _ = daemonExecTmux(context.Background(), fmt.Sprintf("tmux kill-session -t %s", shellQuote(name)))
+		return fmt.Errorf("start session: invalid pane id %q", paneID)
+	}
+	completionHook := daemonCompletionHook(paneID, completionChannel)
+
+	cleanupCreatedSession := func() {
+		_, _, _, _ = daemonExecTmux(context.Background(), fmt.Sprintf("tmux kill-session -t %s", shellQuote(name)))
+		daemonRemoveSessionState(sessionID)
+	}
+	configureCmd := fmt.Sprintf(
+		"tmux set-option -t %s remain-on-exit on && tmux set-option -t %s %s %s && tmux set-hook -t %s pane-died %s",
+		shellQuote(name),
+		shellQuote(name),
+		daemonCompletionOption,
+		shellQuote(completionChannel),
+		shellQuote(name),
+		shellQuote(completionHook),
+	)
+	_, stderr, exitCode, err = daemonExecTmux(ctx, configureCmd)
+	if err != nil {
+		cleanupCreatedSession()
+		return fmt.Errorf("configure session: %w", err)
+	}
+	if exitCode != 0 {
+		cleanupCreatedSession()
+		return daemonFormatCommandFailure("configure session", exitCode, stderr)
+	}
+
+	state := newDaemonSessionState()
+	if _, loaded := daemonSessions.LoadOrStore(sessionID, state); loaded {
+		cleanupCreatedSession()
+		return fmt.Errorf("session %q is already tracked", sessionID)
+	}
+	daemonStartSessionCompletionWaiter(completionChannel, state)
+
+	_, stderr, exitCode, err = daemonExecTmux(ctx, fmt.Sprintf("tmux wait-for -S %s", shellQuote(startChannel)))
+	if err != nil {
+		cleanupCreatedSession()
+		return fmt.Errorf("release session start: %w", err)
+	}
+	if exitCode != 0 {
+		cleanupCreatedSession()
+		return daemonFormatCommandFailure("release session start", exitCode, stderr)
+	}
 	return nil
+}
+
+func daemonStartSessionCompletionWaiter(channel string, state *daemonSessionState) {
+	waiterCtx, cancel := context.WithCancel(context.Background())
+	state.setWaiterCancel(cancel)
+	go func() {
+		defer cancel()
+		defer state.complete()
+		_, _, _, _ = daemonExecTmux(waiterCtx, fmt.Sprintf("tmux wait-for %s", shellQuote(channel)))
+	}()
 }
 
 var daemonSpecialKeys = map[string]string{
@@ -656,18 +804,23 @@ func daemonCleanPaneOutput(s string) string {
 }
 
 func daemonReadSession(ctx context.Context, sessionID string) (string, error) {
+	output, _, err := daemonReadSessionState(ctx, sessionID)
+	return output, err
+}
+
+func daemonReadSessionState(ctx context.Context, sessionID string) (string, bool, error) {
 	name := daemonTmuxSessionName(sessionID)
 	checkCmd := fmt.Sprintf("tmux has-session -t %s 2>/dev/null", shellQuote(name))
 	if _, _, ec, _ := daemonExecTmux(ctx, checkCmd); ec != 0 {
-		return "", fmt.Errorf("session %q does not exist (command may have exited and been cleaned up)", sessionID)
+		return "", false, fmt.Errorf("session %q does not exist (command may have exited and been cleaned up)", sessionID)
 	}
 	cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -100", shellQuote(name))
 	stdout, stderr, exitCode, err := daemonExecTmux(ctx, cmd)
 	if err != nil {
-		return "", fmt.Errorf("read session: %w", err)
+		return "", false, fmt.Errorf("read session: %w", err)
 	}
 	if exitCode != 0 {
-		return "", daemonFormatCommandFailure("read session", exitCode, stderr)
+		return "", false, daemonFormatCommandFailure("read session", exitCode, stderr)
 	}
 	stdout = daemonCleanPaneOutput(stdout)
 	statusCmd := fmt.Sprintf("tmux list-panes -t %s -F '#{pane_dead} #{pane_dead_status}' 2>/dev/null", shellQuote(name))
@@ -682,7 +835,95 @@ func daemonReadSession(ctx context.Context, sessionID string) (string, error) {
 			stdout += fmt.Sprintf("\n[exit code: %d]", paneExitCode)
 		}
 	}
-	return stdout, nil
+	return stdout, paneDead, nil
+}
+
+func daemonWaitSession(ctx context.Context, sessionID string, timeout time.Duration) (string, bool, error) {
+	if timeout <= 0 {
+		return daemonReadSessionState(ctx, sessionID)
+	}
+
+	deadline := time.Now().Add(timeout)
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	name := daemonTmuxSessionName(sessionID)
+	channelOut, stderr, exitCode, err := daemonExecTmux(
+		waitCtx,
+		fmt.Sprintf("tmux show-options -t %s -v %s", shellQuote(name), daemonCompletionOption),
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", false, ctx.Err()
+		}
+		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+			return daemonReadSessionState(ctx, sessionID)
+		}
+		return "", false, fmt.Errorf("read session completion channel: %w", err)
+	}
+	if exitCode != 0 {
+		return "", false, daemonFormatCommandFailure("read session completion channel", exitCode, stderr)
+	}
+	channel := strings.TrimSpace(channelOut)
+	if channel == "" {
+		return "", false, errors.New("session completion channel is empty")
+	}
+
+	output, completed, err := daemonReadSessionState(waitCtx, sessionID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", false, ctx.Err()
+		}
+		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+			return daemonReadSessionState(ctx, sessionID)
+		}
+		return "", false, err
+	}
+	if completed {
+		return output, true, nil
+	}
+
+	stateValue, loaded := daemonSessions.Load(sessionID)
+	if !loaded {
+		state := newDaemonSessionState()
+		stateValue, loaded = daemonSessions.LoadOrStore(sessionID, state)
+		if !loaded {
+			daemonStartSessionCompletionWaiter(channel, state)
+			stateValue = state
+		}
+	}
+	state := stateValue.(*daemonSessionState)
+
+	return daemonWaitForSessionCompletion(
+		ctx,
+		time.Until(deadline),
+		state,
+		func(readCtx context.Context) (string, bool, error) {
+			return daemonReadSessionState(readCtx, sessionID)
+		},
+	)
+}
+
+func daemonWaitForSessionCompletion(
+	ctx context.Context,
+	timeout time.Duration,
+	state *daemonSessionState,
+	readState func(context.Context) (string, bool, error),
+) (string, bool, error) {
+	if timeout <= 0 {
+		return readState(ctx)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-state.done:
+	case <-timer.C:
+	case <-ctx.Done():
+		if ctx.Err() != nil {
+			return "", false, ctx.Err()
+		}
+	}
+	return readState(ctx)
 }
 
 func daemonParsePaneStatus(status string) (bool, int, error) {
@@ -708,6 +949,7 @@ func daemonStopSession(ctx context.Context, sessionID string) error {
 	if exitCode != 0 {
 		return daemonFormatCommandFailure("stop session", exitCode, stderr)
 	}
+	daemonRemoveSessionState(sessionID)
 	return nil
 }
 

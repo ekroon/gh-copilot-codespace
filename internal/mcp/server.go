@@ -696,7 +696,15 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		if err := c.StartSession(ctx, shellId, command, cwd); err != nil {
 			return runBashSyncFallback(ctx, c, command, cwd), nil
 		}
-		output, err := waitForSessionOutput(ctx, c, shellId, time.Duration(initialWait*float64(time.Second)))
+		wait := time.Duration(initialWait * float64(time.Second))
+		var output string
+		var completed bool
+		if waiter, ok := c.(ssh.SessionWaiter); ok && waiter.SupportsWaitSession() {
+			output, completed, err = waiter.WaitSession(ctx, shellId, wait)
+		} else {
+			output, err = waitForSessionOutput(ctx, c, shellId, wait)
+			completed = sessionOutputExited(output)
+		}
 		if err != nil {
 			if stopErr := stopSessionForCleanup(c, shellId); stopErr != nil {
 				return toolError(fmt.Sprintf("%s\n\nAdditionally, failed to stop session %s after read failure: %v", err.Error(), shellId, stopErr)), nil
@@ -704,7 +712,7 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			return toolError(err.Error()), nil
 		}
 
-		if sessionOutputExited(output) {
+		if completed {
 			finalOutput := trimSessionExitMarker(output)
 			if err := stopSessionForCleanup(c, shellId); err != nil {
 				if finalOutput != "" {
@@ -815,14 +823,13 @@ func sessionOutputExited(output string) bool {
 
 func trimSessionExitMarker(output string) string {
 	lines := strings.Split(output, "\n")
-	filtered := lines[:0]
-	for _, line := range lines {
-		if strings.TrimSpace(line) == sessionExitedMarker {
-			continue
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == sessionExitedMarker {
+			lines = append(lines[:i], lines[i+1:]...)
+			break
 		}
-		filtered = append(filtered, line)
 	}
-	return strings.TrimRight(strings.Join(filtered, "\n"), "\n")
+	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
 }
 
 // --- remote_write_bash ---

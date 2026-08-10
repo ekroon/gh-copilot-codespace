@@ -803,3 +803,126 @@ func TestExecutorSessionLifecycle(t *testing.T) {
 		t.Fatalf("ListSessions output = %q, want stopped session absent", list)
 	}
 }
+
+func TestExecutorWaitSessionReturnsOnCompletion(t *testing.T) {
+	e := dialDaemon(t)
+	ctx := testContext(t)
+	sessionID := fmt.Sprintf("daemonclient-wait-%d", time.Now().UnixNano())
+	if err := e.StartSession(ctx, sessionID, "printf wait-done", testDir(t)); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopSession(context.Background(), sessionID) })
+
+	start := time.Now()
+	output, completed, err := e.WaitSession(ctx, sessionID, 5*time.Second)
+	if err != nil {
+		t.Fatalf("WaitSession: %v", err)
+	}
+	if !completed {
+		t.Fatal("WaitSession completed = false, want true")
+	}
+	if !strings.Contains(output, "wait-done") || !strings.Contains(output, "[session exited]") {
+		t.Fatalf("WaitSession output = %q, want command output and exit marker", output)
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("WaitSession elapsed = %v, want less than 1s", elapsed)
+	}
+}
+
+func TestExecutorWaitSessionReturnsOnTimeout(t *testing.T) {
+	e := dialDaemon(t)
+	ctx := testContext(t)
+	sessionID := fmt.Sprintf("daemonclient-timeout-%d", time.Now().UnixNano())
+	if err := e.StartSession(ctx, sessionID, "sleep 5", testDir(t)); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopSession(context.Background(), sessionID) })
+
+	start := time.Now()
+	_, completed, err := e.WaitSession(ctx, sessionID, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitSession: %v", err)
+	}
+	if completed {
+		t.Fatal("WaitSession completed = true, want false")
+	}
+	if elapsed := time.Since(start); elapsed >= 250*time.Millisecond {
+		t.Fatalf("WaitSession elapsed = %v, want less than 250ms", elapsed)
+	}
+}
+
+func TestExecutorWaitSessionDoesNotReuseCompletionSignal(t *testing.T) {
+	e := dialDaemon(t)
+	ctx := testContext(t)
+	sessionID := fmt.Sprintf("daemonclient-reuse-%d", time.Now().UnixNano())
+
+	if err := e.StartSession(ctx, sessionID, "printf first", testDir(t)); err != nil {
+		t.Fatalf("StartSession first: %v", err)
+	}
+	if _, completed, err := e.WaitSession(ctx, sessionID, 5*time.Second); err != nil {
+		t.Fatalf("WaitSession first: %v", err)
+	} else if !completed {
+		t.Fatal("WaitSession first completed = false, want true")
+	}
+	if err := e.StopSession(ctx, sessionID); err != nil {
+		t.Fatalf("StopSession first: %v", err)
+	}
+
+	if err := e.StartSession(ctx, sessionID, "sleep 5", testDir(t)); err != nil {
+		t.Fatalf("StartSession second: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopSession(context.Background(), sessionID) })
+	if _, completed, err := e.WaitSession(ctx, sessionID, 50*time.Millisecond); err != nil {
+		t.Fatalf("WaitSession second: %v", err)
+	} else if completed {
+		t.Fatal("WaitSession second completed = true, want false")
+	}
+}
+
+func TestExecutorDuplicateSessionStartPreservesExistingSession(t *testing.T) {
+	e := dialDaemon(t)
+	ctx := testContext(t)
+	sessionID := fmt.Sprintf("daemonclient-duplicate-%d", time.Now().UnixNano())
+	if err := e.StartSession(ctx, sessionID, "bash --noprofile --norc", testDir(t)); err != nil {
+		t.Fatalf("StartSession first: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopSession(context.Background(), sessionID) })
+
+	if err := e.StartSession(ctx, sessionID, "printf duplicate", testDir(t)); err == nil {
+		t.Fatal("StartSession duplicate error = nil")
+	}
+	if err := e.WriteSession(ctx, sessionID, "echo existing-alive{enter}"); err != nil {
+		t.Fatalf("WriteSession existing: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		output, err := e.ReadSession(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("ReadSession existing: %v", err)
+		}
+		if strings.Contains(output, "existing-alive") {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("existing session did not survive duplicate start")
+}
+
+func TestExecutorWaitSessionDoesNotTrustOutputMarker(t *testing.T) {
+	e := dialDaemon(t)
+	ctx := testContext(t)
+	sessionID := fmt.Sprintf("daemonclient-marker-%d", time.Now().UnixNano())
+	if err := e.StartSession(ctx, sessionID, "printf '[session exited]\\n'; sleep 5", testDir(t)); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopSession(context.Background(), sessionID) })
+
+	output, completed, err := e.WaitSession(ctx, sessionID, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitSession: %v", err)
+	}
+	if completed {
+		t.Fatalf("WaitSession completed = true for running command; output = %q", output)
+	}
+}

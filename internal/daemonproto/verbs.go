@@ -144,6 +144,19 @@ type (
 	}
 )
 
+// WaitSessionParams / WaitSessionResult — wait until a session exits or the
+// requested timeout elapses, then return its current output.
+type (
+	WaitSessionParams struct {
+		SessionID string `json:"session_id"`
+		TimeoutMS int64  `json:"timeout_ms"`
+	}
+	WaitSessionResult struct {
+		Output    string `json:"output"`
+		Completed bool   `json:"completed"`
+	}
+)
+
 // StopSessionParams / StopSessionResult — terminate a session. Mutating.
 type (
 	StopSessionParams struct {

@@ -97,6 +97,7 @@ const (
 	VerbStartSession Verb = "start_session"
 	VerbWriteSession Verb = "write_session"
 	VerbReadSession  Verb = "read_session"
+	VerbWaitSession  Verb = "wait_session"
 	VerbStopSession  Verb = "stop_session"
 	VerbListSessions Verb = "list_sessions"
 	VerbPing         Verb = "ping"
@@ -118,6 +119,7 @@ func AllVerbs() []Verb {
 		VerbStartSession,
 		VerbWriteSession,
 		VerbReadSession,
+		VerbWaitSession,
 		VerbStopSession,
 		VerbListSessions,
 		VerbPing,
@@ -140,6 +142,7 @@ func AllDefinedVerbs() []Verb {
 		VerbStartSession,
 		VerbWriteSession,
 		VerbReadSession,
+		VerbWaitSession,
 		VerbStopSession,
 		VerbListSessions,
 		VerbPing,

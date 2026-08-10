@@ -50,6 +50,13 @@ type Executor interface {
 	GetWorkdir() string
 }
 
+// SessionWaiter is implemented by executors that can wait for session
+// completion without client-side polling.
+type SessionWaiter interface {
+	SupportsWaitSession() bool
+	WaitSession(ctx context.Context, sessionID string, timeout time.Duration) (output string, completed bool, err error)
+}
+
 // NewClient creates a new SSH client for the given codespace.
 func NewClient(codespaceName string) *Client {
 	return &Client{

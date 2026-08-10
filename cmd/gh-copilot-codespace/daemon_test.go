@@ -238,6 +238,66 @@ func TestRunDaemonRunBashCancelKillsProcess(t *testing.T) {
 	}
 }
 
+func TestDaemonWaitForSessionCompletionRefreshesOutputAfterTimeout(t *testing.T) {
+	state := newDaemonSessionState()
+	readCalls := 0
+
+	output, completed, err := daemonWaitForSessionCompletion(
+		context.Background(),
+		10*time.Millisecond,
+		state,
+		func(context.Context) (string, bool, error) {
+			readCalls++
+			return "late output", false, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("daemonWaitForSessionCompletion() error = %v", err)
+	}
+	if output != "late output" {
+		t.Fatalf("output = %q, want %q", output, "late output")
+	}
+	if completed {
+		t.Fatal("completed = true, want false")
+	}
+	if readCalls != 1 {
+		t.Fatalf("read calls = %d, want 1", readCalls)
+	}
+}
+
+func TestDaemonRemoveSessionStateCancelsWaiter(t *testing.T) {
+	sessionID := "cancel-waiter"
+	state := newDaemonSessionState()
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	state.setWaiterCancel(cancelWaiter)
+	daemonSessions.Store(sessionID, state)
+	t.Cleanup(func() { daemonSessions.Delete(sessionID) })
+
+	daemonRemoveSessionState(sessionID)
+
+	select {
+	case <-waiterCtx.Done():
+	default:
+		t.Fatal("waiter context was not canceled")
+	}
+	select {
+	case <-state.done:
+	default:
+		t.Fatal("session completion channel was not closed")
+	}
+	if _, loaded := daemonSessions.Load(sessionID); loaded {
+		t.Fatal("session state remains tracked after removal")
+	}
+}
+
+func TestDaemonCompletionHookTargetsOriginalPane(t *testing.T) {
+	got := daemonCompletionHook("%3", "copilot-exit-123")
+	want := `if-shell -F '#{==:#{hook_pane},%3}' 'wait-for -S copilot-exit-123'`
+	if got != want {
+		t.Fatalf("daemonCompletionHook() = %q, want %q", got, want)
+	}
+}
+
 func TestRunDaemonUnknownVerbReturnsError(t *testing.T) {
 	h := startDaemonTestHarness(t)
 	defer h.close()
