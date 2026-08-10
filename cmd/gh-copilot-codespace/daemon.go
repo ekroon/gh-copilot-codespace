@@ -31,7 +31,6 @@ const (
 )
 
 var errDaemonCanceled = errors.New("request canceled")
-var daemonPaneIDRe = regexp.MustCompile(`^%[0-9]+$`)
 var daemonTmuxStartMu sync.Mutex
 
 type daemonInflight struct {
@@ -650,8 +649,15 @@ func daemonNewTmuxChannel(kind string) (string, error) {
 	return fmt.Sprintf("copilot-%s-%x", kind, nonce[:]), nil
 }
 
-func daemonCompletionHook(paneID, channel string) string {
-	return fmt.Sprintf("if-shell -F '#{==:#{hook_pane},%s}' 'wait-for -S %s'", paneID, channel)
+func daemonSessionSupervisorCommand(startChannel, completionChannel, command string) string {
+	script := fmt.Sprintf(
+		"%s && tmux wait-for %s && bash -c %s; copilot_exit_code=$?; tmux wait-for -S %s; exit $copilot_exit_code",
+		daemonMisePATH,
+		shellQuote(startChannel),
+		shellQuote(command),
+		shellQuote(completionChannel),
+	)
+	return "bash -c " + shellQuote(script)
 }
 
 func daemonTmuxUpdateEnvironmentCommand(keys []string) string {
@@ -756,23 +762,18 @@ func daemonStartSession(ctx context.Context, sessionID, command, cwd string) err
 	}
 
 	sessionCommand := daemonWrapCommandInWorkdir(command, cwd)
-	wrappedCommand := fmt.Sprintf("tmux wait-for %s; %s", shellQuote(startChannel), sessionCommand)
+	wrappedCommand := daemonSessionSupervisorCommand(startChannel, completionChannel, sessionCommand)
 	createCmd := fmt.Sprintf(
-		"tmux new-session -d -P -F '#{pane_id}' -s %s -x 200 -y 50 %s",
+		"tmux new-session -d -s %s -x 200 -y 50 %s",
 		shellQuote(name),
 		shellQuote(wrappedCommand),
 	)
-	paneOut, stderr, exitCode, err := daemonExecTmux(ctx, createCmd)
+	_, stderr, exitCode, err := daemonExecTmux(ctx, createCmd)
 	if err != nil {
 		return fmt.Errorf("start session: %w", err)
 	}
 	if exitCode != 0 {
 		return daemonFormatCommandFailure("start session", exitCode, stderr)
-	}
-	paneID := strings.TrimSpace(paneOut)
-	if !daemonPaneIDRe.MatchString(paneID) {
-		_, _, _, _ = daemonExecTmux(context.Background(), fmt.Sprintf("tmux kill-session -t %s", shellQuote(name)))
-		return fmt.Errorf("start session: invalid pane id %q", paneID)
 	}
 	if !tmuxRunning {
 		running, configureErr := daemonConfigureRunningTmuxEnvironment(ctx, bootstrapKeys)
@@ -786,20 +787,17 @@ func daemonStartSession(ctx context.Context, sessionID, command, cwd string) err
 			return errors.New("configure tmux environment updates: tmux server did not remain running")
 		}
 	}
-	completionHook := daemonCompletionHook(paneID, completionChannel)
 
 	cleanupCreatedSession := func() {
 		_, _, _, _ = daemonExecTmux(context.Background(), fmt.Sprintf("tmux kill-session -t %s", shellQuote(name)))
 		daemonRemoveSessionState(sessionID)
 	}
 	configureCmd := fmt.Sprintf(
-		"tmux set-option -t %s remain-on-exit on && tmux set-option -t %s %s %s && tmux set-hook -t %s pane-died %s",
+		"tmux set-option -t %s remain-on-exit on && tmux set-option -t %s %s %s",
 		shellQuote(name),
 		shellQuote(name),
 		daemonCompletionOption,
 		shellQuote(completionChannel),
-		shellQuote(name),
-		shellQuote(completionHook),
 	)
 	_, stderr, exitCode, err = daemonExecTmux(ctx, configureCmd)
 	if err != nil {
@@ -1038,10 +1036,13 @@ func daemonWaitForSessionCompletion(
 
 func daemonParsePaneStatus(status string) (bool, int, error) {
 	fields := strings.Fields(strings.TrimSpace(status))
-	if len(fields) < 2 {
+	if len(fields) == 0 {
 		return false, 0, errors.New("invalid pane status")
 	}
 	paneDead := fields[0] == "1"
+	if len(fields) == 1 {
+		return paneDead, 0, nil
+	}
 	exitCode, err := strconv.Atoi(fields[1])
 	if err != nil {
 		return false, 0, fmt.Errorf("parse pane exit code: %w", err)

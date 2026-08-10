@@ -291,11 +291,32 @@ func TestDaemonRemoveSessionStateCancelsWaiter(t *testing.T) {
 	}
 }
 
-func TestDaemonCompletionHookTargetsOriginalPane(t *testing.T) {
-	got := daemonCompletionHook("%3", "copilot-exit-123")
-	want := `if-shell -F '#{==:#{hook_pane},%3}' 'wait-for -S copilot-exit-123'`
-	if got != want {
-		t.Fatalf("daemonCompletionHook() = %q, want %q", got, want)
+func TestDaemonSessionSupervisorSignalsCompletion(t *testing.T) {
+	got := daemonSessionSupervisorCommand("copilot-start-123", "copilot-exit-123", "printf first")
+	for _, want := range []string{
+		"bash -c ",
+		"tmux wait-for",
+		"bash -c",
+		"copilot_exit_code=$?",
+		"tmux wait-for -S",
+		"exit $copilot_exit_code",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("daemonSessionSupervisorCommand() = %q, want substring %q", got, want)
+		}
+	}
+	if strings.Contains(got, "status=$?") {
+		t.Fatalf("daemonSessionSupervisorCommand() uses zsh-reserved status variable: %q", got)
+	}
+}
+
+func TestDaemonParsePaneStatusAllowsMissingZeroExitStatus(t *testing.T) {
+	dead, exitCode, err := daemonParsePaneStatus("1\n")
+	if err != nil {
+		t.Fatalf("daemonParsePaneStatus() error = %v", err)
+	}
+	if !dead || exitCode != 0 {
+		t.Fatalf("daemonParsePaneStatus() = (%v, %d), want (true, 0)", dead, exitCode)
 	}
 }
 
