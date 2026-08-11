@@ -32,8 +32,7 @@ func TestExtensionHostSubprocess_ConcurrentListCodespaces(t *testing.T) {
 	script := `#!/bin/sh
 case "$*" in
   *"codespace list"*)
-    sleep 5
-    echo '[]'
+    exec sleep 5
     ;;
   *)
     echo '[]'
