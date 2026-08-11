@@ -81,7 +81,7 @@ func TestWrapExecutorsSkipsNonSSHExecutors(t *testing.T) {
 func TestWrapExecutorsHandlesDialFailureGracefully(t *testing.T) {
 	t.Setenv(daemonDisabledEnv, "")
 	oldDeploy := daemonDeployBinary
-	daemonDeployBinary = func(*ssh.Client, string) (string, error) {
+	daemonDeployBinary = func(context.Context, *ssh.Client, string) (string, error) {
 		return "", errors.New("deploy failed")
 	}
 	t.Cleanup(func() { daemonDeployBinary = oldDeploy })
@@ -117,7 +117,7 @@ func TestDaemonDeployerReusesVerifiedHelperPath(t *testing.T) {
 		Executor:   client,
 	}
 
-	path, err := daemonDeployerFor(cs, client)(client, cs.Name)
+	path, err := daemonDeployerFor(cs, client)(context.Background(), client, cs.Name)
 	if err != nil {
 		t.Fatalf("daemon deployer error = %v", err)
 	}

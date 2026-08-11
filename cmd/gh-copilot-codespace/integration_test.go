@@ -52,7 +52,7 @@ func TestIntegration_DeployAndExec(t *testing.T) {
 	client := testSSHClient(t, cs)
 
 	// Deploy binary to codespace
-	remotePath, err := deployBinary(client, cs)
+	remotePath, err := deployBinary(context.Background(), client, cs)
 	if err != nil {
 		t.Fatalf("deployBinary: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestIntegration_DeployAndExecWithEnv(t *testing.T) {
 
 	client := testSSHClient(t, cs)
 
-	remotePath, err := deployBinary(client, cs)
+	remotePath, err := deployBinary(context.Background(), client, cs)
 	if err != nil {
 		t.Fatalf("deployBinary: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestIntegration_DeployAndExecWithWorkdir(t *testing.T) {
 
 	client := testSSHClient(t, cs)
 
-	remotePath, err := deployBinary(client, cs)
+	remotePath, err := deployBinary(context.Background(), client, cs)
 	if err != nil {
 		t.Fatalf("deployBinary: %v", err)
 	}

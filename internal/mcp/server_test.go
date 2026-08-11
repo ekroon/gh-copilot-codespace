@@ -2056,3 +2056,62 @@ func TestResolveExecutor_MultiCS_WithAlias(t *testing.T) {
 		t.Errorf("expected result from codespace b, got %q", resultText(res))
 	}
 }
+
+func TestWriteBashHandler_CancelDuringDelay(t *testing.T) {
+	mock := &mockExecutor{readSessionResult: "delayed-output"}
+	handler := writeBashHandler(testReg(mock))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel immediately — the handler should return promptly instead of sleeping.
+	cancel()
+
+	res, err := handler(ctx, makeReq(map[string]any{
+		"shellId": "s1",
+		"delay":   float64(60),
+	}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected error result on cancelled context")
+	}
+}
+
+func TestReadBashHandler_CancelDuringDelay(t *testing.T) {
+	mock := &mockExecutor{readSessionResult: "session-output"}
+	handler := readBashHandler(testReg(mock))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := handler(ctx, makeReq(map[string]any{
+		"shellId": "s1",
+		"delay":   float64(60),
+	}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected error result on cancelled context")
+	}
+}
+
+func TestBashHandler_AsyncCancelDuringInitialWait(t *testing.T) {
+	mock := &mockExecutor{}
+	handler := bashHandler(testReg(mock))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := handler(ctx, makeReq(map[string]any{
+		"command":      "sleep 100",
+		"mode":         "async",
+		"initial_wait": float64(60),
+	}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected error result on cancelled context during async initial wait")
+	}
+}

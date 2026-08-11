@@ -690,7 +690,11 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 				return toolErrorFor(err), nil
 			}
 			// Wait briefly and capture initial output
-			time.Sleep(time.Duration(asyncRemoteBashInitialDelay * float64(time.Second)))
+			select {
+			case <-ctx.Done():
+				return toolErrorFor(ctx.Err()), nil
+			case <-time.After(time.Duration(asyncRemoteBashInitialDelay * float64(time.Second))):
+			}
 			output, _ := c.ReadSession(ctx, shellId)
 			return toolSuccess(fmt.Sprintf("Started async session: %s\n\n%s", shellId, output)), nil
 		}
@@ -897,7 +901,11 @@ func writeBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		delay := optionalFloat(req, "delay", 2)
-		time.Sleep(time.Duration(delay * float64(time.Second)))
+		select {
+		case <-ctx.Done():
+			return toolErrorFor(ctx.Err()), nil
+		case <-time.After(time.Duration(delay * float64(time.Second))):
+		}
 
 		output, err := c.ReadSession(ctx, shellId)
 		if err != nil {
@@ -943,7 +951,11 @@ func readBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		delay := optionalFloat(req, "delay", 2)
-		time.Sleep(time.Duration(delay * float64(time.Second)))
+		select {
+		case <-ctx.Done():
+			return toolErrorFor(ctx.Err()), nil
+		case <-time.After(time.Duration(delay * float64(time.Second))):
+		}
 
 		output, err := c.ReadSession(ctx, shellId)
 		if err != nil {

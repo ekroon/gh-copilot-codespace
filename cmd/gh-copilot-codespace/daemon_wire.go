@@ -83,7 +83,7 @@ func wrapExecutorWithDaemon(ctx context.Context, cs *registry.ManagedCodespace) 
 func daemonDeployerFor(cs *registry.ManagedCodespace, sshClient *ssh.Client) daemontransport.Deployer {
 	if cs.HelperPath != "" && sshClient.FilesystemHelperPath() == cs.HelperPath {
 		helperPath := cs.HelperPath
-		return func(*ssh.Client, string) (string, error) {
+		return func(context.Context, *ssh.Client, string) (string, error) {
 			return helperPath, nil
 		}
 	}

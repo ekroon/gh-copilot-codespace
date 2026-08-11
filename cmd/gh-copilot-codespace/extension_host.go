@@ -7,10 +7,20 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 )
+
+// extensionHostRuntime is a narrow test seam for the extension-host protocol server.
+type extensionHostRuntime interface {
+	Definitions() []mcp.ToolDefinition
+	Call(ctx context.Context, name string, args map[string]any) (mcp.RuntimeCallResult, error)
+}
 
 type extensionHostRequest struct {
 	ID     any            `json:"id,omitempty"`
@@ -52,31 +62,24 @@ type customAgentWire struct {
 }
 
 func runExtensionHost() error {
-	return runExtensionHostIO(os.Stdin, os.Stdout)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	return runExtensionHostIO(ctx, os.Stdin, os.Stdout)
 }
 
-func runExtensionHostIO(in io.Reader, out io.Writer) error {
+func runExtensionHostIO(ctx context.Context, in io.Reader, out io.Writer) error {
 	reg, lifecycleCfg, err := toolRuntimeInputsFromEnv()
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	closers := wrapExecutorsWithDaemon(ctx, reg)
-	lifecycleCfg.ExecutorSetup = func(ctx context.Context, cs *registry.ManagedCodespace) error {
-		closeExecutor, err := wrapExecutorWithDaemon(ctx, cs)
+	wrapExecutorsWithDaemon(ctx, reg)
+	lifecycleCfg.ExecutorSetup = func(setupCtx context.Context, cs *registry.ManagedCodespace) error {
+		_, err := wrapExecutorWithDaemon(setupCtx, cs)
 		if err != nil {
 			return err
 		}
-		if closeExecutor != nil {
-			closers = append(closers, closeExecutor)
-		}
 		return nil
 	}
-	defer func() {
-		for _, c := range closers {
-			c()
-		}
-	}()
 	runtime := mcp.NewToolRuntime(reg, lifecycleCfg)
 	mode := preambleModeFromEnv(os.Getenv(codespaceExtensionModeEnv))
 	preamble := BuildPreamble(PreambleContext{
@@ -84,64 +87,221 @@ func runExtensionHostIO(in io.Reader, out io.Writer) error {
 		Codespaces:   preambleCodespacesFromRegistry(reg),
 		AccessPolicy: lifecycleCfg.AccessPolicy,
 	})
-	decoder := json.NewDecoder(in)
-	encoder := json.NewEncoder(out)
 
-	for {
-		var req extensionHostRequest
-		if err := decoder.Decode(&req); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
+	var bootstrap *bootstrapPayload
+	if preamble != "" || reg.Len() > 0 {
+		bootstrap = &bootstrapPayload{}
+		if preamble != "" {
+			bootstrap.SystemMessage = &systemMessageWire{
+				Mode:    "append",
+				Content: preamble,
 			}
-			return fmt.Errorf("decode request: %w", err)
 		}
-
-		var resp extensionHostResponse
-		resp.ID = req.ID
-		switch req.Method {
-		case "list_tools":
-			payload := bootstrapPayload{
-				Tools: runtime.Definitions(),
+		if reg.Len() > 0 {
+			if agent := remoteExplorerInlineAgent(true); agent != nil {
+				bootstrap.CustomAgents = []customAgentWire{*agent}
 			}
-			if preamble != "" {
-				payload.SystemMessage = &systemMessageWire{
-					Mode:    "append",
-					Content: preamble,
-				}
-			}
-			// Advertise the remote-explorer sub-agent whenever at least one
-			// codespace is connected so the parent agent can delegate
-			// exploration to it. With zero codespaces the remote_* tools are
-			// useless, so suppress the agent.
-			if reg.Len() > 0 {
-				if agent := remoteExplorerInlineAgent(true); agent != nil {
-					payload.CustomAgents = []customAgentWire{*agent}
-				}
-			}
-			resp.Result = payload
-		case "call_tool":
-			if req.Tool == "" {
-				resp.Error = "missing tool"
-				break
-			}
-			args := req.Args
-			if args == nil {
-				args = map[string]any{}
-			}
-			result, err := runtime.Call(ctx, req.Tool, args)
-			if err != nil {
-				resp.Error = err.Error()
-			} else {
-				resp.Result = result
-			}
-		default:
-			resp.Error = fmt.Sprintf("unknown method %q", req.Method)
-		}
-
-		if err := encoder.Encode(resp); err != nil {
-			return fmt.Errorf("encode response: %w", err)
 		}
 	}
+
+	// Cleanup uses ManagedCodespace.Cleanup as the authoritative idempotent
+	// cleanup; no separate shared closers slice.
+	defer func() {
+		for _, cs := range reg.All() {
+			if cs.Cleanup != nil {
+				cs.Cleanup()
+			}
+		}
+	}()
+
+	return runExtensionHostServer(ctx, in, out, runtime, bootstrap)
+}
+
+// runExtensionHostServer is the context-aware concurrent protocol coordinator.
+// It uses the narrow extensionHostRuntime interface for testability.
+func runExtensionHostServer(ctx context.Context, in io.Reader, out io.Writer, rt extensionHostRuntime, bootstrap *bootstrapPayload) error {
+	hostCtx, hostCancel := context.WithCancel(ctx)
+	defer hostCancel()
+
+	// Serialized response writer: one goroutine owns the encoder.
+	// writerStopped is a broadcast channel (closed once); writerErr stores
+	// the first error for later retrieval. outputClosed is set when we
+	// intentionally close output during shutdown (not a real error).
+	responses := make(chan extensionHostResponse, 64)
+	writerStopped := make(chan struct{})
+	var writerErr error
+	var writerOnce sync.Once
+
+	go func() {
+		encoder := json.NewEncoder(out)
+		for resp := range responses {
+			if err := encoder.Encode(resp); err != nil {
+				writerOnce.Do(func() {
+					writerErr = err
+					close(writerStopped)
+					hostCancel()
+				})
+				// Drain remaining responses so workers don't block.
+				for range responses {
+				}
+				return
+			}
+		}
+		// Normal close after all responses written.
+		writerOnce.Do(func() { close(writerStopped) })
+	}()
+
+	var wg sync.WaitGroup
+
+	// sendResponse delivers a response to the writer. Uses a non-blocking fast
+	// path when the channel has capacity, falling back to a cancellation-aware
+	// send only when the channel is full (backpressure from a blocked writer).
+	sendResponse := func(resp extensionHostResponse) {
+		select {
+		case responses <- resp:
+			return
+		default:
+		}
+		// Channel full — blocked writer or burst. Wait with cancellation.
+		select {
+		case responses <- resp:
+		case <-writerStopped:
+		case <-hostCtx.Done():
+		}
+	}
+
+	// Decoder goroutine. Sends decoded requests or errors. Every send selects
+	// on hostCtx.Done so the goroutine never blocks on the channel after
+	// cancellation. decoderDone is closed when the goroutine exits.
+	type decodedRequest struct {
+		req extensionHostRequest
+		err error
+	}
+	requests := make(chan decodedRequest, 1)
+	decoderDone := make(chan struct{})
+	go func() {
+		defer close(decoderDone)
+		decoder := json.NewDecoder(in)
+		for {
+			var req extensionHostRequest
+			if err := decoder.Decode(&req); err != nil {
+				select {
+				case requests <- decodedRequest{err: err}:
+				case <-hostCtx.Done():
+				}
+				return
+			}
+			select {
+			case requests <- decodedRequest{req: req}:
+			case <-hostCtx.Done():
+				return
+			}
+		}
+	}()
+
+	var decodeErr error
+loop:
+	for {
+		select {
+		case dr := <-requests:
+			if dr.err != nil {
+				if errors.Is(dr.err, io.EOF) || errors.Is(dr.err, io.ErrClosedPipe) {
+					decodeErr = nil
+				} else {
+					decodeErr = fmt.Errorf("decode request: %w", dr.err)
+				}
+				break loop
+			}
+			req := dr.req
+
+			switch req.Method {
+			case "list_tools":
+				payload := bootstrapPayload{
+					Tools: rt.Definitions(),
+				}
+				if bootstrap != nil {
+					payload.SystemMessage = bootstrap.SystemMessage
+					payload.CustomAgents = bootstrap.CustomAgents
+				}
+				sendResponse(extensionHostResponse{ID: req.ID, Result: payload})
+
+			case "call_tool":
+				if req.Tool == "" {
+					sendResponse(extensionHostResponse{ID: req.ID, Error: "missing tool"})
+					continue
+				}
+				args := req.Args
+				if args == nil {
+					args = map[string]any{}
+				}
+				reqID := req.ID
+				toolName := req.Tool
+
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					callCtx, callCancel := context.WithCancel(hostCtx)
+					defer callCancel()
+
+					result, err := rt.Call(callCtx, toolName, args)
+					var resp extensionHostResponse
+					resp.ID = reqID
+					if err != nil {
+						resp.Error = err.Error()
+					} else {
+						resp.Result = result
+					}
+					sendResponse(resp)
+				}()
+
+			default:
+				sendResponse(extensionHostResponse{ID: req.ID, Error: fmt.Sprintf("unknown method %q", req.Method)})
+			}
+
+		case <-hostCtx.Done():
+			// Parent or writer cancelled. Close input to unblock decoder.
+			if c, ok := in.(io.Closer); ok {
+				c.Close()
+			}
+			decodeErr = nil
+			break loop
+		}
+	}
+
+	// Cancel in-flight worker contexts (unblocks context-aware tools).
+	hostCancel()
+
+	// Workers blocked in sendResponse unblock via hostCtx.Done.
+	wg.Wait()
+	close(responses)
+
+	// Wait briefly for writer to drain the closed channel. If the writer is
+	// stuck in Encode (blocked output), don't block the server return — the
+	// caller's pipe teardown or process exit will clean it up.
+	select {
+	case <-writerStopped:
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Close output to signal EOF to pipe readers and unblock a stuck writer.
+	if c, ok := out.(io.Closer); ok {
+		c.Close()
+	}
+
+	// After closing output, wait for writer to finish (it unblocks from the
+	// close and runs writerOnce). This prevents a data race on server locals.
+	<-writerStopped
+
+	// Wait for decoder goroutine to exit (unblocked by input close or ctx).
+	<-decoderDone
+
+	if decodeErr != nil {
+		return decodeErr
+	}
+	if writerErr != nil {
+		return fmt.Errorf("encode response: %w", writerErr)
+	}
+	return nil
 }
 
 func preambleModeFromEnv(string) PreambleMode {

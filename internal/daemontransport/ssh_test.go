@@ -61,7 +61,7 @@ func TestSSHTransportSpawnFallsBackToGhCodespaceWhenNoMultiplex(t *testing.T) {
 func TestSSHTransportDeployDelegatesToInjectedFunc(t *testing.T) {
 	client := ssh.NewClient("codespace-three")
 	called := false
-	transport := NewSSHTransport(client, "codespace-three", func(gotClient *ssh.Client, gotName string) (string, error) {
+	transport := NewSSHTransport(client, "codespace-three", func(_ context.Context, gotClient *ssh.Client, gotName string) (string, error) {
 		called = true
 		if gotClient != client {
 			t.Fatalf("deployer client = %p, want %p", gotClient, client)

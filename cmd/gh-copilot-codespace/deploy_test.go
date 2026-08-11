@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/daemonproto"
 	"github.com/ekroon/gh-copilot-codespace/internal/helperinfo"
@@ -25,7 +27,7 @@ type fakeDeployRemote struct {
 	installCommands []string
 }
 
-func (f *fakeDeployRemote) run(_ string, command string, stdin []byte) (string, error) {
+func (f *fakeDeployRemote) run(_ context.Context, _ string, command string, stdin []byte) (string, error) {
 	f.t.Helper()
 	f.commands = append(f.commands, command)
 
@@ -79,8 +81,8 @@ func testDeployDeps(t *testing.T, remote *fakeDeployRemote) deployBinaryDeps {
 	remote.expectedDigest = hex.EncodeToString(digest[:])
 
 	return deployBinaryDeps{
-		detectArch: func(string) (string, error) { return "amd64", nil },
-		getLinuxBinary: func(string) (string, func(), error) {
+		detectArch: func(context.Context, string) (string, error) { return "amd64", nil },
+		getLinuxBinary: func(context.Context, string) (string, func(), error) {
 			return binaryPath, nil, nil
 		},
 		binaryVersion: func(string) (string, error) { return "test-version", nil },
@@ -106,7 +108,7 @@ func TestDeployBinaryIgnoresOldFixedHelper(t *testing.T) {
 	}
 	client := ssh.NewClient("demo")
 
-	got, err := deployBinaryWithDeps(client, "demo", testDeployDeps(t, remote))
+	got, err := deployBinaryWithDeps(context.Background(), client, "demo", testDeployDeps(t, remote))
 	if err != nil {
 		t.Fatalf("deployBinaryWithDeps() error = %v", err)
 	}
@@ -128,7 +130,7 @@ func TestDeployBinaryDoesNotReplaceInUseBinary(t *testing.T) {
 		oldFixedInUse: true,
 	}
 
-	if _, err := deployBinaryWithDeps(ssh.NewClient("demo"), "demo", testDeployDeps(t, remote)); err != nil {
+	if _, err := deployBinaryWithDeps(context.Background(), ssh.NewClient("demo"), "demo", testDeployDeps(t, remote)); err != nil {
 		t.Fatalf("deployBinaryWithDeps() error = %v", err)
 	}
 	if len(remote.installCommands) != 1 {
@@ -153,7 +155,7 @@ func TestDeployBinaryFailureLeavesHelperUnselected(t *testing.T) {
 	}
 	client := ssh.NewClient("demo")
 
-	_, err := deployBinaryWithDeps(client, "demo", testDeployDeps(t, remote))
+	_, err := deployBinaryWithDeps(context.Background(), client, "demo", testDeployDeps(t, remote))
 	if err == nil || !strings.Contains(err.Error(), "copy failed") {
 		t.Fatalf("deployBinaryWithDeps() error = %v, want copy failure", err)
 	}
@@ -168,7 +170,7 @@ func TestDeployBinaryRejectsCapabilityMismatch(t *testing.T) {
 	remote := &fakeDeployRemote{t: t, info: info}
 	client := ssh.NewClient("demo")
 
-	_, err := deployBinaryWithDeps(client, "demo", testDeployDeps(t, remote))
+	_, err := deployBinaryWithDeps(context.Background(), client, "demo", testDeployDeps(t, remote))
 	if err == nil || !strings.Contains(err.Error(), "filesystem protocol") {
 		t.Fatalf("deployBinaryWithDeps() error = %v, want filesystem protocol mismatch", err)
 	}
@@ -204,5 +206,48 @@ func TestHelperDaemonProtocolMatchesDaemonHandshake(t *testing.T) {
 			helperinfo.DaemonProtocolVersion,
 			daemonproto.ProtocolVersion,
 		)
+	}
+}
+
+func TestDeployBinaryWithDeps_CancelPropagation(t *testing.T) {
+	// Prove that a cancelled context causes deployBinaryWithDeps to return
+	// promptly even when a dependency blocks on ctx.Done.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	client := ssh.NewClient("demo")
+	deps := deployBinaryDeps{
+		detectArch: func(dctx context.Context, _ string) (string, error) {
+			// Block until context is cancelled.
+			<-dctx.Done()
+			return "", dctx.Err()
+		},
+		getLinuxBinary: func(context.Context, string) (string, func(), error) {
+			t.Fatal("getLinuxBinary should not be called")
+			return "", nil, nil
+		},
+		binaryVersion: func(string) (string, error) { return "v", nil },
+		remoteCommand: func(context.Context, string, string, []byte) (string, error) {
+			t.Fatal("remoteCommand should not be called")
+			return "", nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := deployBinaryWithDeps(ctx, client, "demo", deps)
+		done <- err
+	}()
+
+	// Cancel after brief delay.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("expected context canceled error, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("deployBinaryWithDeps did not return after context cancel")
 	}
 }

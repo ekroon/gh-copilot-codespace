@@ -13,7 +13,7 @@ import (
 
 // Deployer installs the daemon-capable binary in a codespace and returns the
 // absolute path to launch remotely.
-type Deployer func(*ssh.Client, string) (string, error)
+type Deployer func(ctx context.Context, client *ssh.Client, codespaceName string) (string, error)
 
 var commandContext = exec.CommandContext
 
@@ -29,7 +29,7 @@ type SSHTransport struct {
 // client already configured by the launcher. Pass deployBinary as the optional
 // deployer from the cmd package to avoid an import cycle.
 func NewSSHTransport(client *ssh.Client, codespaceName string, deployer ...Deployer) *SSHTransport {
-	deployFunc := Deployer(func(*ssh.Client, string) (string, error) {
+	deployFunc := Deployer(func(context.Context, *ssh.Client, string) (string, error) {
 		return "", ErrNotImplemented
 	})
 	if len(deployer) > 0 && deployer[0] != nil {
@@ -50,8 +50,7 @@ func (t *SSHTransport) Name() string { return "ssh" }
 
 // Deploy installs the daemon binary in the codespace via the injected deployer.
 func (t *SSHTransport) Deploy(ctx context.Context) (string, error) {
-	_ = ctx
-	return t.deployFunc(t.client, t.codespaceName)
+	return t.deployFunc(ctx, t.client, t.codespaceName)
 }
 
 // Spawn starts `<remotePath> daemon` in the codespace and returns its stdio

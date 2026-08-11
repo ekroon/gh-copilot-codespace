@@ -30,8 +30,8 @@ import (
 func dialDaemon(t *testing.T, cs string) *daemonclient.Executor {
 	t.Helper()
 	client := testSSHClient(t, cs)
-	transport := daemontransport.NewSSHTransport(client, cs, func(c *ssh.Client, name string) (string, error) {
-		return deployBinary(c, name)
+	transport := daemontransport.NewSSHTransport(client, cs, func(ctx context.Context, c *ssh.Client, name string) (string, error) {
+		return deployBinary(ctx, c, name)
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

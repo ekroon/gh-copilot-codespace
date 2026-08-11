@@ -20,8 +20,8 @@ import (
 )
 
 // DeployFunc deploys the exec agent binary to a codespace.
-// Returns the remote path to the deployed binary, or error.
-type DeployFunc func(sshClient *ssh.Client, codespaceName string) (string, error)
+// The context must be respected so callers can cancel long builds/downloads.
+type DeployFunc func(ctx context.Context, sshClient *ssh.Client, codespaceName string) (string, error)
 
 // ExecutorSetup upgrades a newly connected codespace executor when available.
 // Implementations may replace cs.Executor and should leave it unchanged on error.
@@ -320,7 +320,11 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 			if i == 29 {
 				return toolError(fmt.Sprintf("codespace %s created but SSH not ready after 30 attempts", csName)), nil
 			}
-			time.Sleep(3 * time.Second)
+			select {
+			case <-ctx.Done():
+				return toolError(fmt.Sprintf("codespace %s created but SSH readiness interrupted", csName)), nil
+			case <-time.After(3 * time.Second):
+			}
 		}
 
 		// Setup SSH multiplexing
@@ -332,7 +336,7 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 		// Deploy and select a compatible helper binary.
 		var helperPath string
 		if state.cfg.DeployFunc != nil {
-			remotePath, err := state.cfg.DeployFunc(sshClient, csName)
+			remotePath, err := state.cfg.DeployFunc(ctx, sshClient, csName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed: %v\n", err)
 			} else if selected := sshClient.FilesystemHelperPath(); selected == "" || selected != remotePath {
@@ -370,6 +374,9 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 			}
 		}
 		if err := reg.Register(cs); err != nil {
+			if cs.Cleanup != nil {
+				cs.Cleanup()
+			}
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
 		}
 
@@ -479,7 +486,7 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 		}
 
 		// Look up the codespace to get its repository
-		repoInfo := lookupCSRepository(csName)
+		repoInfo := lookupCSRepository(ctx, csName)
 
 		// Setup SSH
 		sshClient := ssh.NewClient(csName)
@@ -490,7 +497,7 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 		// Deploy and select a compatible helper binary.
 		var helperPath string
 		if state.cfg.DeployFunc != nil {
-			remotePath, err := state.cfg.DeployFunc(sshClient, csName)
+			remotePath, err := state.cfg.DeployFunc(ctx, sshClient, csName)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed for %s: %v\n", csName, err)
 			} else if selected := sshClient.FilesystemHelperPath(); selected == "" || selected != remotePath {
@@ -517,10 +524,11 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 			}
 		}
 		if err := reg.Register(cs); err != nil {
+			if cs.Cleanup != nil {
+				cs.Cleanup()
+			}
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
 		}
-
-		state.mutateAccessPolicy(func(*CodespaceAccessPolicy) {})
 
 		// Run provisioners
 		if len(state.cfg.Provisioners) > 0 {
@@ -538,8 +546,8 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 }
 
 // lookupCSRepository fetches the repository name for a codespace via gh CLI.
-func lookupCSRepository(csName string) string {
-	out, err := exec.Command("gh", "codespace", "list",
+func lookupCSRepository(ctx context.Context, csName string) string {
+	out, err := exec.CommandContext(ctx, "gh", "codespace", "list",
 		"--json", "name,repository", "--limit", "50").Output()
 	if err != nil {
 		return ""

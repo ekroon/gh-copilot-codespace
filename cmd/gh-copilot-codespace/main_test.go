@@ -472,7 +472,7 @@ func TestRunExtensionHostIOListAndCall(t *testing.T) {
 		`{"id":1,"method":"list_tools"}` + "\n" +
 			`{"id":2,"method":"call_tool","tool":"list_codespaces","args":{}}` + "\n")
 	var output bytes.Buffer
-	if err := runExtensionHostIO(input, &output); err != nil {
+	if err := runExtensionHostIO(context.Background(), input, &output); err != nil {
 		t.Fatalf("runExtensionHostIO: %v", err)
 	}
 
@@ -551,7 +551,7 @@ func TestRunExtensionHostIOAdvertisesRemoteExplorerWhenCodespaceConnected(t *tes
 
 	input := strings.NewReader(`{"id":1,"method":"list_tools"}` + "\n")
 	var output bytes.Buffer
-	if err := runExtensionHostIO(input, &output); err != nil {
+	if err := runExtensionHostIO(context.Background(), input, &output); err != nil {
 		t.Fatalf("runExtensionHostIO: %v", err)
 	}
 

@@ -437,7 +437,7 @@ func TestConnectCodespaceHandlerFailedDeployLeavesHelperUnavailable(t *testing.T
 
 	reg := registry.New()
 	handler := connectCodespaceHandler(reg, LifecycleConfig{
-		DeployFunc: func(*ssh.Client, string) (string, error) {
+		DeployFunc: func(context.Context, *ssh.Client, string) (string, error) {
 			return "", errors.New("deploy failed")
 		},
 	})
@@ -490,6 +490,51 @@ func TestConnectCodespaceHandlerSetsUpConfiguredExecutor(t *testing.T) {
 	}
 	if cs.Executor != wrapped {
 		t.Fatalf("Executor = %T, want configured executor", cs.Executor)
+	}
+}
+
+func TestCreateCodespaceHandlerCleansUpOnRegistrationRace(t *testing.T) {
+	installFakeCodespaceCLI(t, `[{"name":"created-cs-name","repository":"owner/repo"}]`, "/workspaces/repo/")
+
+	reg := registry.New()
+	// Pre-register with a different alias but same codespace name.
+	existing := &registry.ManagedCodespace{
+		Alias:    "preexisting-alias",
+		Name:     "created-cs-name",
+		Executor: &mockExecutor{},
+	}
+	if err := reg.Register(existing); err != nil {
+		t.Fatalf("pre-register: %v", err)
+	}
+
+	gh := &mockGHRunner{
+		results: map[string]mockGHResult{
+			"codespace create": {output: "created-cs-name"},
+			"codespace ssh":    {output: "ready"},
+		},
+	}
+
+	var cleanupCalled bool
+	state := newLifecycleState(LifecycleConfig{
+		GHRunner: gh,
+		ExecutorSetup: func(_ context.Context, cs *registry.ManagedCodespace) error {
+			cs.Cleanup = func() { cleanupCalled = true }
+			return nil
+		},
+	})
+	handler := createCodespaceHandlerWithState(reg, state)
+
+	res, _ := handler(context.Background(), makeReq(map[string]any{
+		"repository": "owner/repo",
+	}))
+	if !res.IsError {
+		t.Fatalf("expected registration failure, got: %s", resultText(res))
+	}
+	if !strings.Contains(resultText(res), "registration failed") {
+		t.Fatalf("expected 'registration failed' error, got: %s", resultText(res))
+	}
+	if !cleanupCalled {
+		t.Fatal("Cleanup was not called after registration race loss")
 	}
 }
 
@@ -865,5 +910,16 @@ func TestGetCodespaceOptions_MissingRepo(t *testing.T) {
 	res, _ := handler(context.Background(), makeReq(map[string]any{}))
 	if !res.IsError {
 		t.Fatal("expected error for missing repository")
+	}
+}
+
+func TestConnectCodespaceHandler_CancelDuringRepositoryLookup(t *testing.T) {
+	// lookupCSRepository uses CommandContext; cancelled context should return
+	// empty repo without hanging.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := lookupCSRepository(ctx, "nonexistent-codespace")
+	if result != "" {
+		t.Fatalf("expected empty repository on cancelled context, got %q", result)
 	}
 }

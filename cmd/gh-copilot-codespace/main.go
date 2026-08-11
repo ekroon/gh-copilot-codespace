@@ -453,7 +453,7 @@ func runLauncher(args []string) error {
 		}
 
 		// Deploy exec agent binary
-		remoteBinary, err := deployBinary(sshClient, selected.Name)
+		remoteBinary, err := deployBinary(ctx, sshClient, selected.Name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not deploy exec agent for %s: %v\n", selected.Name, err)
 		}
