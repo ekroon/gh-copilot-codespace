@@ -474,6 +474,100 @@ func daemonCreateProcessCgroup(sessionID string) (*daemonProcessCgroup, error) {
 	return &daemonProcessCgroup{path: path}, nil
 }
 
+func daemonCleanupStaleProcessCgroupsAtStartup() error {
+	if runtime.GOOS != "linux" || !daemonProcessSessionsSupported() {
+		return nil
+	}
+	return daemonCleanupStaleProcessCgroups(
+		daemonProcessCgroupRoot,
+		daemonProcessOwnerAlive,
+		func(cgroup *daemonProcessCgroup) error { return cgroup.kill() },
+		func(cgroup *daemonProcessCgroup) error { return cgroup.remove() },
+	)
+}
+
+func daemonCleanupStaleProcessCgroups(
+	root string,
+	ownerAlive func(int) (bool, error),
+	killCgroup func(*daemonProcessCgroup) error,
+	removeCgroup func(*daemonProcessCgroup) error,
+) error {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read process session cgroup root: %w", err)
+	}
+
+	var cleanupErrors []error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		ownerPID, ok := daemonProcessCgroupOwnerPID(entry.Name())
+		if !ok {
+			continue
+		}
+		alive, err := ownerAlive(ownerPID)
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("check process session cgroup owner %d: %w", ownerPID, err))
+			continue
+		}
+		if alive {
+			continue
+		}
+
+		cgroup := &daemonProcessCgroup{path: filepath.Join(root, entry.Name())}
+		killErr := killCgroup(cgroup)
+		removeErr := removeCgroup(cgroup)
+		if err := errors.Join(killErr, removeErr); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("clean stale process session cgroup %q: %w", entry.Name(), err))
+		}
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func daemonProcessCgroupOwnerPID(name string) (int, bool) {
+	pidText, hash, ok := strings.Cut(name, "-")
+	if !ok || len(hash) != 16 {
+		return 0, false
+	}
+	if _, err := strconv.ParseUint(hash, 16, 64); err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(pidText)
+	return pid, err == nil && pid > 0
+}
+
+func daemonProcessOwnerAlive(pid int) (bool, error) {
+	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err == nil {
+		closingParen := strings.LastIndexByte(string(stat), ')')
+		if closingParen < 0 {
+			return true, errors.New("malformed /proc stat")
+		}
+		fields := strings.Fields(string(stat[closingParen+1:]))
+		if len(fields) == 0 {
+			return true, errors.New("missing process state in /proc stat")
+		}
+		return fields[0] != "Z" && fields[0] != "X", nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
+	err = syscall.Kill(pid, 0)
+	switch {
+	case err == nil, errors.Is(err, syscall.EPERM):
+		return true, nil
+	case errors.Is(err, syscall.ESRCH):
+		return false, nil
+	default:
+		return true, err
+	}
+}
+
 func (c *daemonProcessCgroup) addProcess(pid int) error {
 	return os.WriteFile(filepath.Join(c.path, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644)
 }
@@ -511,13 +605,17 @@ func (c *daemonProcessCgroup) killProcesses() error {
 	return errors.New("cgroup remained populated after SIGKILL")
 }
 
-func (c *daemonProcessCgroup) remove() {
+func (c *daemonProcessCgroup) remove() error {
+	var lastErr error
 	for range 20 {
 		if err := os.Remove(c.path); err == nil || errors.Is(err, os.ErrNotExist) {
-			return
+			return nil
+		} else {
+			lastErr = err
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	return lastErr
 }
 
 func daemonSignalProcessTree(rootPID, pgid int, signal syscall.Signal) {

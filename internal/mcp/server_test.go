@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/daemonclient"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
@@ -1590,6 +1591,40 @@ func TestBashHandler_DefaultFallsBackToRunBashWhenSessionStartFails(t *testing.T
 	}
 	if mock.runBashCalls != 1 {
 		t.Fatalf("runBashCalls = %d, want 1", mock.runBashCalls)
+	}
+}
+
+func TestBashHandler_DoesNotFallbackAfterConnectionLossStartingLegacySession(t *testing.T) {
+	mock := &mockExecutor{
+		startSessionErr: &daemonclient.ConnectionLostError{
+			Cause:          fmt.Errorf("daemon exited"),
+			Reconnected:    true,
+			OutcomeUnknown: true,
+			OldGeneration:  1,
+			NewGeneration:  2,
+		},
+		runBashStdout: "must not run",
+	}
+
+	handler := bashHandler(testReg(mock))
+	res, err := handler(context.Background(), makeReq(map[string]any{
+		"command": "touch side-effect",
+		"shellId": "connection-lost",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("result error = false, want true; result = %s", resultText(res))
+	}
+	if mock.runBashCalls != 0 {
+		t.Fatalf("runBashCalls = %d, want 0 to avoid replay", mock.runBashCalls)
+	}
+	text := resultText(res)
+	if !strings.Contains(text, "Remote connection lost") ||
+		!strings.Contains(text, "outcome of this call is unknown") ||
+		!strings.Contains(text, "inspect remote state before repeating") {
+		t.Fatalf("result missing connection-loss guidance:\n%s", text)
 	}
 }
 

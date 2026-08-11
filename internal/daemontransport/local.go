@@ -51,7 +51,8 @@ func (t *LocalTransport) Spawn(ctx context.Context, remotePath string) (io.ReadW
 		_ = stdin.Close()
 		return nil, fmt.Errorf("daemontransport: open daemon stdout: %w", err)
 	}
-	cmd.Stderr = os.Stderr
+	stderr := newStderrTail(os.Stderr, StderrTailLimit)
+	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
@@ -59,7 +60,7 @@ func (t *LocalTransport) Spawn(ctx context.Context, remotePath string) (io.ReadW
 		return nil, fmt.Errorf("daemontransport: start local daemon: %w", err)
 	}
 
-	return newProcessStream(cmd, stdin, stdout), nil
+	return newProcessStream(t.Name(), cmd, stdin, stdout, stderr), nil
 }
 
 // Close releases transport resources. LocalTransport has none.

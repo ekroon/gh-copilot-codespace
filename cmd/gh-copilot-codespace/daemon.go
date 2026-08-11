@@ -135,6 +135,9 @@ func runDaemonIO(ctx context.Context, in io.Reader, out io.Writer) error {
 	codespaceenv.ApplyProcessBootstrap()
 	defer daemonCancelAllSessionWaiters()
 	defer daemonStopAllProcessSessions()
+	if err := daemonCleanupStaleProcessCgroupsAtStartup(); err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: stale process session cleanup incomplete: %v\n", err)
+	}
 
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	dec := daemonproto.NewDecoder(in)

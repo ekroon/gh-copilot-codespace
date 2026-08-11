@@ -23,7 +23,9 @@ import (
 var daemonBinary string
 
 type pipeTransport struct {
-	stream io.ReadWriteCloser
+	mu      sync.Mutex
+	stream  io.ReadWriteCloser
+	spawned bool
 }
 
 type closeSignalConn struct {
@@ -50,6 +52,12 @@ func (t *pipeTransport) Name() string { return "pipe" }
 func (t *pipeTransport) Deploy(context.Context) (string, error) { return "daemon", nil }
 
 func (t *pipeTransport) Spawn(context.Context, string) (io.ReadWriteCloser, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.spawned {
+		return nil, errors.New("pipeTransport: single stream already spawned")
+	}
+	t.spawned = true
 	return t.stream, nil
 }
 
@@ -116,9 +124,13 @@ func testContext(t *testing.T) context.Context {
 
 func waitForWriterIdle(t *testing.T, e *Executor) {
 	t.Helper()
+	conn := e.current()
+	if conn == nil {
+		t.Fatal("executor has no connection")
+	}
 	select {
-	case <-e.writeMu:
-		e.writeMu <- struct{}{}
+	case <-conn.writeMu:
+		conn.writeMu <- struct{}{}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for daemon writer to become idle")
 	}
@@ -351,11 +363,21 @@ func TestExecutorContextCancelClosesStreamWhenCancelWriteIsBlocked(t *testing.T)
 		serverErr <- nil
 	}()
 
-	e, err := Dial(context.Background(), &pipeTransport{stream: signaledClient})
+	second := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
+	transport := &scriptedTransport{}
+	transport.spawn = func(attempt int) (io.ReadWriteCloser, error) {
+		if attempt == 1 {
+			return signaledClient, nil
+		}
+		return second.stream, nil
+	}
+
+	e, err := Dial(context.Background(), transport)
 	if err != nil {
 		t.Fatalf("Dial() error = %v", err)
 	}
 	defer e.Close()
+	original := e.current()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	targetErr := make(chan error, 1)
@@ -401,6 +423,22 @@ func TestExecutorContextCancelClosesStreamWhenCancelWriteIsBlocked(t *testing.T)
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
+	}
+
+	// The blocked cancel kills only its own generation: the executor recovers
+	// by establishing a replacement connection on the next call.
+	result, err := e.Ping(context.Background())
+	if err != nil {
+		t.Fatalf("Ping() after generation death error = %v", err)
+	}
+	if !result.Pong {
+		t.Fatal("Ping().Pong = false, want true")
+	}
+	if e.current().id == original.id {
+		t.Fatal("executor kept the dead generation")
+	}
+	if got := transport.spawnCount(); got != 2 {
+		t.Fatalf("spawn count = %d, want 2", got)
 	}
 }
 
@@ -746,19 +784,20 @@ func TestExecutorConcurrentCalls(t *testing.T) {
 
 func TestExecutorCloseTerminatesReader(t *testing.T) {
 	e := dialDaemon(t)
+	conn := e.current()
 	if err := e.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	select {
-	case <-e.readerDone:
+	case <-conn.readerDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("readerDone did not close")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := e.Ping(ctx); err == nil {
-		t.Fatal("Ping after Close error = nil, want error")
+	if _, err := e.Ping(ctx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Ping after Close error = %v, want ErrClosed", err)
 	}
 }
 

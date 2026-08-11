@@ -5,10 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	pathpkg "path"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,26 +18,38 @@ import (
 // Executor speaks daemonproto over a daemontransport.Transport. It satisfies
 // ssh.Executor so callers can substitute it for *ssh.Client without changing
 // any consumers. Executor is safe for concurrent use; each verb call gets an
-// independent id and the writer is serialized through a mutex.
+// independent id and the writer is serialized per connection generation.
+//
+// All stream-scoped state lives in a connection generation. When a generation
+// dies, the executor restores the connection lazily on the next call. It never
+// replays an interrupted operation: interrupted callers receive a
+// *ConnectionLostError describing what is known about the outcome.
 type Executor struct {
-	transport daemontransport.Transport
-	stream    io.ReadWriteCloser // owned; closed by Close()
-	writeMu   chan struct{}
-	dec       *daemonproto.Decoder
+	transport  daemontransport.Transport
+	remotePath string
 
-	nextID  atomic.Uint64
-	pending sync.Map // map[uint64]chan daemonproto.Frame
+	nextID         atomic.Uint64
+	nextGeneration atomic.Uint64
+
+	mu                sync.Mutex
+	conn              *connection
+	closed            bool
+	reconnecting      chan struct{}
+	reconnectFailures int
+	lastReconnectErr  error
+	cooldownUntil     time.Time
+
+	closeSignal    chan struct{}
+	closeOnce      sync.Once
+	closeTransport sync.Once
 
 	workdir   string
 	workdirMu sync.RWMutex
 
-	readerDone    chan struct{}
-	readerErr     atomic.Value // terminal stream error; sticky
-	readerErrOnce sync.Once
-
-	helloOnce sync.Once
-	hello     daemonproto.Frame
-	helloErr  error
+	helloTimeout         time.Duration
+	reconnectTimeout     time.Duration
+	reconnectCooldown    time.Duration
+	maxReconnectCooldown time.Duration
 }
 
 // RemoteError is an error returned by the remote daemon.
@@ -60,124 +69,38 @@ func Dial(ctx context.Context, t daemontransport.Transport) (*Executor, error) {
 		return nil, err
 	}
 
-	stream, err := t.Spawn(ctx, remotePath)
+	e := &Executor{
+		transport:            t,
+		remotePath:           remotePath,
+		closeSignal:          make(chan struct{}),
+		helloTimeout:         defaultHelloTimeout,
+		reconnectTimeout:     defaultReconnectTimeout,
+		reconnectCooldown:    defaultReconnectCooldown,
+		maxReconnectCooldown: defaultMaxCooldown,
+	}
+
+	conn, err := e.connect(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	e := &Executor{
-		transport:  t,
-		stream:     stream,
-		writeMu:    make(chan struct{}, 1),
-		dec:        daemonproto.NewDecoder(stream),
-		readerDone: make(chan struct{}),
-	}
-	e.writeMu <- struct{}{}
-
-	helloCh := make(chan daemonproto.Frame, 1)
-	e.pending.Store(uint64(0), helloCh)
-	go e.readLoop()
-
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-
-	select {
-	case frame := <-helloCh:
-		e.pending.Delete(uint64(0))
-		if e.helloErr != nil {
-			_ = stream.Close()
-			<-e.readerDone
-			return nil, e.helloErr
-		}
-		if frame.Type != daemonproto.TypeHello {
-			_ = stream.Close()
-			<-e.readerDone
-			return nil, fmt.Errorf("daemonclient: expected hello frame, got %q", frame.Type)
-		}
-		if frame.Version != daemonproto.ProtocolVersion {
-			_ = stream.Close()
-			<-e.readerDone
-			return nil, fmt.Errorf("daemonclient: unsupported daemon protocol version %q (want %q)", frame.Version, daemonproto.ProtocolVersion)
-		}
-		if missing := missingDaemonVerbs(frame.Verbs, daemonproto.FilesystemVerbs()); len(missing) > 0 {
-			_ = stream.Close()
-			<-e.readerDone
-			return nil, fmt.Errorf("daemonclient: daemon missing required filesystem capabilities: %s", strings.Join(missing, ", "))
-		}
-		return e, nil
-	case <-ctx.Done():
-		e.pending.Delete(uint64(0))
-		_ = stream.Close()
-		<-e.readerDone
-		return nil, ctx.Err()
-	case <-timer.C:
-		e.pending.Delete(uint64(0))
-		_ = stream.Close()
-		<-e.readerDone
-		return nil, errors.New("daemonclient: timed out waiting for daemon hello")
-	case <-e.readerDone:
-		e.pending.Delete(uint64(0))
-		_ = stream.Close()
-		return nil, fmt.Errorf("daemonclient: daemon exited before hello: %w", e.readErr())
-	}
-}
-
-func (e *Executor) readLoop() {
-	defer close(e.readerDone)
-	sawHello := false
-	for {
-		frame, err := e.dec.Read()
-		if err != nil {
-			e.setReaderErr(err)
-			return
-		}
-
-		if !sawHello {
-			if frame.Type != daemonproto.TypeHello {
-				e.helloErr = fmt.Errorf("daemonclient: expected hello frame, got %q", frame.Type)
-				if ch, ok := e.pending.Load(uint64(0)); ok {
-					select {
-					case ch.(chan daemonproto.Frame) <- frame:
-					default:
-					}
-				}
-				continue
-			}
-			sawHello = true
-			e.helloOnce.Do(func() { e.hello = frame })
-			if ch, ok := e.pending.Load(uint64(0)); ok {
-				select {
-				case ch.(chan daemonproto.Frame) <- frame:
-				default:
-				}
-			} else {
-				fmt.Fprintln(os.Stderr, "daemonclient: ignoring unexpected hello frame")
-			}
-			continue
-		}
-
-		switch frame.Type {
-		case daemonproto.TypeResponse:
-			if ch, ok := e.pending.Load(frame.ID); ok {
-				select {
-				case ch.(chan daemonproto.Frame) <- frame:
-				default:
-				}
-			}
-		case daemonproto.TypeHello:
-			fmt.Fprintln(os.Stderr, "daemonclient: ignoring late hello frame")
-		case daemonproto.TypeRequest, daemonproto.TypeCancel:
-			fmt.Fprintf(os.Stderr, "daemonclient: ignoring unexpected %s frame for id %d\n", frame.Type, frame.ID)
-		default:
-			fmt.Fprintf(os.Stderr, "daemonclient: ignoring unknown frame type %q\n", frame.Type)
-		}
-	}
+	e.conn = conn
+	return e, nil
 }
 
 func (e *Executor) call(ctx context.Context, verb daemonproto.Verb, params any) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	conn, err := e.connectionFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return e.callOn(ctx, conn, verb, params)
+}
+
+// callOn issues one request on the captured generation c. Every response,
+// cancellation, and failure stays pinned to that generation.
+func (e *Executor) callOn(ctx context.Context, c *connection, verb daemonproto.Verb, params any) (json.RawMessage, error) {
 	id := e.nextID.Add(1)
 	frame, err := daemonproto.NewRequest(id, verb, params, "")
 	if err != nil {
@@ -185,171 +108,46 @@ func (e *Executor) call(ctx context.Context, verb daemonproto.Verb, params any) 
 	}
 
 	responseCh := make(chan daemonproto.Frame, 1)
-	e.pending.Store(id, responseCh)
-	defer e.pending.Delete(id)
+	c.pending.Store(id, responseCh)
+	defer c.pending.Delete(id)
 
-	if err := e.writeFrame(ctx, frame); err != nil {
-		return nil, fmt.Errorf("daemonclient: write %s request: %w", verb, err)
+	written, writeErr := c.writeFrame(ctx, frame)
+	if writeErr != nil {
+		// Caller-driven cancellation or deadline is not a connection failure:
+		// the generation stays usable for later calls.
+		if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
+			return nil, writeErr
+		}
+		if !errors.Is(writeErr, errConnectionDead) {
+			c.fail(fmt.Errorf("daemonclient: write %s request: %w", verb, writeErr))
+		}
+		return nil, e.connectionLost(ctx, c, written)
 	}
 
 	select {
 	case response := <-responseCh:
-		return e.processResponse(verb, response)
+		return processResponse(response)
 	case <-ctx.Done():
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-		cancelErr := e.writeFrame(cancelCtx, daemonproto.NewCancel(id))
+		_, cancelErr := c.writeFrame(cancelCtx, daemonproto.NewCancel(id))
 		cancel()
-		if cancelErr != nil {
-			e.failStream(fmt.Errorf("daemonclient: deliver cancel for request %d: %w", id, cancelErr))
+		if cancelErr != nil && !errors.Is(cancelErr, errConnectionDead) {
+			c.fail(fmt.Errorf("daemonclient: deliver cancel for request %d: %w", id, cancelErr))
 		}
 		timer := time.NewTimer(250 * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case <-responseCh:
-		case <-e.readerDone:
+		case <-c.readerDone:
 		case <-timer.C:
 		}
 		return nil, ctx.Err()
-	case <-e.readerDone:
-		return nil, e.readErr()
+	case <-c.readerDone:
+		return nil, e.connectionLost(ctx, c, true)
 	}
 }
 
-func (e *Executor) failStream(err error) {
-	e.setReaderErr(err)
-	_ = e.stream.Close()
-}
-
-func (e *Executor) setReaderErr(err error) {
-	if err != nil {
-		e.readerErrOnce.Do(func() {
-			e.readerErr.Store(err)
-		})
-	}
-}
-
-type daemonWriteDeadlineSetter interface {
-	SetWriteDeadline(time.Time) error
-}
-
-func (e *Executor) writeFrame(ctx context.Context, frame daemonproto.Frame) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case <-e.writeMu:
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-e.readerDone:
-		return e.readErr()
-	}
-	defer func() { e.writeMu <- struct{}{} }()
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	data, err := daemonproto.MarshalFrame(frame)
-	if err != nil {
-		return err
-	}
-
-	if deadlineWriter, ok := e.stream.(daemonWriteDeadlineSetter); ok {
-		return e.writeFrameWithDeadline(ctx, deadlineWriter, data)
-	}
-
-	stopClose := context.AfterFunc(ctx, func() {
-		_ = e.stream.Close()
-	})
-	written, writeErr := writeDaemonFrameBytes(e.stream, data)
-	_ = stopClose()
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if writeErr != nil {
-		if written > 0 {
-			_ = e.stream.Close()
-		}
-		return writeErr
-	}
-	return nil
-}
-
-func (e *Executor) writeFrameWithDeadline(ctx context.Context, writer daemonWriteDeadlineSetter, data []byte) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := writer.SetWriteDeadline(deadline); err != nil {
-			return fmt.Errorf("set write deadline: %w", err)
-		}
-	}
-
-	deadlineSet := make(chan struct{})
-	stopDeadline := context.AfterFunc(ctx, func() {
-		_ = writer.SetWriteDeadline(time.Now())
-		close(deadlineSet)
-	})
-	written, writeErr := writeDaemonFrameBytes(e.stream, data)
-	if !stopDeadline() {
-		<-deadlineSet
-	}
-	resetErr := writer.SetWriteDeadline(time.Time{})
-
-	if ctx.Err() != nil {
-		if written > 0 {
-			_ = e.stream.Close()
-		}
-		return ctx.Err()
-	}
-	if writeErr != nil {
-		if written > 0 {
-			_ = e.stream.Close()
-		}
-		var timeoutErr interface{ Timeout() bool }
-		if errors.As(writeErr, &timeoutErr) && timeoutErr.Timeout() {
-			if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
-				return context.DeadlineExceeded
-			}
-		}
-		return writeErr
-	}
-	if resetErr != nil {
-		_ = e.stream.Close()
-		return fmt.Errorf("reset write deadline: %w", resetErr)
-	}
-	return nil
-}
-
-func writeDaemonFrameBytes(writer io.Writer, data []byte) (int, error) {
-	total := 0
-	for len(data) > 0 {
-		written, err := writer.Write(data)
-		total += written
-		if written > 0 {
-			data = data[written:]
-		}
-		if err != nil {
-			return total, err
-		}
-		if written == 0 {
-			return total, io.ErrShortWrite
-		}
-	}
-	return total, nil
-}
-
-func missingDaemonVerbs(advertised []string, required []daemonproto.Verb) []string {
-	available := make(map[string]struct{}, len(advertised))
-	for _, verb := range advertised {
-		available[verb] = struct{}{}
-	}
-	var missing []string
-	for _, verb := range required {
-		if _, ok := available[string(verb)]; !ok {
-			missing = append(missing, string(verb))
-		}
-	}
-	return missing
-}
-
-func (e *Executor) processResponse(verb daemonproto.Verb, frame daemonproto.Frame) (json.RawMessage, error) {
+func processResponse(frame daemonproto.Frame) (json.RawMessage, error) {
 	if frame.Error != nil {
 		if frame.Error.Code == daemonproto.ErrCodeCanceled {
 			return nil, context.Canceled
@@ -359,13 +157,13 @@ func (e *Executor) processResponse(verb daemonproto.Verb, frame daemonproto.Fram
 	return frame.Result, nil
 }
 
-func (e *Executor) readErr() error {
-	if v := e.readerErr.Load(); v != nil {
-		if err, ok := v.(error); ok {
-			return err
-		}
+// supportsVerb reports whether the current generation advertised verb.
+func (e *Executor) supportsVerb(verb daemonproto.Verb) bool {
+	conn := e.current()
+	if conn == nil {
+		return false
 	}
-	return errors.New("daemonclient: reader stopped")
+	return conn.supports(verb)
 }
 
 // Ping checks whether the daemon connection is healthy.
@@ -564,12 +362,7 @@ func (e *Executor) StartSession(ctx context.Context, sessionID, command, cwd str
 }
 
 func (e *Executor) SupportsProcessSessions() bool {
-	for _, verb := range e.hello.Verbs {
-		if verb == string(daemonproto.VerbStartProcessSession) {
-			return true
-		}
-	}
-	return false
+	return e.supportsVerb(daemonproto.VerbStartProcessSession)
 }
 
 func (e *Executor) StartProcessSession(ctx context.Context, sessionID, command, cwd string) error {
@@ -616,12 +409,7 @@ func (e *Executor) ReadSession(ctx context.Context, sessionID string) (string, e
 }
 
 func (e *Executor) SupportsWaitSession() bool {
-	for _, verb := range e.hello.Verbs {
-		if verb == string(daemonproto.VerbWaitSession) {
-			return true
-		}
-	}
-	return false
+	return e.supportsVerb(daemonproto.VerbWaitSession)
 }
 
 func (e *Executor) WaitSession(ctx context.Context, sessionID string, timeout time.Duration) (string, bool, error) {
@@ -692,14 +480,38 @@ func resolveRootedPath(path, root string) string {
 	return pathpkg.Join(root, path)
 }
 
+// Close disposes the current generation, prevents any further reconnect, and
+// closes the transport exactly once. It is safe to call concurrently with an
+// in-flight reconnect: the reconnect either observes the closed state and
+// disposes its unpublished stream, or publishes before Close claims it.
 func (e *Executor) Close() error {
-	if e.stream != nil {
-		_ = e.stream.Close()
+	e.mu.Lock()
+	e.closed = true
+	conn := e.conn
+	reconnecting := e.reconnecting
+	e.mu.Unlock()
+
+	e.closeOnce.Do(func() { close(e.closeSignal) })
+
+	if conn != nil {
+		conn.dispose()
 	}
-	<-e.readerDone
-	if e.transport != nil {
-		_ = e.transport.Close()
+	if reconnecting != nil {
+		<-reconnecting
 	}
+
+	e.mu.Lock()
+	published := e.conn
+	e.mu.Unlock()
+	if published != nil && published != conn {
+		published.dispose()
+	}
+
+	e.closeTransport.Do(func() {
+		if e.transport != nil {
+			_ = e.transport.Close()
+		}
+	})
 	return nil
 }
 

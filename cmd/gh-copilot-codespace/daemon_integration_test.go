@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -257,6 +258,138 @@ func TestIntegration_DaemonSessionLifecycle(t *testing.T) {
 	if !strings.Contains(list, sessionID) {
 		t.Fatalf("ListSessions output %q missing %q", list, sessionID)
 	}
+}
+
+// TestIntegration_DaemonReconnectsAfterRemoteDaemonDeath kills only the helper
+// daemon process this test spawned — the codespace itself is untouched — and
+// checks that the interrupted call is reported instead of replayed while later
+// calls run on a fresh daemon process.
+func TestIntegration_DaemonReconnectsAfterRemoteDaemonDeath(t *testing.T) {
+	cs := testCodespace(t)
+	exec := dialDaemon(t, cs)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	ping, err := exec.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	pid := ping.PID
+	marker := fmt.Sprintf("/tmp/it-daemon-death-%d.txt", time.Now().UnixNano())
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_, _, _, _ = exec.RunBash(cleanupCtx, fmt.Sprintf("rm -f %s", marker), "/tmp")
+	})
+
+	command := fmt.Sprintf("printf 'run\\n' >> %s; kill -9 %d", marker, pid)
+	if _, _, _, err := exec.RunBash(ctx, command, "/tmp"); err == nil {
+		t.Fatal("RunBash succeeded, want connection loss after the daemon was killed")
+	} else {
+		var lost *daemonclient.ConnectionLostError
+		if !errors.As(err, &lost) {
+			t.Fatalf("RunBash error = %v (%T), want *daemonclient.ConnectionLostError", err, err)
+		}
+		if !lost.OutcomeUnknown {
+			t.Fatalf("OutcomeUnknown = false, want true for a request that reached the daemon: %v", lost)
+		}
+		if !lost.Reconnected {
+			t.Fatalf("Reconnected = false, want a restored connection: %v", lost)
+		}
+		if lost.NewGeneration == lost.OldGeneration {
+			t.Fatalf("generations = %d -> %d, want a new generation", lost.OldGeneration, lost.NewGeneration)
+		}
+		if lost.Cause == nil {
+			t.Fatal("Cause = nil, want the terminal cause of the lost connection")
+		}
+		t.Logf("connection loss cause: %v", lost.Cause)
+	}
+
+	after, err := exec.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping after reconnect: %v", err)
+	}
+	if after.PID == pid {
+		t.Fatalf("daemon pid = %d after reconnect, want a new process", after.PID)
+	}
+
+	stdout, _, exitCode, err := exec.RunBash(ctx, fmt.Sprintf("cat %s", marker), "/tmp")
+	if err != nil {
+		t.Fatalf("RunBash after reconnect: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("cat %s exit code = %d, want 0", marker, exitCode)
+	}
+	if stdout != "run\n" {
+		t.Fatalf("marker content = %q, want exactly one recorded run", stdout)
+	}
+}
+
+// TestIntegration_DaemonDeathCleansUpProcessSessions verifies that a new daemon
+// removes stale cgroups left by a SIGKILLed daemon and terminates their process.
+func TestIntegration_DaemonDeathCleansUpProcessSessions(t *testing.T) {
+	cs := testCodespace(t)
+	exec := dialDaemon(t, cs)
+	if !exec.SupportsProcessSessions() {
+		t.Skip("daemon does not advertise daemon-managed process sessions")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	ping, err := exec.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+
+	sessionID := fmt.Sprintf("it-lost-session-%d", time.Now().UnixNano())
+	pidPath := fmt.Sprintf("/tmp/%s.pid", sessionID)
+	if err := exec.StartProcessSession(ctx, sessionID, fmt.Sprintf("printf %%s $$ > %s; exec sleep 120", pidPath), "/tmp"); err != nil {
+		t.Fatalf("StartProcessSession: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		_, _, _, _ = exec.RunBash(cleanupCtx, fmt.Sprintf("rm -f %s", pidPath), "/tmp")
+	})
+
+	var processPID int
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		stdout, _, exitCode, runErr := exec.RunBash(ctx, fmt.Sprintf("cat %s 2>/dev/null", pidPath), "/tmp")
+		if runErr == nil && exitCode == 0 {
+			processPID, runErr = strconv.Atoi(strings.TrimSpace(stdout))
+			if runErr != nil {
+				t.Fatalf("parse process pid %q: %v", stdout, runErr)
+			}
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if processPID <= 0 {
+		t.Fatal("process session did not publish its pid")
+	}
+
+	if _, _, _, err := exec.RunBash(ctx, fmt.Sprintf("kill -9 %d", ping.PID), "/tmp"); err == nil {
+		t.Fatal("RunBash succeeded, want connection loss after the daemon was killed")
+	}
+
+	if _, err := exec.ReadSession(ctx, sessionID); err == nil {
+		t.Fatal("ReadSession succeeded after daemon death, want the retained session to be gone")
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, exitCode, runErr := exec.RunBash(ctx, fmt.Sprintf("kill -0 %d 2>/dev/null", processPID), "/tmp")
+		if runErr != nil {
+			t.Fatalf("check process %d: %v", processPID, runErr)
+		}
+		if exitCode != 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("process %d survived daemon SIGKILL and reconnect cleanup", processPID)
 }
 
 func TestIntegration_DaemonProcessSessionDoesNotShadowTmuxAfterReconnect(t *testing.T) {

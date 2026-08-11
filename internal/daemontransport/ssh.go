@@ -85,7 +85,8 @@ func (t *SSHTransport) Spawn(ctx context.Context, remotePath string) (io.ReadWri
 		_ = stdin.Close()
 		return nil, fmt.Errorf("daemontransport: open daemon stdout: %w", err)
 	}
-	cmd.Stderr = os.Stderr
+	stderr := newStderrTail(os.Stderr, StderrTailLimit)
+	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
@@ -93,7 +94,7 @@ func (t *SSHTransport) Spawn(ctx context.Context, remotePath string) (io.ReadWri
 		return nil, fmt.Errorf("daemontransport: start ssh daemon: %w", err)
 	}
 
-	return &sshSpawnedStream{processStream: newProcessStream(cmd, stdin, stdout)}, nil
+	return &sshSpawnedStream{processStream: newProcessStream(t.Name(), cmd, stdin, stdout, stderr)}, nil
 }
 
 // Close releases transport resources. The SSH client owns multiplexing state,
@@ -103,6 +104,10 @@ func (t *SSHTransport) Close() error { return nil }
 type sshSpawnedStream struct {
 	*processStream
 }
+
+// The SSH stream must keep reporting terminal causes; daemonclient type-asserts
+// the spawned stream, not the embedded processStream.
+var _ TerminalErrorReporter = (*sshSpawnedStream)(nil)
 
 func shellQuote(s string) string {
 	if s == "" {

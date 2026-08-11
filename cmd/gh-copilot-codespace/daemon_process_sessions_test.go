@@ -57,6 +57,53 @@ func TestDaemonProcessEnvironmentPrependsMisePaths(t *testing.T) {
 	}
 }
 
+func TestDaemonCleanupStaleProcessCgroupsKillsOnlyDeadOwners(t *testing.T) {
+	root := t.TempDir()
+	deadName := "4242-0123456789abcdef"
+	liveName := "4343-fedcba9876543210"
+	for _, name := range []string{deadName, liveName, ".probe-4242", "not-a-session"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatalf("Mkdir(%q) error = %v", name, err)
+		}
+	}
+
+	var killed, removed []string
+	err := daemonCleanupStaleProcessCgroups(
+		root,
+		func(pid int) (bool, error) {
+			switch pid {
+			case 4242:
+				return false, nil
+			case 4343:
+				return true, nil
+			default:
+				t.Fatalf("owner check called for unexpected pid %d", pid)
+				return true, nil
+			}
+		},
+		func(cgroup *daemonProcessCgroup) error {
+			killed = append(killed, filepath.Base(cgroup.path))
+			return nil
+		},
+		func(cgroup *daemonProcessCgroup) error {
+			removed = append(removed, filepath.Base(cgroup.path))
+			return os.Remove(cgroup.path)
+		},
+	)
+	if err != nil {
+		t.Fatalf("daemonCleanupStaleProcessCgroups() error = %v", err)
+	}
+	if !slices.Equal(killed, []string{deadName}) {
+		t.Fatalf("killed cgroups = %v, want only %q", killed, deadName)
+	}
+	if !slices.Equal(removed, []string{deadName}) {
+		t.Fatalf("removed cgroups = %v, want only %q", removed, deadName)
+	}
+	if _, err := os.Stat(filepath.Join(root, liveName)); err != nil {
+		t.Fatalf("live-owner cgroup was touched: %v", err)
+	}
+}
+
 func TestDaemonProcessSessionSurvivesInitialWait(t *testing.T) {
 	sessionID := "process-slow"
 	if err := daemonStartProcessSession(context.Background(), sessionID, "printf started; sleep 0.2; printf finished", t.TempDir()); err != nil {

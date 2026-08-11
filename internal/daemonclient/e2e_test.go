@@ -1,4 +1,4 @@
-package daemonclient
+package daemonclient_test
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/daemonclient"
 	"github.com/ekroon/gh-copilot-codespace/internal/daemontransport"
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
@@ -21,7 +22,7 @@ type e2eCodespace struct {
 	alias string
 	name  string
 	cwd   string
-	exec  *Executor
+	exec  *daemonclient.Executor
 }
 
 func newE2ERuntime(t *testing.T, spaces ...e2eCodespace) *mcp.ToolRuntime {
@@ -44,7 +45,7 @@ func newE2ERuntime(t *testing.T, spaces ...e2eCodespace) *mcp.ToolRuntime {
 	return mcp.NewToolRuntime(reg, mcp.LifecycleConfig{})
 }
 
-func dialDaemonForE2E(t *testing.T, cwd string) *Executor {
+func dialDaemonForE2E(t *testing.T, cwd string) *daemonclient.Executor {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
@@ -64,7 +65,7 @@ func dialDaemonForE2E(t *testing.T, cwd string) *Executor {
 		}
 	}
 
-	e, err := Dial(ctx, daemontransport.NewLocalTransport(daemonBinary))
+	e, err := daemonclient.Dial(ctx, daemontransport.NewLocalTransport(daemonclient.DaemonBinaryForTests()))
 
 	if cwd != "" {
 		if chdirErr := os.Chdir(oldwd); chdirErr != nil && err == nil {
@@ -82,9 +83,9 @@ func dialDaemonForE2E(t *testing.T, cwd string) *Executor {
 	return e
 }
 
-func singleCodespaceRuntime(t *testing.T) (*mcp.ToolRuntime, *Executor) {
+func singleCodespaceRuntime(t *testing.T) (*mcp.ToolRuntime, *daemonclient.Executor) {
 	t.Helper()
-	dir := testDir(t)
+	dir := daemonclient.TempDirForTests(t)
 	e := dialDaemonForE2E(t, dir)
 	return newE2ERuntime(t, e2eCodespace{alias: "test", cwd: dir, exec: e}), e
 }
@@ -151,7 +152,7 @@ func TestE2E_ToolRuntimeViewFileViaDaemon(t *testing.T) {
 	viewTool := findRuntimeTool(t, runtime, "remote_view", "view", "view_file")
 	requireRuntimeToolArgs(t, runtime, viewTool, "path")
 
-	path := filepath.Join(testDir(t), "multiline.txt")
+	path := filepath.Join(daemonclient.TempDirForTests(t), "multiline.txt")
 	if err := os.WriteFile(path, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -209,7 +210,7 @@ func TestE2E_ToolRuntimeCreateEditViewRoundTrip(t *testing.T) {
 	requireRuntimeToolArgs(t, runtime, createTool, "path", "file_text")
 	requireRuntimeToolArgs(t, runtime, editTool, "path", "old_str", "new_str")
 
-	path := filepath.Join(testDir(t), "nested", "roundtrip.txt")
+	path := filepath.Join(daemonclient.TempDirForTests(t), "nested", "roundtrip.txt")
 	createResult := callRuntime(t, runtime, createTool, map[string]any{"path": path, "file_text": "hello world\n"})
 	requireSuccess(t, createResult)
 	editResult := callRuntime(t, runtime, editTool, map[string]any{"path": path, "old_str": "world", "new_str": "daemon"})
@@ -233,7 +234,7 @@ func TestE2E_ToolRuntimeCreateEditViewRoundTrip(t *testing.T) {
 func TestE2E_ToolRuntimeConcurrentCalls(t *testing.T) {
 	runtime, _ := singleCodespaceRuntime(t)
 	viewTool := findRuntimeTool(t, runtime, "remote_view", "view", "view_file")
-	path := filepath.Join(testDir(t), "shared.txt")
+	path := filepath.Join(daemonclient.TempDirForTests(t), "shared.txt")
 	if err := os.WriteFile(path, []byte("one\ntwo\nthree\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -299,8 +300,8 @@ func TestE2E_ContextCancelPropagatesThroughRuntime(t *testing.T) {
 }
 
 func TestE2E_MultipleCodespacesIndependentDaemons(t *testing.T) {
-	dirA := testDir(t)
-	dirB := testDir(t)
+	dirA := daemonclient.TempDirForTests(t)
+	dirB := daemonclient.TempDirForTests(t)
 	if err := os.WriteFile(filepath.Join(dirA, "fixture.txt"), []byte("alpha daemon\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile alpha: %v", err)
 	}

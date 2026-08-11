@@ -73,11 +73,11 @@ func remoteCopyHandler(reg *registry.Registry, localRoot string) server.ToolHand
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		source, err := requiredString(req, "source")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		destination, err := requiredString(req, "destination")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		overwrite := optionalBoolArg(req, "overwrite", false)
 
@@ -95,7 +95,7 @@ func remoteCopyHandler(reg *registry.Registry, localRoot string) server.ToolHand
 
 		root, err := resolveLocalRoot(localRoot)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		if src.remote {
 			return copyFromRemote(ctx, reg, root, src, dst, overwrite)
@@ -296,22 +296,22 @@ func copyToRemote(ctx context.Context, reg *registry.Registry, localRoot string,
 	}
 	source, localPath, err := openLocalCopySourceRooted(localRoot, src.path, localCopyReadHooks{})
 	if err != nil {
-		return toolError(err.Error()), nil
+		return toolErrorFor(err), nil
 	}
 	defer source.Close()
 
 	cs, err := reg.Resolve(dst.alias)
 	if err != nil {
-		return toolError(err.Error()), nil
+		return toolErrorFor(err), nil
 	}
 	remotePath, err := resolveRemoteCopyPath(cs, dst.path)
 	if err != nil {
-		return toolError(err.Error()), nil
+		return toolErrorFor(err), nil
 	}
 	if !overwrite {
 		exists, err := remotePathExists(ctx, cs.Executor, remotePath)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		if exists {
 			return toolError(fmt.Sprintf("destination %s already exists on codespace %q; set overwrite=true to replace it", remotePath, cs.Alias)), nil
@@ -319,7 +319,7 @@ func copyToRemote(ctx context.Context, reg *registry.Registry, localRoot string,
 	}
 	content, err := readOpenedLocalCopySource(ctx, source, localCopyReadHooks{})
 	if err != nil {
-		return toolError(err.Error()), nil
+		return toolErrorFor(err), nil
 	}
 	copyExecutor, ok := cs.Executor.(ssh.RootedFileExecutor)
 	if !ok {
@@ -331,7 +331,7 @@ func copyToRemote(ctx context.Context, reg *registry.Registry, localRoot string,
 		Data:      content,
 		Overwrite: overwrite,
 	}); err != nil {
-		return toolError(fmt.Sprintf("copy to codespace: %v", err)), nil
+		return toolErrorForf(err, "copy to codespace"), nil
 	}
 	return toolSuccess(fmt.Sprintf("Copied %s to cs://%s/%s", localPath, cs.Alias, strings.TrimPrefix(dst.path, "/"))), nil
 }
@@ -410,15 +410,15 @@ func readOpenedLocalCopySource(ctx context.Context, file *os.File, hooks localCo
 func copyFromRemote(ctx context.Context, reg *registry.Registry, localRoot string, src, dst copyEndpoint, overwrite bool) (*mcpsdk.CallToolResult, error) {
 	cs, err := reg.Resolve(src.alias)
 	if err != nil {
-		return toolError(err.Error()), nil
+		return toolErrorFor(err), nil
 	}
 	remotePath, err := resolveRemoteCopyPath(cs, src.path)
 	if err != nil {
-		return toolError(err.Error()), nil
+		return toolErrorFor(err), nil
 	}
 	localPath, exists, err := inspectLocalCopyDestinationRooted(localRoot, dst.path)
 	if err != nil {
-		return toolError(err.Error()), nil
+		return toolErrorFor(err), nil
 	}
 	if !overwrite && exists {
 		return toolError(fmt.Sprintf("destination %s already exists locally; set overwrite=true to replace it", localPath)), nil
@@ -432,7 +432,7 @@ func copyFromRemote(ctx context.Context, reg *registry.Registry, localRoot strin
 		Root: cs.Workdir,
 	})
 	if err != nil {
-		return toolError(fmt.Sprintf("copy from codespace: %v", err)), nil
+		return toolErrorForf(err, "copy from codespace"), nil
 	}
 	if err := writeLocalFileAtomicRootedWithHooks(ctx, localRoot, dst.path, content, overwrite, localCopyWriteHooks{}); err != nil {
 		return toolError(fmt.Sprintf("writing local destination: %v", err)), nil
@@ -490,20 +490,20 @@ func viewHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		path, err := requiredString(req, "path")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		viewRange, err := optionalViewRangeArg(req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		forceReadLargeFiles, err := optionalBoolArgStrict(req, "forceReadLargeFiles")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		result, err := ssh.ExecuteView(ctx, c, ssh.ViewRequest{
@@ -512,7 +512,7 @@ func viewHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			ForceReadLargeFiles: forceReadLargeFiles,
 		})
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		return viewToolSuccess(path, result), nil
 	}
@@ -550,23 +550,23 @@ func editHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		path, err := requiredString(req, "path")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		oldStr, err := requiredString(req, "old_str")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		newStr, err := requiredString(req, "new_str")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		if err := c.EditFile(ctx, path, oldStr, newStr); err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		return toolSuccess(fmt.Sprintf("Successfully edited %s", path)), nil
 	}
@@ -600,19 +600,19 @@ func createHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		path, err := requiredString(req, "path")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		content, err := requiredString(req, "file_text")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		if err := c.CreateFile(ctx, path, content); err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		return toolSuccess(fmt.Sprintf("Created %s", path)), nil
 	}
@@ -671,11 +671,11 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		command, err := requiredString(req, "command")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		mode := optionalString(req, "mode")
@@ -687,7 +687,7 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		if mode == "async" {
 			if err := c.StartSession(ctx, shellId, command, cwd); err != nil {
-				return toolError(err.Error()), nil
+				return toolErrorFor(err), nil
 			}
 			// Wait briefly and capture initial output
 			time.Sleep(time.Duration(asyncRemoteBashInitialDelay * float64(time.Second)))
@@ -698,9 +698,12 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		initialWait := optionalFloat(req, "initial_wait", defaultRemoteBashInitialWait)
 		if starter, ok := c.(ssh.ProcessSessionStarter); ok && starter.SupportsProcessSessions() {
 			if err := starter.StartProcessSession(ctx, shellId, command, cwd); err != nil {
-				return toolError(err.Error()), nil
+				return toolErrorFor(err), nil
 			}
 		} else if err := c.StartSession(ctx, shellId, command, cwd); err != nil {
+			if !canFallbackAfterSessionStartError(ctx, err) {
+				return toolErrorFor(err), nil
+			}
 			return runBashSyncFallback(ctx, c, command, cwd), nil
 		}
 		wait := time.Duration(initialWait * float64(time.Second))
@@ -714,9 +717,9 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 		if err != nil {
 			if stopErr := stopSessionForCleanup(c, shellId); stopErr != nil {
-				return toolError(fmt.Sprintf("%s\n\nAdditionally, failed to stop session %s after read failure: %v", err.Error(), shellId, stopErr)), nil
+				return toolError(fmt.Sprintf("%s\n\nAdditionally, failed to stop session %s after read failure: %v", toolErrorMessage(err), shellId, stopErr)), nil
 			}
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		if completed {
@@ -732,6 +735,14 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		return toolSuccess(fmt.Sprintf("%s\n\n[shellId: %s — use remote_read_bash to check for more output]", output, shellId)), nil
 	}
+}
+
+func canFallbackAfterSessionStartError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	_, connectionLost := connectionLostGuidance(err)
+	return !connectionLost
 }
 
 func waitForSessionOutput(ctx context.Context, c ssh.Executor, shellID string, wait time.Duration) (string, error) {
@@ -799,7 +810,7 @@ func stopSessionForCleanup(c ssh.Executor, shellID string) error {
 func runBashSyncFallback(ctx context.Context, c ssh.Executor, command, cwd string) *mcpsdk.CallToolResult {
 	stdout, stderr, exitCode, err := c.RunBash(ctx, command, cwd)
 	if err != nil {
-		errMsg := err.Error()
+		errMsg := toolErrorMessage(err)
 		if ctx.Err() != nil {
 			errMsg += "\n\nHint: This command may have timed out. Use initial_wait parameter (e.g., initial_wait=60) or mode='async' for long-running commands."
 		}
@@ -871,17 +882,17 @@ func writeBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		input := optionalString(req, "input")
 		if input != "" {
 			if err := c.WriteSession(ctx, shellId, input); err != nil {
-				return toolError(err.Error()), nil
+				return toolErrorFor(err), nil
 			}
 		}
 
@@ -890,7 +901,7 @@ func writeBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		output, err := c.ReadSession(ctx, shellId)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		return toolSuccess(output), nil
 	}
@@ -924,11 +935,11 @@ func readBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		delay := optionalFloat(req, "delay", 2)
@@ -936,7 +947,7 @@ func readBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		output, err := c.ReadSession(ctx, shellId)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		return toolSuccess(output), nil
 	}
@@ -966,15 +977,15 @@ func stopBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		if err := c.StopSession(ctx, shellId); err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		return toolSuccess(fmt.Sprintf("Session %s stopped.", shellId)), nil
 	}
@@ -999,11 +1010,11 @@ func listBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		result, err := c.ListSessions(ctx)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		if result == "" {
 			return toolSuccess("No active sessions."), nil
@@ -1099,48 +1110,48 @@ func grepHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		pattern, err := requiredString(req, "pattern")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		paths, err := optionalPathsArg(req, "paths")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		outputMode, err := optionalGrepOutputModeArg(req, "output_mode")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		caseInsensitive, err := optionalBoolArgStrict(req, "-i")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		afterContext, err := optionalIntArg(req, "-A")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		beforeContext, err := optionalIntArg(req, "-B")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		contextLines, err := optionalIntArg(req, "-C")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		lineNumbers, err := optionalBoolPtrArg(req, "-n")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		headLimit, err := optionalIntArg(req, "head_limit")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		multiline, err := optionalBoolArgStrict(req, "multiline")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		result, err := ssh.ExecuteGrep(ctx, c, ssh.GrepRequest{
@@ -1160,7 +1171,7 @@ func grepHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			Cwd:             optionalString(req, "cwd"),
 		})
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		if result.Output == "" {
 			return toolStructuredSuccess("No matches found.", result), nil
@@ -1217,20 +1228,20 @@ func globHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		pattern, err := requiredString(req, "pattern")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		paths, err := optionalPathsArg(req, "paths")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		limit, err := optionalIntArg(req, "limit")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		result, err := ssh.ExecuteGlob(ctx, c, ssh.GlobRequest{
@@ -1241,7 +1252,7 @@ func globHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			Limit:   limit,
 		})
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		if result.Output == "" {
 			return toolStructuredSuccess("No matches found.", result), nil
@@ -1278,11 +1289,11 @@ func applyPatchHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		patch, err := requiredString(req, "patch")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		result, err := ssh.ExecuteApplyPatch(ctx, c, ssh.ApplyPatchRequest{
@@ -1290,7 +1301,7 @@ func applyPatchHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			Cwd:   optionalString(req, "cwd"),
 		})
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		return toolStructuredSuccess(applyPatchResultText(result), result), nil
 	}
@@ -1584,18 +1595,18 @@ func cdHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		path, err := requiredString(req, "path")
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 
 		// Validate the directory exists on the codespace
 		quoted := "'" + strings.ReplaceAll(path, "'", "'\"'\"'") + "'"
 		stdout, _, exitCode, execErr := c.RunBash(ctx, fmt.Sprintf("cd %s && pwd", quoted), c.GetWorkdir())
 		if execErr != nil {
-			return toolError(fmt.Sprintf("failed to change directory: %v", execErr)), nil
+			return toolErrorForf(execErr, "failed to change directory"), nil
 		}
 		if exitCode != 0 {
 			return toolError(fmt.Sprintf("directory does not exist: %s", path)), nil
@@ -1629,7 +1640,7 @@ func cwdHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		c, err := resolveExecutor(reg, req)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		return toolSuccess(c.GetWorkdir()), nil
 	}
@@ -1655,7 +1666,7 @@ func openShellHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		alias := optionalString(req, "codespace")
 		cs, err := reg.Resolve(alias)
 		if err != nil {
-			return toolError(err.Error()), nil
+			return toolErrorFor(err), nil
 		}
 		codespaceName := cs.Name
 
