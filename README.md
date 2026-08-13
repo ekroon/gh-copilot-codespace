@@ -16,7 +16,8 @@ Copilot remains in the checkout where you ran `gh copilot-codespace`. Local inst
 All built-in local tools remain enabled. The extension adds the first-party Codespaces tools, but repository implementation must happen in the Codespace working copy:
 
 - Use `remote_view`, `remote_edit`, `remote_create`, `remote_apply_patch`, `remote_grep`, and `remote_glob` for repository files.
-- Use `remote_bash` for builds, tests, linters, dependency operations, repository scripts, and Git commands.
+- Use `remote_bash`, `remote_write_bash`, `remote_read_bash`, `remote_list_bash`, and `remote_stop_bash` for builds, tests, linters, dependency operations, repository scripts, Git commands, and interactive diagnostics.
+- Use `list_codespaces` first and pass the reported `workdir` as explicit `cwd` on each remote command call.
 - Reserve local tools for local context, Copilot session artifacts, and explicit local-only work.
 
 The local and remote checkouts are separate and are not synchronized.
@@ -96,14 +97,14 @@ The extension registers:
 - `get_codespace_options`, `create_codespace`, `connect_codespace`, `delete_codespace`
 - `open_shell`
 
-For `remote_bash`, `remote_grep`, and `remote_glob`, pass `cwd` explicitly when parallel calls or precise targeting require it. `remote_cd` changes only the default directory for later sequential calls.
+`@remote-explorer` can use the command-capable exploration set: `remote_grep`, `remote_glob`, `remote_view`, `remote_bash`, `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash`, `remote_cwd`, and `list_codespaces`. It starts from `list_codespaces.workdir`, passes `cwd` explicitly on every `remote_bash`/`remote_grep`/`remote_glob` call, and does not use `remote_cd`, `remote_edit`, `remote_create`, `remote_copy`, `remote_apply_patch`, lifecycle discovery/mutation tools, or `open_shell`.
 
 - `remote_view` mirrors the local `view` surface with line ranges, `forceReadLargeFiles`, directory listings, image results, and binary metadata.
 - `remote_create` creates parent directories and refuses to overwrite an existing file.
 - `remote_grep` mirrors local `rg` options including `path`/`paths`, `output_mode`, `-i`, `-A`, `-B`, `-C`, `-n`, `head_limit`, and `multiline`.
 - `remote_glob` mirrors local `glob` path selection with `path`/`paths`; results default to 1,000 matches, accept an optional `limit` capped at 10,000, and report truncation in structured metadata.
 - `remote_apply_patch` accepts the canonical `apply_patch` payload and applies it atomically on the Codespace.
-- `remote_bash` uses a lightweight daemon-managed process for normal sync commands. Commands that exceed `initial_wait` keep running once under the returned `shellId`; use `mode=async` when stdin or a PTY is required.
+- `remote_bash` uses a lightweight daemon-managed process for normal sync commands. Commands that exceed `initial_wait` keep running once under the returned `shellId`; use `mode=async` when stdin or a PTY is required. Use `remote_write_bash`, `remote_read_bash`, `remote_list_bash`, and `remote_stop_bash` to manage those longer-lived sessions.
 
 ### Explicit file transfer
 
@@ -125,7 +126,7 @@ remote_bash(codespace="api", cwd="/workspaces/api", command="go test ./...")
 remote_view(codespace="web", path="/workspaces/web/src/app.ts")
 ```
 
-Use `list_codespaces` to see connected aliases, repositories, branches, and working directories. Lifecycle tools can create, connect, and delete Codespaces during the session.
+Use `list_codespaces` to see connected aliases, repositories, branches, and working directories. Lifecycle tools can create, connect, and delete Codespaces during the session, but `@remote-explorer` does not use them.
 
 ## Selected-only sessions
 

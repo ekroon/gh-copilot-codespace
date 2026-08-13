@@ -590,8 +590,8 @@ func TestRunExtensionHostIOAdvertisesRemoteExplorerWhenCodespaceConnected(t *tes
 		}
 		tools = append(tools, s)
 	}
-	if !reflect.DeepEqual(tools, remoteExplorerReadOnlyExtensionTools) {
-		t.Fatalf("custom agent tools = %v, want %v", tools, remoteExplorerReadOnlyExtensionTools)
+	if !reflect.DeepEqual(tools, remoteExplorerExtensionTools) {
+		t.Fatalf("custom agent tools = %v, want %v", tools, remoteExplorerExtensionTools)
 	}
 }
 

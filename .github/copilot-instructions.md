@@ -49,7 +49,9 @@ The single Go binary operates in four modes:
 - Local project components are context only and are not synchronized with a Codespace.
 - All local tools remain enabled, but repository implementation work belongs in the remote working copy.
 - Use `remote_view`, `remote_edit`, `remote_create`, `remote_apply_patch`, `remote_grep`, and `remote_glob` for repository files.
-- Use `remote_bash` for builds, tests, linters, dependency operations, repository scripts, and Git.
+- Use `remote_bash`, `remote_write_bash`, `remote_read_bash`, `remote_list_bash`, and `remote_stop_bash` for builds, tests, linters, dependency operations, repository scripts, Git, and interactive diagnostics.
+- Start with `list_codespaces`, use each target repository's `workdir` as the initial base, and pass explicit `cwd` on every `remote_bash`/`remote_grep`/`remote_glob` call.
+- Do not rely on `remote_cd`; it is unavailable to `@remote-explorer`.
 - Use `remote_copy` only for an explicit one-time file transfer between the local checkout and `cs://<alias>/<path>`; it is not synchronization.
 - Use the inline `@remote-explorer` agent for remote codebase exploration.
 
@@ -71,6 +73,7 @@ The single Go binary operates in four modes:
 - Async bash sessions use tmux names prefixed with `copilot-`.
 - `remote_view` mirrors local `view` capabilities for ranges, directory listings, large-file overrides, and image metadata.
 - `remote_bash`, `remote_grep`, and `remote_glob` should receive explicit working directories when parallel ordering matters.
+- `@remote-explorer` can use the command-capable exploration set (`remote_grep`, `remote_glob`, `remote_view`, `remote_bash`, `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash`, `remote_cwd`, `list_codespaces`) and does not use `remote_cd` or lifecycle/mutation tools such as `list_available_codespaces`, `get_codespace_options`, `create_codespace`, `connect_codespace`, `delete_codespace`, `remote_edit`, `remote_create`, `remote_copy`, `remote_apply_patch`, or `open_shell`.
 - The launcher uses `syscall.Exec`, so it does not remain resident after Copilot starts.
 - The user-scoped extension activates only when its per-session manifest and token validate; unrelated Copilot sessions receive no tools from it.
 

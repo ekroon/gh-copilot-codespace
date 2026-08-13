@@ -24,40 +24,53 @@ const remoteExplorerAgentPrompt = `You are a fast code exploration agent for rem
 
 ## Available tools
 
-Use these remote tools to explore the codespace:
+Use these remote tools to explore and diagnose the codespace:
+- **list_codespaces** — list connected codespaces, aliases, and repository workdirs
+- **remote_view** — read file contents with line numbers
 - **remote_grep** — search for patterns in files (ripgrep)
 - **remote_glob** — find files by name patterns
-- **remote_view** — read file contents with line numbers
-- **remote_cwd** — check the default working directory used when cwd is omitted
-- **list_codespaces** — list connected codespaces and their aliases
+- **remote_bash** — run bash, gh, git, build, test, and diagnostic commands
+- **remote_write_bash** — send input or special keys to an interactive/long-lived bash session
+- **remote_read_bash** — read more output from an existing bash session
+- **remote_list_bash** — list active bash sessions
+- **remote_stop_bash** — stop an active bash session
+- **remote_cwd** — inspect the current default working directory when diagnosing, but do not rely on it for repository work
 
 ## Guidelines
 
-- All repository source lives on remote GitHub Codespaces. Do not use local built-in file, search, or shell tools for repository exploration.
+- All repository source lives on remote GitHub Codespaces. Do not use local built-in file, search, or shell tools for repository work.
+- Use list_codespaces first, then use the target repository workdir from that result as your initial base directory.
+- Pass explicit cwd to every remote_bash, remote_grep, and remote_glob call.
+- Never rely on remote_cd or shared sticky cwd mutation; treat cwd as explicit per call.
+- Use remote_write_bash/remote_read_bash/remote_list_bash/remote_stop_bash for async or interactive sessions.
 - Be concise — return focused answers under 300 words
 - Search broadly first, then narrow down
 - Use remote_grep for content search, remote_glob for file discovery and structure
-- With multiple codespaces, use list_codespaces and pass the ` + "`codespace` alias" + ` to every remote tool call that needs an explicit target
-- Pass cwd explicitly on remote_grep/remote_glob when you need predictable parallel calls
+- With multiple codespaces, pass the ` + "`codespace` alias" + ` to every remote tool call that needs an explicit target
 - Read only the relevant portions of files (use view_range)
-- Use remote_cwd to confirm the default working directory when relative paths matter
+- Keep to exploration and diagnosis; do not use local file/search/shell tools for remote repository work
 `
 
-// remoteExplorerReadOnlyExtensionTools is the explicit read-only allow-list
-// used by the remote-explorer agent in extension-tools mode. The names match
-// the runtime tool names exposed by the extension host (no "codespace/"
-// namespace — that's an MCP-mode concept).
-var remoteExplorerReadOnlyExtensionTools = []string{
+// remoteExplorerExtensionTools is the shared command-capable allow-list used by
+// the remote-explorer agent in extension-tools mode. The names match the
+// runtime tool names exposed by the extension host (no "codespace/" namespace —
+// that's an MCP-mode concept).
+var remoteExplorerExtensionTools = []string{
 	"remote_grep",
 	"remote_glob",
 	"remote_view",
+	"remote_bash",
+	"remote_write_bash",
+	"remote_read_bash",
+	"remote_stop_bash",
+	"remote_list_bash",
 	"remote_cwd",
 	"list_codespaces",
 }
 
-func remoteExplorerReadOnlyMCPTools() []string {
-	tools := make([]string, 0, len(remoteExplorerReadOnlyExtensionTools))
-	for _, tool := range remoteExplorerReadOnlyExtensionTools {
+func remoteExplorerMCPTools() []string {
+	tools := make([]string, 0, len(remoteExplorerExtensionTools))
+	for _, tool := range remoteExplorerExtensionTools {
 		tools = append(tools, "codespace/"+tool)
 	}
 	return tools
@@ -76,7 +89,7 @@ func remoteExplorerInlineAgent(haveRemoteTools bool) *customAgentWire {
 		Description: remoteExplorerAgentDescription,
 		Prompt:      remoteExplorerAgentPrompt,
 		Model:       "claude-haiku-4.5",
-		Tools:       append([]string(nil), remoteExplorerReadOnlyExtensionTools...),
+		Tools:       append([]string(nil), remoteExplorerExtensionTools...),
 	}
 }
 
@@ -85,7 +98,7 @@ func remoteExplorerInlineAgent(haveRemoteTools bool) *customAgentWire {
 // namespacing because in MCP mode the remote_* tools come from the `codespace`
 // MCP server.
 func remoteExplorerAgentMarkdown() string {
-	tools := remoteExplorerReadOnlyMCPTools()
+	tools := remoteExplorerMCPTools()
 	toolLines := make([]string, 0, len(tools))
 	for _, tool := range tools {
 		toolLines = append(toolLines, "  - "+tool)

@@ -684,7 +684,13 @@ func TestIntegration_ExtensionHostEndToEnd(t *testing.T) {
 			Mode    string
 			Content string
 		} `json:"systemMessage"`
-		CustomAgents []struct{ Name string } `json:"customAgents"`
+		CustomAgents []struct {
+			Name    string
+			Prompt  string
+			Tools   []string
+			Model   string
+			Display string `json:"displayName"`
+		} `json:"customAgents"`
 	}
 	if err := json.Unmarshal(resp.Result, &bootstrap); err != nil {
 		t.Fatalf("decode bootstrap: %v", err)
@@ -692,15 +698,26 @@ func TestIntegration_ExtensionHostEndToEnd(t *testing.T) {
 	if len(bootstrap.Tools) == 0 {
 		t.Fatal("list_tools returned 0 tools")
 	}
-	haveBash := false
-	for _, tool := range bootstrap.Tools {
-		if tool.Name == "remote_bash" {
-			haveBash = true
-			break
+	haveTool := func(name string) bool {
+		for _, tool := range bootstrap.Tools {
+			if tool.Name == name {
+				return true
+			}
 		}
+		return false
 	}
-	if !haveBash {
-		t.Fatalf("remote_bash missing from tools; got %d tools", len(bootstrap.Tools))
+	for _, want := range []string{
+		"remote_bash",
+		"remote_write_bash",
+		"remote_read_bash",
+		"remote_stop_bash",
+		"remote_list_bash",
+		"remote_cwd",
+		"list_codespaces",
+	} {
+		if !haveTool(want) {
+			t.Fatalf("%s missing from tools; got %d tools", want, len(bootstrap.Tools))
+		}
 	}
 	if bootstrap.SystemMessage == nil {
 		t.Fatal("list_tools returned no systemMessage (preamble should be SDK-delivered in extension-tools mode)")
@@ -717,6 +734,44 @@ func TestIntegration_ExtensionHostEndToEnd(t *testing.T) {
 	// remote-explorer agent should be advertised because reg has 1 codespace.
 	if len(bootstrap.CustomAgents) == 0 {
 		t.Errorf("expected at least one custom agent (remote-explorer) when codespaces are connected")
+	} else {
+		agent := bootstrap.CustomAgents[0]
+		if agent.Name != remoteExplorerAgentName {
+			t.Fatalf("custom agent name = %q, want %q", agent.Name, remoteExplorerAgentName)
+		}
+		if !strings.Contains(agent.Prompt, "remote_bash") {
+			t.Fatalf("custom agent prompt missing remote_bash guidance: %q", agent.Prompt)
+		}
+		for _, want := range []string{
+			"remote_bash",
+			"remote_write_bash",
+			"remote_read_bash",
+			"remote_stop_bash",
+			"remote_list_bash",
+			"remote_cwd",
+			"list_codespaces",
+		} {
+			if !slicesContain(agent.Tools, want) {
+				t.Fatalf("custom agent tools missing %q: %v", want, agent.Tools)
+			}
+		}
+		for _, forbidden := range []string{
+			"remote_cd",
+			"remote_edit",
+			"remote_create",
+			"remote_copy",
+			"remote_apply_patch",
+			"list_available_codespaces",
+			"get_codespace_options",
+			"create_codespace",
+			"connect_codespace",
+			"delete_codespace",
+			"open_shell",
+		} {
+			if slicesContain(agent.Tools, forbidden) {
+				t.Fatalf("custom agent tools unexpectedly include %q: %v", forbidden, agent.Tools)
+			}
+		}
 	}
 
 	// 2. remote_bash through the daemon — verify round-trip with a unique sentinel.
