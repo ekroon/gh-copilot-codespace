@@ -23,6 +23,7 @@ type SSHTransport struct {
 	codespaceName string
 	deployFunc    Deployer
 	sshStateFunc  func(*ssh.Client) (sshConfigPath, sshHost string)
+	recoverFunc   func(context.Context, *ssh.Client) error
 }
 
 // NewSSHTransport returns a Transport that starts daemon processes over the SSH
@@ -42,6 +43,9 @@ func NewSSHTransport(client *ssh.Client, codespaceName string, deployer ...Deplo
 		sshStateFunc: func(c *ssh.Client) (string, string) {
 			return c.SSHConfigPath(), c.SSHHost()
 		},
+		recoverFunc: func(ctx context.Context, c *ssh.Client) error {
+			return c.RefreshMultiplexing(ctx)
+		},
 	}
 }
 
@@ -51,6 +55,12 @@ func (t *SSHTransport) Name() string { return "ssh" }
 // Deploy installs the daemon binary in the codespace via the injected deployer.
 func (t *SSHTransport) Deploy(ctx context.Context) (string, error) {
 	return t.deployFunc(ctx, t.client, t.codespaceName)
+}
+
+// Recover wakes the Codespace, retires stale SSH multiplexing state, and
+// establishes a fresh master before daemonclient reconnects.
+func (t *SSHTransport) Recover(ctx context.Context) error {
+	return t.recoverFunc(ctx, t.client)
 }
 
 // Spawn starts `<remotePath> daemon` in the codespace and returns its stdio
@@ -99,6 +109,8 @@ func (t *SSHTransport) Spawn(ctx context.Context, remotePath string) (io.ReadWri
 // Close releases transport resources. The SSH client owns multiplexing state,
 // so there is nothing to release here.
 func (t *SSHTransport) Close() error { return nil }
+
+var _ Recoverer = (*SSHTransport)(nil)
 
 type sshSpawnedStream struct {
 	*processStream

@@ -53,13 +53,13 @@ func connectionLostGuidance(err error) (string, bool) {
 		fmt.Fprintf(&b, " (%v)", lost.Cause)
 	}
 	if lost.Reconnected {
-		b.WriteString(" and a new daemon connection was established")
+		b.WriteString(" and the codespace was automatically woken when needed before a new daemon connection was established")
 		if lost.NewGeneration != 0 {
 			fmt.Fprintf(&b, " (generation %d -> %d)", lost.OldGeneration, lost.NewGeneration)
 		}
 		b.WriteString(".")
 	} else if lost.ReconnectErr != nil {
-		fmt.Fprintf(&b, " and reconnecting failed (%v).", lost.ReconnectErr)
+		fmt.Fprintf(&b, " and automatic wake/reconnect failed (%v).", lost.ReconnectErr)
 	} else {
 		b.WriteString(" and no daemon connection is available.")
 	}

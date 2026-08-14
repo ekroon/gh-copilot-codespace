@@ -25,7 +25,7 @@ func TestConnectionLostGuidanceReconnected(t *testing.T) {
 	}
 	for _, want := range []string{
 		"daemon exited",
-		"a new daemon connection was established (generation 1 -> 2)",
+		"automatically woken when needed before a new daemon connection was established (generation 1 -> 2)",
 		"not retried automatically",
 		"outcome of this call is unknown",
 		"inspect remote state before repeating an edit",
@@ -85,7 +85,7 @@ func TestConnectionLostGuidanceReconnectFailed(t *testing.T) {
 		t.Fatal("connectionLostGuidance() ok = false, want true")
 	}
 	for _, want := range []string{
-		"reconnecting failed (spawn failed)",
+		"automatic wake/reconnect failed (spawn failed)",
 		"not retried automatically",
 		"outcome of this call is unknown",
 		"Remote tools stay unavailable until the connection is restored",
@@ -161,12 +161,12 @@ func TestHandlersReportConnectionLossGuidance(t *testing.T) {
 		{
 			name:     "reconnect succeeded",
 			err:      reconnected,
-			wantText: []string{"Remote connection lost", "a new daemon connection was established", "Remote tools work again"},
+			wantText: []string{"Remote connection lost", "automatically woken when needed", "Remote tools work again"},
 		},
 		{
 			name:     "reconnect failed",
 			err:      fmt.Errorf("edit file: %w", failed),
-			wantText: []string{"Remote connection lost", "reconnecting failed (codespace unavailable)", "Remote tools stay unavailable"},
+			wantText: []string{"Remote connection lost", "automatic wake/reconnect failed (codespace unavailable)", "Remote tools stay unavailable"},
 		},
 		{
 			name:     "normal error unchanged",

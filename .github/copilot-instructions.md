@@ -76,6 +76,8 @@ The single Go binary operates in four modes:
 - `@remote-explorer` can use the command-capable exploration set (`remote_grep`, `remote_glob`, `remote_view`, `remote_bash`, `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash`, `remote_cwd`, `list_codespaces`) and does not use `remote_cd` or lifecycle/mutation tools such as `list_available_codespaces`, `get_codespace_options`, `create_codespace`, `connect_codespace`, `delete_codespace`, `remote_edit`, `remote_create`, `remote_copy`, `remote_apply_patch`, or `open_shell`.
 - The launcher uses `syscall.Exec`, so it does not remain resident after Copilot starts.
 - The user-scoped extension activates only when its per-session manifest and token validate; unrelated Copilot sessions receive no tools from it.
+- Daemon-backed remote tools probe connections on demand. A stopped Codespace is automatically woken, its SSH multiplexing is refreshed, and the daemon reconnects.
+- Never replay an operation after an in-flight connection loss because its remote outcome may be unknown. Only a preflight failure before the operation is sent may recover transparently and execute once.
 
 ## Installation
 

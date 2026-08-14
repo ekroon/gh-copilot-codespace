@@ -37,6 +37,8 @@ The `systemMessage` always explains that local files provide context while repos
 
 The extension host wraps each Codespace SSH executor with a daemon client by default. Calls share one multiplexed SSH stream, avoiding a new SSH process and shell setup for every operation. If daemon deployment or connection fails, the host falls back to direct SSH. Set `COPILOT_CODESPACE_NO_DAEMON=1` to force that fallback.
 
+Daemon-backed remote tools probe the connection on demand. If a connected Codespace was stopped, the next tool call automatically wakes it, refreshes stale SSH multiplexing, and reconnects the daemon. Operations are never replayed after an in-flight connection loss because their remote outcome may be unknown; the error reports whether recovery succeeded so the next call can continue on the restored connection.
+
 ## Prerequisites
 
 - `gh` CLI authenticated with `codespace` scope

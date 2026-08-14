@@ -50,6 +50,12 @@ type Transport interface {
 	Close() error
 }
 
+// Recoverer is implemented by transports that must refresh underlying
+// connection state before daemonclient opens a replacement stream.
+type Recoverer interface {
+	Recover(ctx context.Context) error
+}
+
 // TerminalErrorReporter is implemented by streams whose underlying process can
 // explain why the stream died. Clients that observe EOF or a write failure may
 // type-assert their io.ReadWriteCloser to this interface to obtain a richer

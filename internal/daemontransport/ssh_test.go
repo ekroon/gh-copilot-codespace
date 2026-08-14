@@ -84,6 +84,26 @@ func TestSSHTransportDeployDelegatesToInjectedFunc(t *testing.T) {
 	}
 }
 
+func TestSSHTransportRecoverRefreshesMultiplexing(t *testing.T) {
+	client := ssh.NewClient("codespace-recover")
+	called := 0
+	transport := NewSSHTransport(client, "codespace-recover")
+	transport.recoverFunc = func(ctx context.Context, got *ssh.Client) error {
+		called++
+		if got != client {
+			t.Fatalf("Recover client = %p, want %p", got, client)
+		}
+		return ctx.Err()
+	}
+
+	if err := transport.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("recover calls = %d, want 1", called)
+	}
+}
+
 type capturedCommand struct {
 	name string
 	args []string

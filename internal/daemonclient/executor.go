@@ -50,6 +50,9 @@ type Executor struct {
 	reconnectTimeout     time.Duration
 	reconnectCooldown    time.Duration
 	maxReconnectCooldown time.Duration
+	idleProbeAfter       time.Duration
+	inFlightProbeAfter   time.Duration
+	probeTimeout         time.Duration
 }
 
 // RemoteError is an error returned by the remote daemon.
@@ -77,6 +80,9 @@ func Dial(ctx context.Context, t daemontransport.Transport) (*Executor, error) {
 		reconnectTimeout:     defaultReconnectTimeout,
 		reconnectCooldown:    defaultReconnectCooldown,
 		maxReconnectCooldown: defaultMaxCooldown,
+		idleProbeAfter:       defaultIdleProbeAfter,
+		inFlightProbeAfter:   defaultInFlightProbeAfter,
+		probeTimeout:         defaultProbeTimeout,
 	}
 
 	conn, err := e.connect(ctx)
@@ -95,12 +101,38 @@ func (e *Executor) call(ctx context.Context, verb daemonproto.Verb, params any) 
 	if err != nil {
 		return nil, err
 	}
+	if verb != daemonproto.VerbPing {
+		conn, err = e.preflightConnection(ctx, conn)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return e.callOn(ctx, conn, verb, params)
+}
+
+type callOptions struct {
+	monitorLiveness bool
+	sendCancel      bool
+	recoverLoss     bool
 }
 
 // callOn issues one request on the captured generation c. Every response,
 // cancellation, and failure stays pinned to that generation.
 func (e *Executor) callOn(ctx context.Context, c *connection, verb daemonproto.Verb, params any) (json.RawMessage, error) {
+	return e.callOnWithOptions(ctx, c, verb, params, callOptions{
+		monitorLiveness: verb != daemonproto.VerbPing,
+		sendCancel:      true,
+		recoverLoss:     true,
+	})
+}
+
+func (e *Executor) callOnWithOptions(
+	ctx context.Context,
+	c *connection,
+	verb daemonproto.Verb,
+	params any,
+	options callOptions,
+) (json.RawMessage, error) {
 	id := e.nextID.Add(1)
 	frame, err := daemonproto.NewRequest(id, verb, params, "")
 	if err != nil {
@@ -121,30 +153,121 @@ func (e *Executor) callOn(ctx context.Context, c *connection, verb daemonproto.V
 		if !errors.Is(writeErr, errConnectionDead) {
 			c.fail(fmt.Errorf("daemonclient: write %s request: %w", verb, writeErr))
 		}
+		if !options.recoverLoss {
+			return nil, c.cause()
+		}
 		return nil, e.connectionLost(ctx, c, written)
 	}
 
-	select {
-	case response := <-responseCh:
-		return processResponse(response)
-	case <-ctx.Done():
-		cancelCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-		_, cancelErr := c.writeFrame(cancelCtx, daemonproto.NewCancel(id))
-		cancel()
-		if cancelErr != nil && !errors.Is(cancelErr, errConnectionDead) {
-			c.fail(fmt.Errorf("daemonclient: deliver cancel for request %d: %w", id, cancelErr))
-		}
-		timer := time.NewTimer(250 * time.Millisecond)
-		defer timer.Stop()
-		select {
-		case <-responseCh:
-		case <-c.readerDone:
-		case <-timer.C:
-		}
-		return nil, ctx.Err()
-	case <-c.readerDone:
-		return nil, e.connectionLost(ctx, c, true)
+	var livenessTimer *time.Timer
+	var livenessC <-chan time.Time
+	if options.monitorLiveness && e.inFlightProbeAfter >= 0 {
+		livenessTimer = time.NewTimer(e.inFlightProbeAfter)
+		livenessC = livenessTimer.C
+		defer livenessTimer.Stop()
 	}
+
+	for {
+		select {
+		case response := <-responseCh:
+			return processResponse(response)
+		case <-ctx.Done():
+			if options.sendCancel {
+				e.cancelRequest(c, id, responseCh)
+			}
+			return nil, ctx.Err()
+		case <-c.readerDone:
+			if !options.recoverLoss {
+				return nil, c.cause()
+			}
+			return nil, e.connectionLost(ctx, c, true)
+		case <-livenessC:
+			if err := e.probeConnection(ctx, c); err != nil {
+				select {
+				case response := <-responseCh:
+					return processResponse(response)
+				default:
+				}
+				if ctx.Err() != nil {
+					if options.sendCancel {
+						e.cancelRequest(c, id, responseCh)
+					}
+					return nil, ctx.Err()
+				}
+				c.fail(fmt.Errorf("daemonclient: daemon liveness probe failed: %w", err))
+				if !options.recoverLoss {
+					return nil, c.cause()
+				}
+				return nil, e.connectionLost(ctx, c, true)
+			}
+			livenessTimer.Reset(e.inFlightProbeAfter)
+		}
+	}
+}
+
+func (e *Executor) cancelRequest(c *connection, id uint64, responseCh <-chan daemonproto.Frame) {
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	_, cancelErr := c.writeFrame(cancelCtx, daemonproto.NewCancel(id))
+	cancel()
+	if cancelErr != nil && !errors.Is(cancelErr, errConnectionDead) {
+		c.fail(fmt.Errorf("daemonclient: deliver cancel for request %d: %w", id, cancelErr))
+	}
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-responseCh:
+	case <-c.readerDone:
+	case <-timer.C:
+	}
+}
+
+func (e *Executor) preflightConnection(ctx context.Context, c *connection) (*connection, error) {
+	if e.idleProbeAfter < 0 || c.idleFor() < e.idleProbeAfter {
+		return c, nil
+	}
+	if err := e.probeConnection(ctx, c); err == nil {
+		return c, nil
+	} else if ctx.Err() != nil {
+		return nil, ctx.Err()
+	} else {
+		c.fail(fmt.Errorf("daemonclient: daemon preflight probe failed: %w", err))
+	}
+
+	next, err := e.obtainConnection(ctx, c)
+	if err == nil {
+		return next, nil
+	}
+	return nil, &ConnectionLostError{
+		Cause:          c.cause(),
+		ReconnectErr:   err,
+		OutcomeUnknown: false,
+		OldGeneration:  c.id,
+	}
+}
+
+func (e *Executor) probeConnection(ctx context.Context, c *connection) error {
+	timeout := e.probeTimeout
+	if timeout <= 0 {
+		timeout = defaultProbeTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	progress := c.readProgress()
+	raw, err := e.callOnWithOptions(probeCtx, c, daemonproto.VerbPing, daemonproto.PingParams{}, callOptions{})
+	if err != nil {
+		if ctx.Err() == nil && !c.dead() && c.readProgress() != progress {
+			return nil
+		}
+		return err
+	}
+	var result daemonproto.PingResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("decode ping result: %w", err)
+	}
+	if !result.Pong {
+		return errors.New("daemon returned an invalid ping response")
+	}
+	return nil
 }
 
 func processResponse(frame daemonproto.Frame) (json.RawMessage, error) {

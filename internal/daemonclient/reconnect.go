@@ -9,16 +9,20 @@ import (
 	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/daemonproto"
+	"github.com/ekroon/gh-copilot-codespace/internal/daemontransport"
 )
 
 // ErrClosed is returned when an operation is attempted on a closed Executor.
 var ErrClosed = errors.New("daemonclient: executor is closed")
 
 const (
-	defaultHelloTimeout      = 10 * time.Second
-	defaultReconnectTimeout  = 30 * time.Second
-	defaultReconnectCooldown = 2 * time.Second
-	defaultMaxCooldown       = 30 * time.Second
+	defaultHelloTimeout       = 10 * time.Second
+	defaultReconnectTimeout   = 90 * time.Second
+	defaultReconnectCooldown  = 2 * time.Second
+	defaultMaxCooldown        = 30 * time.Second
+	defaultIdleProbeAfter     = 5 * time.Second
+	defaultInFlightProbeAfter = 10 * time.Second
+	defaultProbeTimeout       = 5 * time.Second
 
 	// maxReconnectAttemptsPerCall bounds how many times a single caller may
 	// trigger a reconnect before giving up, so an unstable daemon cannot make
@@ -52,7 +56,7 @@ func (e *ConnectionLostError) Error() string {
 		fmt.Fprintf(&b, " (%v)", e.Cause)
 	}
 	if e.Reconnected {
-		b.WriteString(" and a new daemon connection was established.")
+		b.WriteString(" and the Codespace was automatically woken when needed before a new daemon connection was established.")
 		if e.OutcomeUnknown {
 			b.WriteString(" This operation was not retried and its outcome may be unknown." +
 				" Retry read-only operations. Inspect remote state before repeating mutations.")
@@ -62,7 +66,7 @@ func (e *ConnectionLostError) Error() string {
 		return b.String()
 	}
 	if e.ReconnectErr != nil {
-		fmt.Fprintf(&b, " and reconnection failed: %v.", e.ReconnectErr)
+		fmt.Fprintf(&b, " and automatic wake/reconnect failed: %v.", e.ReconnectErr)
 	} else {
 		b.WriteString(" and no daemon connection is available.")
 	}
@@ -186,10 +190,9 @@ func (e *Executor) obtainConnection(ctx context.Context, avoid *connection) (*co
 	}
 }
 
-// reconnect performs exactly one Spawn plus handshake on a detached context so
-// that an individual caller's cancellation cannot abort shared recovery. It
-// never redeploys: the remote helper path from the initial deployment is
-// reused.
+// reconnect performs one transport recovery, Spawn, and handshake on a
+// detached context so an individual caller's cancellation cannot abort shared
+// recovery. It never redeploys: the initial remote helper path is reused.
 func (e *Executor) reconnect(waiter chan struct{}) {
 	defer close(waiter)
 
@@ -207,15 +210,16 @@ func (e *Executor) reconnect(waiter chan struct{}) {
 		}
 	}()
 
+	if recoverer, ok := e.transport.(daemontransport.Recoverer); ok {
+		if err := recoverer.Recover(ctx); err != nil {
+			e.recordReconnectFailure(waiter, fmt.Errorf("daemonclient: recover %s transport: %w", e.transport.Name(), err))
+			return
+		}
+	}
+
 	conn, err := e.connect(ctx)
 	if err != nil {
-		e.mu.Lock()
-		e.reconnecting = nil
-		e.reconnectFailures++
-		e.lastReconnectErr = err
-		e.cooldownUntil = time.Now().Add(e.reconnectBackoff())
-		e.mu.Unlock()
-		fmt.Fprintf(os.Stderr, "daemonclient: daemon reconnect failed: %v\n", err)
+		e.recordReconnectFailure(waiter, err)
 		return
 	}
 
@@ -237,6 +241,18 @@ func (e *Executor) reconnect(waiter chan struct{}) {
 		previous.dispose()
 	}
 	fmt.Fprintf(os.Stderr, "daemonclient: reconnected to daemon (generation %d)\n", conn.id)
+}
+
+func (e *Executor) recordReconnectFailure(waiter chan struct{}, err error) {
+	e.mu.Lock()
+	if e.reconnecting == waiter {
+		e.reconnecting = nil
+	}
+	e.reconnectFailures++
+	e.lastReconnectErr = err
+	e.cooldownUntil = time.Now().Add(e.reconnectBackoff())
+	e.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "daemonclient: daemon reconnect failed: %v\n", err)
 }
 
 // connect spawns a daemon over the existing transport and completes the

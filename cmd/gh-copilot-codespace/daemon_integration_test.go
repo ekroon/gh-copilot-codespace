@@ -58,6 +58,75 @@ func TestIntegration_DaemonDialAndPing(t *testing.T) {
 	}
 }
 
+func TestIntegration_DaemonRecoversAfterCodespaceShutdown(t *testing.T) {
+	if os.Getenv("TEST_CODESPACE_RECOVERY") != "1" {
+		t.Skip("TEST_CODESPACE_RECOVERY=1 not set")
+	}
+	cs := testCodespace(t)
+	daemonExec := dialDaemon(t, cs)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, _, code, err := daemonExec.RunBash(ctx, "echo recovery-prime", "/tmp")
+	cancel()
+	if err != nil || code != 0 {
+		t.Fatalf("prime RunBash: err=%v code=%d", err, code)
+	}
+	lastActivity := time.Now()
+
+	t.Cleanup(func() {
+		wakeCtx, wakeCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer wakeCancel()
+		_ = exec.CommandContext(wakeCtx, "gh", "codespace", "ssh", "-c", cs, "--", "true").Run()
+	})
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	output, err := exec.CommandContext(stopCtx, "gh", "codespace", "stop", "-c", cs).CombinedOutput()
+	stopCancel()
+	if err != nil {
+		t.Fatalf("gh codespace stop: %v\n%s", err, output)
+	}
+	waitForCodespaceState(t, cs, "Shutdown", 2*time.Minute)
+	if remaining := 6*time.Second - time.Since(lastActivity); remaining > 0 {
+		time.Sleep(remaining)
+	}
+
+	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer recoverCancel()
+	stdout, stderr, code, err := daemonExec.RunBash(recoverCtx, "echo recovered-after-shutdown", "/tmp")
+	if err != nil {
+		t.Fatalf("RunBash after shutdown: %v", err)
+	}
+	if code != 0 || !strings.Contains(stdout, "recovered-after-shutdown") {
+		t.Fatalf("RunBash after shutdown: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	waitForCodespaceState(t, cs, "Available", 2*time.Minute)
+}
+
+func waitForCodespaceState(t *testing.T, name, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		output, err := exec.CommandContext(ctx, "gh", "codespace", "list", "--json", "name,state").Output()
+		cancel()
+		if err == nil {
+			var entries []struct {
+				Name  string `json:"name"`
+				State string `json:"state"`
+			}
+			if json.Unmarshal(output, &entries) == nil {
+				for _, entry := range entries {
+					if entry.Name == name && entry.State == want {
+						return
+					}
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("codespace %q did not reach state %q within %s", name, want, timeout)
+}
+
 func TestIntegration_DaemonRunBashEcho(t *testing.T) {
 	cs := testCodespace(t)
 	exec := dialDaemon(t, cs)

@@ -151,6 +151,21 @@ func controlSocketPath(configDir, codespaceName string) string {
 // SetupMultiplexing generates an SSH config with ControlMaster and establishes
 // a persistent connection. Subsequent Exec calls use this connection (~0.1s vs ~3s).
 func (c *Client) SetupMultiplexing(ctx context.Context) error {
+	return c.setupMultiplexing(ctx, false)
+}
+
+// RefreshMultiplexing retires stale SSH state, asks gh for fresh connection
+// configuration (which wakes a stopped Codespace), and establishes a new
+// multiplexed master.
+func (c *Client) RefreshMultiplexing(ctx context.Context) error {
+	sshConfigPath, sshHost, controlSocket := c.sshState()
+	if err := c.retireMultiplexing(ctx, sshConfigPath, sshHost, controlSocket); err != nil {
+		return err
+	}
+	return c.setupMultiplexing(ctx, true)
+}
+
+func (c *Client) setupMultiplexing(ctx context.Context, forceRefresh bool) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("getting home dir: %w", err)
@@ -168,28 +183,33 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 	// Avoids calling gh codespace ssh --config which creates a new tunnel and may
 	// invalidate the existing ControlMaster's connection and its socket forwardings.
 	var sshHost string
-	if data, err := os.ReadFile(sshConfigPath); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "Host ") {
-				sshHost = strings.TrimPrefix(trimmed, "Host ")
-			}
-			if strings.HasPrefix(trimmed, "ControlPath ") {
-				controlSocket = strings.TrimPrefix(trimmed, "ControlPath ")
-			}
-		}
-		if sshHost != "" {
-			check := c.command(ctx, "ssh", "-F", sshConfigPath, "-O", "check", sshHost)
-			if check.Run() == nil {
-				// Smoke-test the tunnel: ssh -O check only verifies the master
-				// process is alive, not that the underlying relay still works.
-				probe := c.command(ctx, "ssh", "-F", sshConfigPath, "-o", "ConnectTimeout=5", sshHost, "echo ok")
-				if out, err := probe.Output(); err == nil && strings.TrimSpace(string(out)) == "ok" {
-					c.setSSHState(sshConfigPath, sshHost, controlSocket)
-					fmt.Fprintf(os.Stderr, "codespace-mcp: reusing existing SSH multiplexing\n")
-					return nil
+	if !forceRefresh {
+		if data, err := os.ReadFile(sshConfigPath); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "Host ") {
+					sshHost = strings.TrimPrefix(trimmed, "Host ")
 				}
-				fmt.Fprintf(os.Stderr, "codespace-mcp: existing SSH master alive but tunnel broken, reconnecting\n")
+				if strings.HasPrefix(trimmed, "ControlPath ") {
+					controlSocket = strings.TrimPrefix(trimmed, "ControlPath ")
+				}
+			}
+			if sshHost != "" {
+				check := c.command(ctx, "ssh", "-F", sshConfigPath, "-O", "check", sshHost)
+				if check.Run() == nil {
+					// Smoke-test the tunnel: ssh -O check only verifies the master
+					// process is alive, not that the underlying relay still works.
+					probe := c.command(ctx, "ssh", "-F", sshConfigPath, "-o", "ConnectTimeout=5", sshHost, "echo ok")
+					if out, err := probe.Output(); err == nil && strings.TrimSpace(string(out)) == "ok" {
+						c.setSSHState(sshConfigPath, sshHost, controlSocket)
+						fmt.Fprintf(os.Stderr, "codespace-mcp: reusing existing SSH multiplexing\n")
+						return nil
+					}
+					fmt.Fprintf(os.Stderr, "codespace-mcp: existing SSH master alive but tunnel broken, reconnecting\n")
+				}
+			}
+			if err := c.retireMultiplexing(ctx, sshConfigPath, sshHost, controlSocket); err != nil {
+				return err
 			}
 		}
 	}
@@ -224,6 +244,9 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 	if !strings.Contains(config, "ControlPersist") {
 		config += "\tControlPersist 600\n"
 	}
+	config = appendSSHSetting(config, "ServerAliveInterval", "5")
+	config = appendSSHSetting(config, "ServerAliveCountMax", "3")
+	config = appendSSHSetting(config, "ConnectTimeout", "10")
 
 	if err := os.WriteFile(sshConfigPath, []byte(config), 0o600); err != nil {
 		return fmt.Errorf("writing SSH config: %w", err)
@@ -244,7 +267,13 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 			errDetail := strings.TrimSpace(sshErr.String())
 			if attempt == 0 {
 				fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing attempt 1 failed (%v), retrying...\n", errDetail)
-				time.Sleep(3 * time.Second)
+				timer := time.NewTimer(3 * time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
 				continue
 			}
 			// Final attempt failed — fall back to non-multiplexed mode
@@ -257,6 +286,28 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 
 	c.setSSHState(sshConfigPath, sshHost, controlSocket)
 	fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing established\n")
+	return nil
+}
+
+func appendSSHSetting(config, name, value string) string {
+	if strings.Contains(config, name) {
+		return config
+	}
+	return config + fmt.Sprintf("\t%s %s\n", name, value)
+}
+
+func (c *Client) retireMultiplexing(ctx context.Context, sshConfigPath, sshHost, controlSocket string) error {
+	if sshConfigPath != "" && sshHost != "" {
+		retireCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = c.command(retireCtx, "ssh", "-F", sshConfigPath, "-O", "exit", sshHost).Run()
+		cancel()
+	}
+	if controlSocket != "" {
+		if err := os.Remove(controlSocket); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing stale SSH control socket: %w", err)
+		}
+	}
+	c.setSSHState("", "", "")
 	return nil
 }
 

@@ -356,6 +356,69 @@ func TestSetupMultiplexingUsesShortControlSocketForLongCodespaceName(t *testing.
 	}
 }
 
+func TestRefreshMultiplexingRetiresStaleMasterAndRegeneratesConfig(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	client := NewClient("recover-me")
+	configDir := filepath.Join(homeDir, ".copilot", "codespace-workdirs")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, ".ssh-config-recover-me")
+	socketPath := controlSocketPath(configDir, client.codespaceName)
+	if err := os.WriteFile(configPath, []byte("Host cs.stale\n\tControlPath "+socketPath+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socketPath, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client.setSSHState(configPath, "cs.stale", socketPath)
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{},
+		{stdout: "Host cs.fresh\n  HostName example.com\n"},
+		{},
+	})
+
+	if err := client.RefreshMultiplexing(context.Background()); err != nil {
+		t.Fatalf("RefreshMultiplexing() error = %v", err)
+	}
+
+	wantCalls := []fakeExecCall{
+		{name: "ssh", args: []string{"-F", configPath, "-O", "exit", "cs.stale"}},
+		{name: "gh", args: []string{"codespace", "ssh", "--config", "-c", client.codespaceName}},
+		{name: "ssh", args: []string{
+			"-F", configPath,
+			"-o", "ControlMaster=yes",
+			"-o", "ControlPersist=600",
+			"-fN",
+			"cs.fresh",
+		}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, setting := range []string{
+		"ControlPath " + socketPath,
+		"ServerAliveInterval 5",
+		"ServerAliveCountMax 3",
+		"ConnectTimeout 10",
+	} {
+		if !strings.Contains(string(config), setting) {
+			t.Errorf("refreshed config missing %q:\n%s", setting, config)
+		}
+	}
+	if client.SSHHost() != "cs.fresh" {
+		t.Fatalf("SSHHost() = %q, want cs.fresh", client.SSHHost())
+	}
+}
+
 func TestViewFileRetriesReadOnlyTransportFailure(t *testing.T) {
 	client := NewClient("demo")
 	socketPath := t.TempDir() + "/control.sock"

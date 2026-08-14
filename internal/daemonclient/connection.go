@@ -47,11 +47,13 @@ type daemonWriteDeadlineSetter interface {
 // die with a stream lives here; the Executor keeps only state that must
 // survive reconnection.
 type connection struct {
-	id      uint64
-	stream  io.ReadWriteCloser
-	dec     *daemonproto.Decoder
-	writeMu chan struct{}
-	pending sync.Map // map[uint64]chan daemonproto.Frame
+	id        uint64
+	stream    io.ReadWriteCloser
+	dec       *daemonproto.Decoder
+	writeMu   chan struct{}
+	pending   sync.Map // map[uint64]chan daemonproto.Frame
+	activity  atomic.Int64
+	readBytes atomic.Uint64
 
 	helloCh    chan daemonproto.Frame
 	readerDone chan struct{}
@@ -68,11 +70,12 @@ func newConnection(id uint64, stream io.ReadWriteCloser) *connection {
 	c := &connection{
 		id:         id,
 		stream:     stream,
-		dec:        daemonproto.NewDecoder(stream),
 		writeMu:    make(chan struct{}, 1),
 		helloCh:    make(chan daemonproto.Frame, 1),
 		readerDone: make(chan struct{}),
 	}
+	c.dec = daemonproto.NewDecoder(&activityReader{reader: stream, connection: c})
+	c.touch()
 	c.writeMu <- struct{}{}
 	go c.readLoop()
 	return c
@@ -87,6 +90,7 @@ func (c *connection) readLoop() {
 			c.setErr(err)
 			return
 		}
+		c.touch()
 
 		if !sawHello {
 			sawHello = true
@@ -195,6 +199,36 @@ func isClosedStreamSymptom(err error) bool {
 func (c *connection) supports(verb daemonproto.Verb) bool {
 	_, ok := c.verbs[string(verb)]
 	return ok
+}
+
+func (c *connection) touch() {
+	c.activity.Store(time.Now().UnixNano())
+}
+
+func (c *connection) idleFor() time.Duration {
+	last := c.activity.Load()
+	if last == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, last))
+}
+
+func (c *connection) readProgress() uint64 {
+	return c.readBytes.Load()
+}
+
+type activityReader struct {
+	reader     io.Reader
+	connection *connection
+}
+
+func (r *activityReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.connection.readBytes.Add(uint64(n))
+		r.connection.touch()
+	}
+	return n, err
 }
 
 // writeFrame serializes one frame onto this generation's stream. It reports
