@@ -953,10 +953,11 @@ type mockExecutor struct {
 
 type waitSessionMockExecutor struct {
 	*mockExecutor
-	output    string
-	completed bool
-	err       error
-	waitCalls int
+	output       string
+	completed    bool
+	err          error
+	waitCalls    int
+	lastWaitTime time.Duration
 }
 
 type processSessionMockExecutor struct {
@@ -978,8 +979,9 @@ func (m *waitSessionMockExecutor) SupportsWaitSession() bool {
 	return true
 }
 
-func (m *waitSessionMockExecutor) WaitSession(context.Context, string, time.Duration) (string, bool, error) {
+func (m *waitSessionMockExecutor) WaitSession(_ context.Context, _ string, timeout time.Duration) (string, bool, error) {
 	m.waitCalls++
+	m.lastWaitTime = timeout
 	return m.output, m.completed, m.err
 }
 
@@ -2093,6 +2095,106 @@ func TestReadBashHandler_CancelDuringDelay(t *testing.T) {
 	}
 	if !res.IsError {
 		t.Fatal("expected error result on cancelled context")
+	}
+}
+
+func TestReadBashHandler_ReturnsWhenDaemonSessionCompletes(t *testing.T) {
+	base := &mockExecutor{}
+	mock := &waitSessionMockExecutor{
+		mockExecutor: base,
+		output:       "session-output\n[session exited]",
+		completed:    true,
+	}
+	handler := readBashHandler(testRegWithExecutor(mock))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	res, err := handler(ctx, makeReq(map[string]any{
+		"shellId": "s1",
+		"delay":   float64(60),
+	}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if got := resultText(res); got != "session-output\n[session exited]" {
+		t.Fatalf("result text = %q, want retained session output", got)
+	}
+	if mock.waitCalls != 1 {
+		t.Fatalf("waitCalls = %d, want 1", mock.waitCalls)
+	}
+	if mock.lastWaitTime != 60*time.Second {
+		t.Fatalf("lastWaitTime = %v, want 60s", mock.lastWaitTime)
+	}
+	if base.readSessionCalls != 0 {
+		t.Fatalf("readSessionCalls = %d, want 0", base.readSessionCalls)
+	}
+}
+
+func TestReadBashHandler_FallbackReturnsWhenSessionCompletes(t *testing.T) {
+	mock := &mockExecutor{
+		readSessionResults: []string{
+			"running",
+			"session-output\n[session exited]",
+		},
+	}
+	handler := readBashHandler(testReg(mock))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	res, err := handler(ctx, makeReq(map[string]any{
+		"shellId": "s1",
+		"delay":   float64(60),
+	}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if got := resultText(res); got != "session-output\n[session exited]" {
+		t.Fatalf("result text = %q, want completed session output", got)
+	}
+	if mock.readSessionCalls != 2 {
+		t.Fatalf("readSessionCalls = %d, want 2", mock.readSessionCalls)
+	}
+}
+
+func TestWriteBashHandler_ReturnsWhenDaemonSessionCompletes(t *testing.T) {
+	base := &mockExecutor{}
+	mock := &waitSessionMockExecutor{
+		mockExecutor: base,
+		output:       "command-output\n[session exited]",
+		completed:    true,
+	}
+	handler := writeBashHandler(testRegWithExecutor(mock))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	res, err := handler(ctx, makeReq(map[string]any{
+		"shellId": "s1",
+		"input":   "{enter}",
+		"delay":   float64(60),
+	}))
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got tool error: %s", resultText(res))
+	}
+	if got := resultText(res); got != "command-output\n[session exited]" {
+		t.Fatalf("result text = %q, want completed session output", got)
+	}
+	if mock.waitCalls != 1 {
+		t.Fatalf("waitCalls = %d, want 1", mock.waitCalls)
+	}
+	if mock.lastWaitTime != 60*time.Second {
+		t.Fatalf("lastWaitTime = %v, want 60s", mock.lastWaitTime)
+	}
+	if base.readSessionCalls != 0 {
+		t.Fatalf("readSessionCalls = %d, want 0", base.readSessionCalls)
 	}
 }
 

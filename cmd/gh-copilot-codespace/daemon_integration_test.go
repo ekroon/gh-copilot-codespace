@@ -995,13 +995,18 @@ func TestIntegration_ExtensionHostRetainsTimedOutProcessSession(t *testing.T) {
 		t.Fatalf("remote_bash did not retain session %q: %+v", shellID, result)
 	}
 
+	readStart := time.Now()
 	resp = rpc.call(t, "call_tool", "remote_read_bash", map[string]any{
 		"codespace": "it",
 		"shellId":   shellID,
-		"delay":     0.5,
+		"delay":     30,
 	})
+	readElapsed := time.Since(readStart)
 	if resp.Error != nil {
 		t.Fatalf("remote_read_bash error: %v", resp.Error)
+	}
+	if readElapsed >= 5*time.Second {
+		t.Fatalf("remote_read_bash returned after %v, want completion before the 30s delay", readElapsed)
 	}
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
 		t.Fatalf("decode remote_read_bash result: %v", err)

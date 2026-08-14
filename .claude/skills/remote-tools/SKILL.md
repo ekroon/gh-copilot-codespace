@@ -130,7 +130,7 @@ Send input to an async/tmux `remote_bash` session. Supports special keys. Retain
 **Parameters:**
 - `shellId` (required) — Session ID from `remote_bash`
 - `input` (optional) — Text or special keys: `{enter}`, `{up}`, `{down}`, `{left}`, `{right}`, `{backspace}`
-- `delay` (optional) — Seconds to wait before reading output (default: 2)
+- `delay` (optional) — Maximum seconds to wait for the session to complete before returning current output (default: 2). Returns sooner when the session completes.
 
 ### `remote_read_bash`
 
@@ -138,7 +138,7 @@ Read output from a `remote_bash` session.
 
 **Parameters:**
 - `shellId` (required) — Session ID
-- `delay` (optional) — Seconds to wait before reading (default: 2)
+- `delay` (optional) — Maximum seconds to wait for the session to complete before returning current output (default: 2). Returns sooner when the session completes.
 
 ### `remote_stop_bash`
 

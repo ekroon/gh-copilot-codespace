@@ -711,14 +711,7 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			return runBashSyncFallback(ctx, c, command, cwd), nil
 		}
 		wait := time.Duration(initialWait * float64(time.Second))
-		var output string
-		var completed bool
-		if waiter, ok := c.(ssh.SessionWaiter); ok && waiter.SupportsWaitSession() {
-			output, completed, err = waiter.WaitSession(ctx, shellId, wait)
-		} else {
-			output, err = waitForSessionOutput(ctx, c, shellId, wait)
-			completed = sessionOutputExited(output)
-		}
+		output, completed, err := waitForRemoteSession(ctx, c, shellId, wait)
 		if err != nil {
 			if stopErr := stopSessionForCleanup(c, shellId); stopErr != nil {
 				return toolError(fmt.Sprintf("%s\n\nAdditionally, failed to stop session %s after read failure: %v", toolErrorMessage(err), shellId, stopErr)), nil
@@ -747,6 +740,15 @@ func canFallbackAfterSessionStartError(ctx context.Context, err error) bool {
 	}
 	_, connectionLost := connectionLostGuidance(err)
 	return !connectionLost
+}
+
+func waitForRemoteSession(ctx context.Context, c ssh.Executor, shellID string, wait time.Duration) (string, bool, error) {
+	if waiter, ok := c.(ssh.SessionWaiter); ok && waiter.SupportsWaitSession() {
+		return waiter.WaitSession(ctx, shellID, wait)
+	}
+
+	output, err := waitForSessionOutput(ctx, c, shellID, wait)
+	return output, sessionOutputExited(output), err
 }
 
 func waitForSessionOutput(ctx context.Context, c ssh.Executor, shellID string, wait time.Duration) (string, error) {
@@ -859,7 +861,7 @@ func trimSessionExitMarker(output string) string {
 func writeBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_write_bash",
-		Description: "Send input to an async remote bash session on the codespace. Sync process sessions are non-interactive. Supports special keys: {enter}, {up}, {down}, {left}, {right}, {backspace}. Replaces the local 'write_bash' tool.",
+		Description: "Send input to an async remote bash session on the codespace, then wait for completion or the requested delay before returning output. Sync process sessions are non-interactive. Supports special keys: {enter}, {up}, {down}, {left}, {right}, {backspace}. Replaces the local 'write_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -874,7 +876,7 @@ func writeBashTool() mcpsdk.Tool {
 				},
 				"delay": map[string]any{
 					"type":        "number",
-					"description": "Seconds to wait before reading output (default: 2)",
+					"description": "Maximum seconds to wait for the session to complete before returning current output (default: 2). Returns sooner when the session completes.",
 				},
 			},
 			Required: []string{"shellId"},
@@ -901,13 +903,7 @@ func writeBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		delay := optionalFloat(req, "delay", 2)
-		select {
-		case <-ctx.Done():
-			return toolErrorFor(ctx.Err()), nil
-		case <-time.After(time.Duration(delay * float64(time.Second))):
-		}
-
-		output, err := c.ReadSession(ctx, shellId)
+		output, _, err := waitForRemoteSession(ctx, c, shellId, time.Duration(delay*float64(time.Second)))
 		if err != nil {
 			return toolErrorFor(err), nil
 		}
@@ -920,7 +916,7 @@ func writeBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func readBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_read_bash",
-		Description: "Read output from a remote bash session on the codespace. Returns the last 100 lines of the session's terminal output. If a command hasn't completed, call again with a longer delay. Use exponential backoff between reads to minimize overhead. Replaces the local 'read_bash' tool.",
+		Description: "Wait for a remote bash session to complete, then return its last 100 lines of output. If the requested delay expires first, returns current output so the session can be checked again. Replaces the local 'read_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -931,7 +927,7 @@ func readBashTool() mcpsdk.Tool {
 				},
 				"delay": map[string]any{
 					"type":        "number",
-					"description": "Seconds to wait before reading output (default: 2). Use longer delays for slow commands to avoid unnecessary reads.",
+					"description": "Maximum seconds to wait for the session to complete before returning current output (default: 2). Returns sooner when the session completes.",
 				},
 			},
 			Required: []string{"shellId"},
@@ -951,13 +947,7 @@ func readBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 		}
 
 		delay := optionalFloat(req, "delay", 2)
-		select {
-		case <-ctx.Done():
-			return toolErrorFor(ctx.Err()), nil
-		case <-time.After(time.Duration(delay * float64(time.Second))):
-		}
-
-		output, err := c.ReadSession(ctx, shellId)
+		output, _, err := waitForRemoteSession(ctx, c, shellId, time.Duration(delay*float64(time.Second)))
 		if err != nil {
 			return toolErrorFor(err), nil
 		}
