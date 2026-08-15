@@ -40,7 +40,7 @@ Flags:
   -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
       --no-codespace     Start without connecting to any codespace (skip picker)
       --selected-only[=BOOL]
-                         Restrict existing-codespace connections to codespaces selected at startup
+                         Limit the agent to codespaces selected at startup
 
 Subcommands:
   exec                   Execute a command on the codespace (used internally)
@@ -383,6 +383,13 @@ func uniqueStrings(values []string) []string {
 	return result
 }
 
+func validateSelectedOnlySelection(opts launcherOptions, selected []codespace) error {
+	if opts.selectedOnly.resolve(false) && len(selected) == 0 {
+		return fmt.Errorf("--selected-only requires at least one codespace selected at startup")
+	}
+	return nil
+}
+
 func runLauncher(args []string) error {
 	originalCWD, err := os.Getwd()
 	if err != nil {
@@ -414,6 +421,9 @@ func runLauncher(args []string) error {
 		if err != nil {
 			return err
 		}
+	}
+	if err := validateSelectedOnlySelection(opts, selectedList); err != nil {
+		return err
 	}
 
 	lifecycleCfg := mcp.LifecycleConfig{}

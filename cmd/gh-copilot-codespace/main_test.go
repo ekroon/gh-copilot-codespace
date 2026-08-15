@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 )
 
@@ -212,6 +213,54 @@ func TestParseLauncherArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("got %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateSelectedOnlySelection(t *testing.T) {
+	tests := []struct {
+		name     string
+		opts     launcherOptions
+		selected []codespace
+		wantErr  string
+	}{
+		{
+			name: "selected-only requires startup codespace",
+			opts: launcherOptions{
+				selectedOnly: setBoolFlag(true),
+			},
+			wantErr: "--selected-only requires at least one codespace selected at startup",
+		},
+		{
+			name: "selected-only accepts startup codespace",
+			opts: launcherOptions{
+				selectedOnly: setBoolFlag(true),
+			},
+			selected: []codespace{{Name: "cs-1"}},
+		},
+		{
+			name: "explicit false permits empty startup selection",
+			opts: launcherOptions{
+				selectedOnly: setBoolFlag(false),
+			},
+		},
+		{
+			name: "default mode permits empty startup selection",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSelectedOnlySelection(tt.opts, tt.selected)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateSelectedOnlySelection() error = %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("validateSelectedOnlySelection() error = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}
@@ -592,6 +641,68 @@ func TestRunExtensionHostIOAdvertisesRemoteExplorerWhenCodespaceConnected(t *tes
 	}
 	if !reflect.DeepEqual(tools, remoteExplorerExtensionTools) {
 		t.Fatalf("custom agent tools = %v, want %v", tools, remoteExplorerExtensionTools)
+	}
+}
+
+func TestRunExtensionHostIOSelectedOnlyOmitsLifecycleTools(t *testing.T) {
+	t.Setenv("CODESPACE_REGISTRY", `[{"alias":"github","name":"cs-abc","workdir":"/workspaces/github"}]`)
+	t.Setenv(codespaceLifecycleConfigEnv, lifecycleConfigEnvJSON(mcp.LifecycleConfig{
+		AccessPolicy: mcp.CodespaceAccessPolicy{
+			SelectedOnly:          true,
+			AllowedCodespaceNames: []string{"cs-abc"},
+		},
+	}))
+	t.Setenv(codespaceLocalWorkdirEnv, "")
+
+	input := strings.NewReader(`{"id":1,"method":"list_tools"}` + "\n")
+	var output bytes.Buffer
+	if err := runExtensionHostIO(context.Background(), input, &output); err != nil {
+		t.Fatalf("runExtensionHostIO: %v", err)
+	}
+
+	var listResp extensionHostResponse
+	if err := json.NewDecoder(&output).Decode(&listResp); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	payload, ok := listResp.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("list response result = %#v, want bootstrap payload object", listResp.Result)
+	}
+	defs, ok := payload["tools"].([]any)
+	if !ok {
+		t.Fatalf("bootstrap tools = %#v, want definitions", payload["tools"])
+	}
+
+	toolNames := make(map[string]bool, len(defs))
+	for _, def := range defs {
+		tool, _ := def.(map[string]any)
+		name, _ := tool["name"].(string)
+		toolNames[name] = true
+	}
+	for _, want := range []string{"remote_bash", "remote_view", "list_codespaces"} {
+		if !toolNames[want] {
+			t.Fatalf("selected-only tools missing %q: %v", want, toolNames)
+		}
+	}
+	for _, forbidden := range []string{
+		"list_available_codespaces",
+		"get_codespace_options",
+		"create_codespace",
+		"connect_codespace",
+		"delete_codespace",
+	} {
+		if toolNames[forbidden] {
+			t.Fatalf("selected-only tools unexpectedly include %q: %v", forbidden, toolNames)
+		}
+	}
+
+	sysMsg, ok := payload["systemMessage"].(map[string]any)
+	if !ok {
+		t.Fatalf("bootstrap systemMessage = %#v, want object", payload["systemMessage"])
+	}
+	content, _ := sysMsg["content"].(string)
+	if !strings.Contains(content, "limited to the codespaces connected at startup") {
+		t.Fatalf("selected-only preamble missing fixed-set guidance: %q", content)
 	}
 }
 

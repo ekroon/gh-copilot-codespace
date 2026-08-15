@@ -245,6 +245,48 @@ func TestToolRuntimeDefinitionsAndCall(t *testing.T) {
 	}
 }
 
+func TestToolRuntimeSelectedOnlyOmitsLifecycleTools(t *testing.T) {
+	lifecycleTools := []string{
+		"list_available_codespaces",
+		"get_codespace_options",
+		"create_codespace",
+		"connect_codespace",
+		"delete_codespace",
+	}
+
+	unrestricted := NewToolRuntime(registry.New(), LifecycleConfig{})
+	unrestrictedNames := make(map[string]bool)
+	for _, def := range unrestricted.Definitions() {
+		unrestrictedNames[def.Name] = true
+	}
+	for _, name := range lifecycleTools {
+		if !unrestrictedNames[name] {
+			t.Fatalf("unrestricted runtime missing lifecycle tool %q", name)
+		}
+	}
+
+	selectedOnly := NewToolRuntime(registry.New(), LifecycleConfig{
+		AccessPolicy: CodespaceAccessPolicy{SelectedOnly: true},
+	})
+	selectedOnlyNames := make(map[string]bool)
+	for _, def := range selectedOnly.Definitions() {
+		selectedOnlyNames[def.Name] = true
+	}
+	for _, name := range []string{"remote_bash", "remote_view", "list_codespaces"} {
+		if !selectedOnlyNames[name] {
+			t.Fatalf("selected-only runtime missing connected-codespace tool %q", name)
+		}
+	}
+	for _, name := range lifecycleTools {
+		if selectedOnlyNames[name] {
+			t.Fatalf("selected-only runtime unexpectedly includes lifecycle tool %q", name)
+		}
+		if _, err := selectedOnly.Call(context.Background(), name, map[string]any{}); err == nil || !strings.Contains(err.Error(), "unknown tool") {
+			t.Fatalf("selected-only Call(%q) error = %v, want unknown tool", name, err)
+		}
+	}
+}
+
 func TestParseCopyEndpoint(t *testing.T) {
 	tests := []struct {
 		name      string

@@ -69,11 +69,15 @@ func NewToolRuntime(reg *registry.Registry, cfg LifecycleConfig) *ToolRuntime {
 		{tool: cdTool(), handler: cdHandler(reg)},
 		{tool: cwdTool(), handler: cwdHandler(reg)},
 		{tool: listCodespacesTool(), handler: listCodespacesHandler(reg)},
-		{tool: listAvailableCodespacesTool(), handler: listAvailableCodespacesHandlerWithState(state)},
-		{tool: getCodespaceOptionsTool(), handler: getCodespaceOptionsHandler(state.cfg.GHRunner)},
-		{tool: createCodespaceTool(), handler: createCodespaceHandlerWithState(reg, state)},
-		{tool: connectCodespaceTool(), handler: connectCodespaceHandlerWithState(reg, state)},
-		{tool: deleteCodespaceTool(), handler: deleteCodespaceHandlerWithState(reg, state)},
+	}
+	if !cfg.AccessPolicy.SelectedOnly {
+		tools = append(tools,
+			runtimeTool{tool: listAvailableCodespacesTool(), handler: listAvailableCodespacesHandlerWithState(state)},
+			runtimeTool{tool: getCodespaceOptionsTool(), handler: getCodespaceOptionsHandler(state.cfg.GHRunner)},
+			runtimeTool{tool: createCodespaceTool(), handler: createCodespaceHandlerWithState(reg, state)},
+			runtimeTool{tool: connectCodespaceTool(), handler: connectCodespaceHandlerWithState(reg, state)},
+			runtimeTool{tool: deleteCodespaceTool(), handler: deleteCodespaceHandlerWithState(reg, state)},
+		)
 	}
 	handlers := make(map[string]server.ToolHandlerFunc, len(tools))
 	for _, t := range tools {

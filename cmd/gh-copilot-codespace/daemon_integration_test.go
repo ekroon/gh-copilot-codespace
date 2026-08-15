@@ -20,6 +20,7 @@ import (
 
 	"github.com/ekroon/gh-copilot-codespace/internal/daemonclient"
 	"github.com/ekroon/gh-copilot-codespace/internal/daemontransport"
+	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
@@ -653,6 +654,10 @@ type rpcResponse struct {
 }
 
 func startExtensionHost(t *testing.T, cs, workdir string) *extensionHostRPC {
+	return startExtensionHostWithLifecycleConfig(t, cs, workdir, "")
+}
+
+func startExtensionHostWithLifecycleConfig(t *testing.T, cs, workdir, lifecycleConfig string) *extensionHostRPC {
 	t.Helper()
 	bin := buildExtensionHostBinary(t)
 
@@ -670,6 +675,7 @@ func startExtensionHost(t *testing.T, cs, workdir string) *extensionHostRPC {
 	cmd := exec.Command(bin, "extension-host")
 	cmd.Env = append(os.Environ(),
 		"CODESPACE_REGISTRY="+string(regJSON),
+		codespaceLifecycleConfigEnv+"="+lifecycleConfig,
 		"COPILOT_CODESPACE_EXTENSION_MODE=mirror",
 		// Make sure no opt-out is inherited from the shell.
 		"COPILOT_CODESPACE_NO_DAEMON=",
@@ -890,6 +896,79 @@ func TestIntegration_ExtensionHostEndToEnd(t *testing.T) {
 	resp = rpc.call(t, "wat", "", nil)
 	if resp.Error == nil {
 		t.Fatal("unknown method should produce an error response")
+	}
+}
+
+func TestIntegration_ExtensionHostSelectedOnlyKeepsProvisionedCodespace(t *testing.T) {
+	cs := testCodespace(t)
+	lifecycleConfig := lifecycleConfigEnvJSON(mcp.LifecycleConfig{
+		AccessPolicy: mcp.CodespaceAccessPolicy{
+			SelectedOnly:          true,
+			AllowedCodespaceNames: []string{cs},
+		},
+	})
+	rpc := startExtensionHostWithLifecycleConfig(t, cs, "/tmp", lifecycleConfig)
+
+	resp := rpc.call(t, "list_tools", "", nil)
+	if resp.Error != nil {
+		t.Fatalf("list_tools error: %v", resp.Error)
+	}
+	var bootstrap struct {
+		Tools []struct{ Name string }
+	}
+	if err := json.Unmarshal(resp.Result, &bootstrap); err != nil {
+		t.Fatalf("decode bootstrap: %v", err)
+	}
+	haveTool := func(name string) bool {
+		for _, tool := range bootstrap.Tools {
+			if tool.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []string{"remote_bash", "remote_view", "list_codespaces"} {
+		if !haveTool(want) {
+			t.Fatalf("selected-only tools missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"list_available_codespaces",
+		"get_codespace_options",
+		"create_codespace",
+		"connect_codespace",
+		"delete_codespace",
+	} {
+		if haveTool(forbidden) {
+			t.Fatalf("selected-only tools unexpectedly include %q", forbidden)
+		}
+	}
+
+	resp = rpc.call(t, "call_tool", "delete_codespace", map[string]any{
+		"codespace": "it",
+	})
+	if resp.Error == nil || !strings.Contains(fmt.Sprint(resp.Error), `unknown tool "delete_codespace"`) {
+		t.Fatalf("delete_codespace error = %v, want unknown tool", resp.Error)
+	}
+
+	sentinel := fmt.Sprintf("selected-only-still-connected-%d", time.Now().UnixNano())
+	resp = rpc.call(t, "call_tool", "remote_bash", map[string]any{
+		"codespace":    "it",
+		"command":      fmt.Sprintf("printf %%s %s", sentinel),
+		"initial_wait": 5,
+	})
+	if resp.Error != nil {
+		t.Fatalf("remote_bash after rejected delete error: %v", resp.Error)
+	}
+	var bashResult struct {
+		TextResultForLlm string `json:"textResultForLlm"`
+		ResultType       string `json:"resultType"`
+	}
+	if err := json.Unmarshal(resp.Result, &bashResult); err != nil {
+		t.Fatalf("decode remote_bash result: %v", err)
+	}
+	if bashResult.ResultType != "success" || !strings.Contains(bashResult.TextResultForLlm, sentinel) {
+		t.Fatalf("provisioned codespace unavailable after rejected delete: %+v", bashResult)
 	}
 }
 

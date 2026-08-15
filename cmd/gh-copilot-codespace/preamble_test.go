@@ -96,7 +96,60 @@ func TestBuildPreamble_MultiCodespaceRetainsAliasesAndCwdGuidance(t *testing.T) 
 	}
 }
 
-func TestBuildPreamble_ZeroCodespacesRetainsLifecycleWithoutResumeWorkspace(t *testing.T) {
+func TestBuildPreamble_SelectedOnlyDescribesFixedStartupSet(t *testing.T) {
+	tests := []struct {
+		name       string
+		codespaces []PreambleCodespace
+	}{
+		{
+			name: "single codespace",
+			codespaces: []PreambleCodespace{
+				{Alias: "github", Workdir: "/workspaces/github"},
+			},
+		},
+		{
+			name: "multiple codespaces",
+			codespaces: []PreambleCodespace{
+				{Alias: "github", Workdir: "/workspaces/github"},
+				{Alias: "docs", Workdir: "/workspaces/docs"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BuildPreamble(PreambleContext{
+				Codespaces: tt.codespaces,
+				AccessPolicy: mcp.CodespaceAccessPolicy{
+					SelectedOnly: true,
+				},
+			})
+
+			for _, want := range []string{
+				"--selected-only",
+				"limited to the codespaces connected at startup",
+				"Codespace lifecycle tools are unavailable",
+			} {
+				if !strings.Contains(got, want) {
+					t.Errorf("missing %q in selected-only preamble:\n%s", want, got)
+				}
+			}
+			for _, unwanted := range []string{
+				"list_available_codespaces",
+				"get_codespace_options",
+				"create_codespace",
+				"connect_codespace",
+				"delete_codespace",
+			} {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("unexpected %q in selected-only preamble:\n%s", unwanted, got)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildPreamble_ZeroSelectedOnlyHasNoLifecycleGuidance(t *testing.T) {
 	got := BuildPreamble(PreambleContext{
 		AccessPolicy: mcp.CodespaceAccessPolicy{
 			SelectedOnly: true,
@@ -106,9 +159,8 @@ func TestBuildPreamble_ZeroCodespacesRetainsLifecycleWithoutResumeWorkspace(t *t
 	for _, want := range []string{
 		"# Codespace Lifecycle Session",
 		"--selected-only",
-		"no existing codespaces were selected at startup",
-		"get_codespace_options",
-		"create_codespace",
+		"requires at least one codespace selected at startup",
+		"Codespace lifecycle tools are unavailable",
 		"current directory",
 		"project instructions, agents, and context",
 		"repository work",
@@ -119,7 +171,16 @@ func TestBuildPreamble_ZeroCodespacesRetainsLifecycleWithoutResumeWorkspace(t *t
 			t.Errorf("missing %q in zero-codespace preamble:\n%s", want, got)
 		}
 	}
-	for _, unwanted := range []string{"--resume", "launcher workspace", "project source code is not available locally"} {
+	for _, unwanted := range []string{
+		"--resume",
+		"launcher workspace",
+		"project source code is not available locally",
+		"list_available_codespaces",
+		"get_codespace_options",
+		"create_codespace",
+		"connect_codespace",
+		"delete_codespace",
+	} {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("unexpected %q in zero-codespace preamble:\n%s", unwanted, got)
 		}

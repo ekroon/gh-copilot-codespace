@@ -73,7 +73,7 @@ gh copilot-codespace -c codespace-1,codespace-2
 # Start without a Codespace, then create or connect from the agent
 gh copilot-codespace --no-codespace
 
-# Restrict existing-Codespace access to the startup selection
+# Limit the agent to the Codespaces selected at startup
 gh copilot-codespace --selected-only
 
 # Forward Copilot CLI arguments directly
@@ -128,19 +128,20 @@ remote_bash(codespace="api", cwd="/workspaces/api", command="go test ./...")
 remote_view(codespace="web", path="/workspaces/web/src/app.ts")
 ```
 
-Use `list_codespaces` to see connected aliases, repositories, branches, and working directories. Lifecycle tools can create, connect, and delete Codespaces during the session, but `@remote-explorer` does not use them.
+Use `list_codespaces` to see connected aliases, repositories, branches, and working directories. In default sessions, lifecycle tools can create, connect, and delete Codespaces during the session, but `@remote-explorer` does not use them.
 
 ## Selected-only sessions
 
-`--selected-only` limits access to existing Codespaces. It does not disable Codespace creation.
+`--selected-only` limits the agent to the Codespaces selected at startup. At least one Codespace must be supplied with `-c/--codespace` or chosen in the interactive picker.
 
-| Tool | Behavior |
+| Tool group | Behavior |
 |---|---|
-| `list_available_codespaces` | Shows only existing Codespaces selected at startup. |
-| `connect_codespace` | Can attach only an existing Codespace on that allowlist. |
-| `create_codespace` | Remains available; a newly created Codespace is connected immediately. |
+| Repository `remote_*` tools | Operate on the connected startup Codespaces. |
+| `list_codespaces` | Lists the connected startup Codespaces. |
+| `list_available_codespaces`, `get_codespace_options` | Not registered. |
+| `create_codespace`, `connect_codespace`, `delete_codespace` | Not registered. The agent cannot create, attach, disconnect, or delete Codespaces through the extension lifecycle tools. |
 
-Starting with `--no-codespace --selected-only` creates a create-first session: no existing Codespaces are discoverable or connectable, but the agent can create a new one.
+`--no-codespace --selected-only` and an empty interactive selection are rejected because a selected-only session has no lifecycle tools for adding a Codespace later.
 
 ## Custom provisioners
 

@@ -49,6 +49,7 @@ func buildSinglePreamble(ctx PreambleContext) string {
 	sb.WriteString("# Codespace Remote Development\n\n")
 	fmt.Fprintf(&sb, "The repository working copy for implementation lives on the codespace at %s.\n\n", cs.Workdir)
 	writeCurrentDirectoryGuidance(&sb)
+	writeSelectedOnlyGuidance(&sb, ctx.AccessPolicy)
 	writeRemoteRoutingGuidance(&sb)
 	return sb.String()
 }
@@ -68,6 +69,8 @@ func buildMultiPreamble(ctx PreambleContext) string {
 		}
 		fmt.Fprintf(&sb, "| %s | %s | %s | %s |\n", cs.Alias, cs.Repository, branch, cs.Workdir)
 	}
+	sb.WriteString("\n")
+	writeSelectedOnlyGuidance(&sb, ctx.AccessPolicy)
 	sb.WriteString("\n## Tool routing\n\n")
 	sb.WriteString("- All `remote_*` tools accept an optional `codespace` parameter; pass the alias to target a specific codespace.\n")
 	sb.WriteString("- Use `list_codespaces` to see currently connected codespaces.\n")
@@ -83,15 +86,10 @@ func buildZeroPreamble(ctx PreambleContext) string {
 	sb.WriteString("## What to do first\n\n")
 
 	switch {
-	case policy.SelectedOnly && len(policy.AllowedCodespaceNames) == 0:
-		sb.WriteString("- This session was launched with `--selected-only`, and no existing codespaces were selected at startup.\n")
-		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create the first codespace for this session.\n")
-		sb.WriteString("- `list_available_codespaces` will not show any existing codespaces for this session, and `connect_codespace` cannot attach an existing codespace until you create one from this session.\n")
 	case policy.SelectedOnly:
-		sb.WriteString("- This session was launched with `--selected-only`, so existing codespaces are limited to the ones selected at startup plus codespaces created from this session.\n")
-		sb.WriteString("- Use `list_available_codespaces` to discover which existing codespaces are currently allowlisted for this session.\n")
-		sb.WriteString("- Use `connect_codespace` to attach one of those allowlisted existing codespaces.\n")
-		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create a new codespace for the repository you need.\n")
+		sb.WriteString("- `--selected-only` requires at least one codespace selected at startup; this session has none.\n")
+		sb.WriteString("- Codespace lifecycle tools are unavailable in selected-only sessions.\n")
+		sb.WriteString("- Relaunch and select the codespace or codespaces the agent should use.\n")
 	default:
 		sb.WriteString("- Use `list_available_codespaces` to discover existing codespaces you can connect to.\n")
 		sb.WriteString("- Use `get_codespace_options` and then `create_codespace` to create a new codespace for the repository you need.\n")
@@ -105,6 +103,15 @@ func buildZeroPreamble(ctx PreambleContext) string {
 	sb.WriteString("- Do not make placeholder, empty, or no-op tool calls. Only call tools with the real arguments needed for the task.\n")
 	sb.WriteString("- Use `remote_copy` only for an explicit one-time transfer after connecting; it is not synchronization.\n\n")
 	return sb.String()
+}
+
+func writeSelectedOnlyGuidance(sb *strings.Builder, policy mcp.CodespaceAccessPolicy) {
+	if !policy.SelectedOnly {
+		return
+	}
+	sb.WriteString("## Selected-only session\n\n")
+	sb.WriteString("- This session was launched with `--selected-only` and is limited to the codespaces connected at startup.\n")
+	sb.WriteString("- Codespace lifecycle tools are unavailable; do not create, connect, disconnect, or delete codespaces.\n\n")
 }
 
 func writeCurrentDirectoryGuidance(sb *strings.Builder) {
