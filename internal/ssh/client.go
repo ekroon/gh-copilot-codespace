@@ -464,6 +464,14 @@ func (c *Client) Exec(ctx context.Context, command string) (stdout string, stder
 	return c.runRemoteCommand(ctx, wrapped, sshConfigPath != "")
 }
 
+// ExecWithInput runs a command on the codespace with stdin supplied.
+// It performs no replay or fallback after an in-flight failure.
+func (c *Client) ExecWithInput(ctx context.Context, command string, input []byte) (stdout string, stderr string, exitCode int, err error) {
+	wrapped := envSecretsLoader + " && " + command
+	sshConfigPath, _, _ := c.sshState()
+	return c.runRemoteCommandWithInput(ctx, wrapped, input, sshConfigPath != "")
+}
+
 // UploadTerminfo compiles a local terminfo entry into the remote codespace.
 func (c *Client) UploadTerminfo(ctx context.Context, term string) error {
 	var outBuf, errBuf bytes.Buffer

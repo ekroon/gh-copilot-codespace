@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"debug/buildinfo"
@@ -29,11 +28,13 @@ const (
 )
 
 type deployBinaryDeps struct {
-	detectArch     func(ctx context.Context, codespaceName string) (string, error)
+	detectArch     func(ctx context.Context, remote remoteCommand) (string, error)
 	getLinuxBinary func(ctx context.Context, arch string) (string, func(), error)
 	binaryVersion  func(binaryPath string) (string, error)
-	remoteCommand  func(ctx context.Context, codespaceName, command string, stdin []byte) (string, error)
+	remoteCommand  remoteCommand
 }
+
+type remoteCommand func(ctx context.Context, command string, stdin []byte) (string, error)
 
 // deployBinary copies this binary to the codespace for use as a remote exec agent.
 // In dev mode (go run / local build), it cross-compiles for linux.
@@ -44,12 +45,14 @@ func deployBinary(ctx context.Context, sshClient *ssh.Client, codespaceName stri
 		detectArch:     detectCodespaceArch,
 		getLinuxBinary: getLinuxBinary,
 		binaryVersion:  binaryVersion,
-		remoteCommand:  runDeployRemoteCommand,
+		remoteCommand: func(ctx context.Context, command string, stdin []byte) (string, error) {
+			return runRemoteCommandOnClient(ctx, sshClient, command, stdin)
+		},
 	})
 }
 
 func deployBinaryWithDeps(ctx context.Context, sshClient *ssh.Client, codespaceName string, deps deployBinaryDeps) (string, error) {
-	arch, err := deps.detectArch(ctx, codespaceName)
+	arch, err := deps.detectArch(ctx, deps.remoteCommand)
 	if err != nil {
 		return "", fmt.Errorf("detecting codespace arch: %w", err)
 	}
@@ -73,7 +76,7 @@ func deployBinaryWithDeps(ctx context.Context, sshClient *ssh.Client, codespaceN
 		return "", fmt.Errorf("reading binary version: %w", err)
 	}
 
-	homeOut, err := deps.remoteCommand(ctx, codespaceName, `printf '%s\n' "$HOME"`, nil)
+	homeOut, err := deps.remoteCommand(ctx, `printf '%s\n' "$HOME"`, nil)
 	if err != nil {
 		return "", fmt.Errorf("detecting remote home: %w", err)
 	}
@@ -97,7 +100,7 @@ func deployBinaryWithDeps(ctx context.Context, sshClient *ssh.Client, codespaceN
 		"gh-copilot-codespace",
 	)
 
-	remoteDigest, err := deployedHelperDigest(ctx, deps, codespaceName, remotePath)
+	remoteDigest, err := deployedHelperDigest(ctx, deps, remotePath)
 	if err != nil {
 		return "", err
 	}
@@ -123,11 +126,11 @@ test -x "$dest"`,
 			deployShellQuote(remotePath),
 		)
 		encoded := []byte(base64.StdEncoding.EncodeToString(binData))
-		if _, err := deps.remoteCommand(ctx, codespaceName, installCmd, encoded); err != nil {
+		if _, err := deps.remoteCommand(ctx, installCmd, encoded); err != nil {
 			return "", fmt.Errorf("installing content-addressed helper: %w", err)
 		}
 
-		remoteDigest, err = deployedHelperDigest(ctx, deps, codespaceName, remotePath)
+		remoteDigest, err = deployedHelperDigest(ctx, deps, remotePath)
 		if err != nil {
 			return "", err
 		}
@@ -136,7 +139,7 @@ test -x "$dest"`,
 		}
 	}
 
-	info, err := probeDeployedHelper(ctx, deps, codespaceName, remotePath)
+	info, err := probeDeployedHelper(ctx, deps, remotePath)
 	if err != nil {
 		return "", err
 	}
@@ -150,21 +153,21 @@ test -x "$dest"`,
 	return remotePath, nil
 }
 
-func deployedHelperDigest(ctx context.Context, deps deployBinaryDeps, codespaceName, remotePath string) (string, error) {
+func deployedHelperDigest(ctx context.Context, deps deployBinaryDeps, remotePath string) (string, error) {
 	command := fmt.Sprintf(
 		"if [ -f %s ]; then sha256sum -- %s | awk '{print $1}'; fi",
 		deployShellQuote(remotePath),
 		deployShellQuote(remotePath),
 	)
-	out, err := deps.remoteCommand(ctx, codespaceName, command, nil)
+	out, err := deps.remoteCommand(ctx, command, nil)
 	if err != nil {
 		return "", fmt.Errorf("checking deployed helper digest: %w", err)
 	}
 	return strings.TrimSpace(out), nil
 }
 
-func probeDeployedHelper(ctx context.Context, deps deployBinaryDeps, codespaceName, remotePath string) (helperinfo.Info, error) {
-	out, err := deps.remoteCommand(ctx, codespaceName, deployShellQuote(remotePath)+" helper-info", nil)
+func probeDeployedHelper(ctx context.Context, deps deployBinaryDeps, remotePath string) (helperinfo.Info, error) {
+	out, err := deps.remoteCommand(ctx, deployShellQuote(remotePath)+" helper-info", nil)
 	if err != nil {
 		return helperinfo.Info{}, fmt.Errorf("probing deployed helper compatibility: %w", err)
 	}
@@ -175,33 +178,24 @@ func probeDeployedHelper(ctx context.Context, deps deployBinaryDeps, codespaceNa
 	return info, nil
 }
 
-func restoreDeployedHelper(sshClient *ssh.Client, codespaceName, remotePath string) error {
+func restoreDeployedHelper(ctx context.Context, sshClient *ssh.Client, codespaceName, remotePath string) error {
 	return restoreDeployedHelperWithDeps(
+		ctx,
 		sshClient,
 		codespaceName,
 		remotePath,
-		deployBinaryDeps{remoteCommand: runDeployRemoteCommand},
+		deployBinaryDeps{remoteCommand: func(ctx context.Context, command string, stdin []byte) (string, error) {
+			return runRemoteCommandOnClient(ctx, sshClient, command, stdin)
+		}},
 	)
 }
 
-func restoreDeployedHelperWithDeps(sshClient *ssh.Client, codespaceName, remotePath string, deps deployBinaryDeps) error {
-	info, err := probeDeployedHelper(context.Background(), deps, codespaceName, remotePath)
+func restoreDeployedHelperWithDeps(ctx context.Context, sshClient *ssh.Client, codespaceName, remotePath string, deps deployBinaryDeps) error {
+	info, err := probeDeployedHelper(ctx, deps, remotePath)
 	if err != nil {
 		return err
 	}
 	return sshClient.SelectFilesystemHelper(remotePath, info)
-}
-
-func runDeployRemoteCommand(ctx context.Context, codespaceName, command string, stdin []byte) (string, error) {
-	cmd := exec.CommandContext(ctx, "gh", "codespace", "ssh", "-c", codespaceName, "--", command)
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return string(out), nil
 }
 
 func deployShellQuote(value string) string {
@@ -232,8 +226,8 @@ func sanitizeHelperPathComponent(value string) string {
 }
 
 // detectCodespaceArch returns the codespace's CPU architecture (amd64 or arm64).
-func detectCodespaceArch(ctx context.Context, codespaceName string) (string, error) {
-	out, err := runDeployRemoteCommand(ctx, codespaceName, "uname -m", nil)
+func detectCodespaceArch(ctx context.Context, remote remoteCommand) (string, error) {
+	out, err := remote(ctx, "uname -m", nil)
 	if err != nil {
 		return "", err
 	}
@@ -246,6 +240,21 @@ func detectCodespaceArch(ctx context.Context, codespaceName string) (string, err
 	default:
 		return "", fmt.Errorf("unsupported architecture: %s", machine)
 	}
+}
+
+func runRemoteCommandOnClient(ctx context.Context, sshClient *ssh.Client, command string, stdin []byte) (string, error) {
+	stdout, stderr, exitCode, err := sshClient.ExecWithInput(ctx, command, stdin)
+	if err != nil {
+		return "", err
+	}
+	if exitCode != 0 {
+		trimmed := strings.TrimSpace(stderr)
+		if trimmed == "" {
+			return "", fmt.Errorf("remote command failed (exit %d)", exitCode)
+		}
+		return "", fmt.Errorf("remote command failed (exit %d): %s", exitCode, trimmed)
+	}
+	return stdout, nil
 }
 
 // getLinuxBinary returns a path to a linux binary for the given arch.

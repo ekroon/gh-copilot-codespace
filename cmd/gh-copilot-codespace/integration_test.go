@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
@@ -187,4 +188,41 @@ func TestIntegration_ConnectCodespace(t *testing.T) {
 	if resolved.Name != cs {
 		t.Errorf("resolved name %q, want %q", resolved.Name, cs)
 	}
+}
+
+func TestIntegration_ConnectCodespaceTiming(t *testing.T) {
+	cs := testCodespace(t)
+	selected, err := lookupCodespace(cs)
+	if err != nil {
+		t.Fatalf("lookupCodespace: %v", err)
+	}
+	if selected.State != "Available" {
+		t.Fatalf("codespace %q state = %q, want Available", cs, selected.State)
+	}
+	t.Setenv("COPILOT_CODESPACE_TIMINGS", "1")
+
+	reg := registry.New()
+	started := time.Now()
+	if err := connectSelectedCodespace(context.Background(), reg, selected, builtinProvisioners(nil)); err != nil {
+		t.Fatalf("connectSelectedCodespace: %v", err)
+	}
+	elapsed := time.Since(started)
+
+	connected := reg.FindByName(cs)
+	if connected == nil {
+		t.Fatalf("codespace %q was not registered", cs)
+	}
+	if connected.HelperPath == "" {
+		t.Fatal("connected codespace has no compatible helper path")
+	}
+
+	stdout, _, exitCode, err := connected.Executor.RunBash(context.Background(), "echo timing-ok", connected.Workdir)
+	if err != nil {
+		t.Fatalf("registered executor failed: %v", err)
+	}
+	if exitCode != 0 || !strings.Contains(stdout, "timing-ok") {
+		t.Fatalf("registered executor = output:%q exit:%d", stdout, exitCode)
+	}
+
+	t.Logf("existing codespace connection timing: total=%s helper=%s workdir=%s", elapsed, connected.HelperPath, connected.Workdir)
 }

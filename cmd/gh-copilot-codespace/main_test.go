@@ -13,7 +13,66 @@ import (
 
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
+
+func installDetectWorkdirSSH(t *testing.T, workdir string) {
+	t.Helper()
+
+	binDir := t.TempDir()
+	ghPath := filepath.Join(binDir, "gh")
+	sshPath := filepath.Join(binDir, "ssh")
+	ghScript := `#!/bin/sh
+set -eu
+
+case "${1:-} ${2:-}" in
+  "codespace ssh")
+    if [ "${3:-}" = "--config" ]; then
+      cat <<'EOF'
+Host cs.demo
+  HostName example.com
+  User git
+EOF
+      exit 0
+    fi
+    ;;
+esac
+
+exit 0
+`
+	sshScript := `#!/bin/sh
+set -eu
+
+if [ -n "${FAKE_SSH_COMMAND_LOG:-}" ]; then
+  printf '%s\n' "$*" > "${FAKE_SSH_COMMAND_LOG}"
+fi
+
+last=""
+for arg in "$@"; do
+  last="$arg"
+done
+
+case "$last" in
+  *"ls -d /workspaces/*/ 2>/dev/null"*)
+    printf '%s\n' "${FAKE_GH_WORKDIR:-/workspaces/repo/}"
+    ;;
+esac
+
+exit 0
+`
+	if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+		t.Fatalf("WriteFile ssh: %v", err)
+	}
+	if err := os.WriteFile(ghPath, []byte(ghScript), 0o755); err != nil {
+		t.Fatalf("WriteFile gh: %v", err)
+	}
+	path := binDir
+	if existing := os.Getenv("PATH"); existing != "" {
+		path += string(os.PathListSeparator) + existing
+	}
+	t.Setenv("PATH", path)
+	t.Setenv("FAKE_GH_WORKDIR", workdir)
+}
 
 func setBoolFlag(value bool) optionalBool {
 	return optionalBool{set: true, value: value}
@@ -82,6 +141,30 @@ func TestChooseWorkdir(t *testing.T) {
 				t.Errorf("chooseWorkdir(%v, %q) = %q, want %q", tc.dirs, tc.repoName, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDetectWorkdirUsesConfiguredClient(t *testing.T) {
+	installDetectWorkdirSSH(t, "/workspaces/github/")
+	logPath := filepath.Join(t.TempDir(), "ssh-command.log")
+	t.Setenv("FAKE_SSH_COMMAND_LOG", logPath)
+
+	client := ssh.NewClient("demo")
+	if err := client.SetupMultiplexing(context.Background()); err != nil {
+		t.Fatalf("SetupMultiplexing() error = %v", err)
+	}
+
+	got := detectWorkdir(context.Background(), client, "owner/repo")
+	if got != "/workspaces/github" {
+		t.Fatalf("detectWorkdir() = %q, want %q", got, "/workspaces/github")
+	}
+
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(logPath): %v", err)
+	}
+	if !strings.Contains(string(logged), "ls -d /workspaces/*/ 2>/dev/null") {
+		t.Fatalf("ssh command log = %q, want workdir lookup", string(logged))
 	}
 }
 

@@ -27,7 +27,7 @@ type fakeDeployRemote struct {
 	installCommands []string
 }
 
-func (f *fakeDeployRemote) run(_ context.Context, _ string, command string, stdin []byte) (string, error) {
+func (f *fakeDeployRemote) run(_ context.Context, command string, stdin []byte) (string, error) {
 	f.t.Helper()
 	f.commands = append(f.commands, command)
 
@@ -81,7 +81,7 @@ func testDeployDeps(t *testing.T, remote *fakeDeployRemote) deployBinaryDeps {
 	remote.expectedDigest = hex.EncodeToString(digest[:])
 
 	return deployBinaryDeps{
-		detectArch: func(context.Context, string) (string, error) { return "amd64", nil },
+		detectArch: func(context.Context, remoteCommand) (string, error) { return "amd64", nil },
 		getLinuxBinary: func(context.Context, string) (string, func(), error) {
 			return binaryPath, nil, nil
 		},
@@ -186,6 +186,7 @@ func TestRestoreDeployedHelperRejectsOldFixedV1Helper(t *testing.T) {
 	client := ssh.NewClient("demo")
 
 	err := restoreDeployedHelperWithDeps(
+		context.Background(),
 		client,
 		"demo",
 		legacyRemoteBinaryPath,
@@ -196,6 +197,29 @@ func TestRestoreDeployedHelperRejectsOldFixedV1Helper(t *testing.T) {
 	}
 	if client.FilesystemHelperPath() != "" {
 		t.Fatalf("client helper path = %q, want empty", client.FilesystemHelperPath())
+	}
+}
+
+func TestRestoreDeployedHelperWithDeps_CancelPropagation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	client := ssh.NewClient("demo")
+	deps := deployBinaryDeps{
+		remoteCommand: func(cmdCtx context.Context, command string, stdin []byte) (string, error) {
+			select {
+			case <-cmdCtx.Done():
+				return "", cmdCtx.Err()
+			default:
+				t.Fatalf("remote command %q unexpectedly started with stdin %d", command, len(stdin))
+				return "", nil
+			}
+		},
+	}
+
+	err := restoreDeployedHelperWithDeps(ctx, client, "demo", legacyRemoteBinaryPath, deps)
+	if err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("restoreDeployedHelperWithDeps() error = %v, want context cancellation", err)
 	}
 }
 
@@ -216,7 +240,7 @@ func TestDeployBinaryWithDeps_CancelPropagation(t *testing.T) {
 
 	client := ssh.NewClient("demo")
 	deps := deployBinaryDeps{
-		detectArch: func(dctx context.Context, _ string) (string, error) {
+		detectArch: func(dctx context.Context, _ remoteCommand) (string, error) {
 			// Block until context is cancelled.
 			<-dctx.Done()
 			return "", dctx.Err()
@@ -226,7 +250,7 @@ func TestDeployBinaryWithDeps_CancelPropagation(t *testing.T) {
 			return "", nil, nil
 		},
 		binaryVersion: func(string) (string, error) { return "v", nil },
-		remoteCommand: func(context.Context, string, string, []byte) (string, error) {
+		remoteCommand: func(context.Context, string, []byte) (string, error) {
 			t.Fatal("remoteCommand should not be called")
 			return "", nil
 		},

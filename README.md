@@ -145,7 +145,7 @@ Use `list_codespaces` to see connected aliases, repositories, branches, and work
 
 ## Custom provisioners
 
-Provisioners run setup after the launcher connects a Codespace and after extension lifecycle tools create or connect one. Built-in provisioners upload terminal information and run `git fetch origin`.
+Provisioners run setup after the launcher connects a Codespace and after extension lifecycle tools create or connect one. Built-in provisioners upload terminal information and start `git fetch origin` in the background. Fetch output is written to `~/.local/state/gh-copilot-codespace/git-fetch.log` unless `XDG_STATE_HOME` is set. Branch-specific provisioning only blocks for a fetch when the requested branch is not already available locally.
 
 For Ghostty, the built-in terminal provisioner uploads `xterm-ghostty`. Custom `bash` provisioners run on the Codespace.
 
@@ -175,7 +175,7 @@ Add custom provisioners in `~/.config/copilot-codespace/provisioners.json`:
 | Field | Description |
 |---|---|
 | `builtins.terminfo` | Enable or disable terminal information upload (enabled by default) |
-| `builtins.git-fetch` | Enable or disable `git fetch origin` (enabled by default) |
+| `builtins.git-fetch` | Enable or disable background `git fetch origin` (enabled by default) |
 | `name` | Provisioner name shown in logs |
 | `bash` | Command run on the Codespace |
 | `match.terminal` | Run only for the detected local terminal |
@@ -212,6 +212,7 @@ Pushing a semantic-version tag triggers a release for `gh extension` users. To p
 | `CODESPACE_REGISTRY` | Connected Codespace metadata supplied to the extension host |
 | `CODESPACE_LOCAL_WORKDIR` | Current local checkout used as the allowed local root for `remote_copy` |
 | `CODESPACE_LIFECYCLE_CONFIG` | Per-session lifecycle access policy |
+| `COPILOT_CODESPACE_TIMINGS` | Set to enable connection-stage timings on stderr for launcher and lifecycle connect flows |
 | `COPILOT_CODESPACE_EXTENSION_TOKEN` | Token activating the user-scoped extension for this launch |
 | `COPILOT_CODESPACE_EXTENSION_MANIFEST` | Path to the per-session extension manifest |
 | `COPILOT_CODESPACE_NO_DAEMON` | Set to `1` to use direct SSH instead of the sandbox daemon |

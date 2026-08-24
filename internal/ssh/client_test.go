@@ -520,6 +520,63 @@ func TestUploadTerminfoPipesLocalOutputToRemote(t *testing.T) {
 	}
 }
 
+func TestExecWithInputUsesMultiplexedSSHAndStdin(t *testing.T) {
+	client := NewClient("demo")
+	client.sshConfigPath = "/tmp/ssh-config"
+	client.sshHost = "cs.demo"
+
+	stdinPath := filepath.Join(t.TempDir(), "remote-stdin.txt")
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "ok\n", stdinPath: stdinPath},
+	})
+
+	stdout, stderr, exitCode, err := client.ExecWithInput(context.Background(), "cat", []byte("payload\n"))
+	if err != nil {
+		t.Fatalf("ExecWithInput() error = %v", err)
+	}
+	if stdout != "ok\n" || stderr != "" || exitCode != 0 {
+		t.Fatalf("ExecWithInput() = stdout:%q stderr:%q exit:%d", stdout, stderr, exitCode)
+	}
+
+	gotStdin, err := os.ReadFile(stdinPath)
+	if err != nil {
+		t.Fatalf("ReadFile(stdinPath): %v", err)
+	}
+	if string(gotStdin) != "payload\n" {
+		t.Fatalf("remote stdin = %q, want %q", string(gotStdin), "payload\n")
+	}
+
+	wantCalls := []fakeExecCall{
+		{name: "ssh", args: []string{"-F", "/tmp/ssh-config", "cs.demo", envSecretsLoader + " && cat"}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestExecWithInputDoesNotRetryTransportFailure(t *testing.T) {
+	client := NewClient("demo")
+	client.sshConfigPath = "/tmp/ssh-config"
+	client.sshHost = "cs.demo"
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{exitCode: 255},
+	})
+
+	_, _, exitCode, err := client.ExecWithInput(context.Background(), "touch /tmp/file", []byte("payload"))
+	if err != nil {
+		t.Fatalf("ExecWithInput() error = %v", err)
+	}
+	if exitCode != 255 {
+		t.Fatalf("exitCode = %d, want 255", exitCode)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("len(calls) = %d, want 1", len(calls))
+	}
+}
+
 func TestGrepUsesExplicitCwd(t *testing.T) {
 	client := NewClient("demo")
 

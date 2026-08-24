@@ -1,15 +1,19 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/helperinfo"
+	"github.com/ekroon/gh-copilot-codespace/internal/provisioner"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
@@ -24,6 +28,19 @@ type mockGHRunner struct {
 type mockGHResult struct {
 	output string
 	err    error
+}
+
+type timingProvisioner struct {
+	ran *bool
+}
+
+func (p *timingProvisioner) Name() string                          { return "timing" }
+func (p *timingProvisioner) ShouldRun(provisioner.RunContext) bool { return true }
+func (p *timingProvisioner) Run(context.Context, provisioner.CodespaceTarget) error {
+	if p.ran != nil {
+		*p.ran = true
+	}
+	return nil
 }
 
 func (m *mockGHRunner) Run(_ context.Context, args ...string) (string, error) {
@@ -106,6 +123,78 @@ esac
 	const sshScript = `#!/bin/sh
 echo "fake ssh unavailable" >&2
 exit 1
+`
+
+	if err := os.WriteFile(ghPath, []byte(ghScript), 0o755); err != nil {
+		t.Fatalf("WriteFile gh: %v", err)
+	}
+	if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+		t.Fatalf("WriteFile ssh: %v", err)
+	}
+
+	path := binDir
+	if existing := os.Getenv("PATH"); existing != "" {
+		path += string(os.PathListSeparator) + existing
+	}
+	t.Setenv("PATH", path)
+	t.Setenv("FAKE_GH_CODESPACE_LIST_JSON", listJSON)
+	t.Setenv("FAKE_GH_WORKDIR", workdir)
+}
+
+func installTimingCodespaceCLI(t *testing.T, listJSON string, workdir string) {
+	t.Helper()
+
+	if listJSON == "" {
+		listJSON = "[]"
+	}
+	if workdir == "" {
+		workdir = "/workspaces/repo/"
+	}
+
+	binDir := t.TempDir()
+	ghPath := filepath.Join(binDir, "gh")
+	sshPath := filepath.Join(binDir, "ssh")
+
+	ghScript := `#!/bin/sh
+set -eu
+
+case "${1:-} ${2:-}" in
+  "codespace list")
+    printf '%s\n' "${FAKE_GH_CODESPACE_LIST_JSON:-[]}"
+    ;;
+  "codespace ssh")
+    if [ "${3:-}" = "--config" ]; then
+      cat <<'EOF'
+Host cs.test
+  HostName example.com
+  User git
+EOF
+      exit 0
+    fi
+    ;;
+esac
+
+exit 0
+`
+
+	sshScript := `#!/bin/sh
+set -eu
+
+last=""
+for arg in "$@"; do
+  last="$arg"
+done
+
+case "$last" in
+  *"ls -d /workspaces/*/ 2>/dev/null"*)
+    printf '%s\n' "${FAKE_GH_WORKDIR:-/workspaces/repo/}"
+    ;;
+  *"echo ok"*)
+    printf 'ok\n'
+    ;;
+esac
+
+exit 0
 `
 
 	if err := os.WriteFile(ghPath, []byte(ghScript), 0o755); err != nil {
@@ -490,6 +579,87 @@ func TestConnectCodespaceHandlerSetsUpConfiguredExecutor(t *testing.T) {
 	}
 	if cs.Executor != wrapped {
 		t.Fatalf("Executor = %T, want configured executor", cs.Executor)
+	}
+}
+
+func TestConnectCodespaceHandler_EmitsTimingStages(t *testing.T) {
+	installTimingCodespaceCLI(t, `[{"name":"cs-selected","repository":"owner/repo"}]`, "/workspaces/repo/")
+	t.Setenv("COPILOT_CODESPACE_TIMINGS", "1")
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() {
+		os.Stderr = oldStderr
+	})
+
+	reg := registry.New()
+	deployCalled := false
+	provisionerRan := false
+	handler := connectCodespaceHandler(reg, LifecycleConfig{
+		DeployFunc: func(_ context.Context, sshClient *ssh.Client, _ string) (string, error) {
+			deployCalled = true
+			remotePath := "/tmp/gh-copilot-codespace/helper"
+			if err := sshClient.SelectFilesystemHelper(remotePath, helperinfo.Current()); err != nil {
+				return "", err
+			}
+			return remotePath, nil
+		},
+		ExecutorSetup: func(_ context.Context, cs *registry.ManagedCodespace) error {
+			if cs.Executor == nil {
+				t.Fatal("executor not configured")
+			}
+			return nil
+		},
+		Provisioners: []provisioner.Provisioner{
+			&timingProvisioner{ran: &provisionerRan},
+		},
+	})
+
+	res, _ := handler(context.Background(), makeReq(map[string]any{
+		"name": "cs-selected",
+	}))
+	if res.IsError {
+		t.Fatalf("unexpected connection error: %s", resultText(res))
+	}
+	if !deployCalled {
+		t.Fatal("deploy function was not called")
+	}
+	if !provisionerRan {
+		t.Fatal("provisioner was not called")
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stderr pipe: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("copy stderr: %v", err)
+	}
+
+	got := buf.String()
+	for _, want := range []string{
+		"repository lookup",
+		"ssh multiplexing",
+		"helper deployment",
+		"workdir detection",
+		"executor setup",
+		"provisioning",
+		"total:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("timing output %q missing %q", got, want)
+		}
+	}
+	if strings.Index(got, "repository lookup") > strings.Index(got, "ssh multiplexing") ||
+		strings.Index(got, "ssh multiplexing") > strings.Index(got, "helper deployment") ||
+		strings.Index(got, "helper deployment") > strings.Index(got, "workdir detection") ||
+		strings.Index(got, "workdir detection") > strings.Index(got, "executor setup") ||
+		strings.Index(got, "executor setup") > strings.Index(got, "provisioning") {
+		t.Fatalf("timing output out of order: %q", got)
 	}
 }
 

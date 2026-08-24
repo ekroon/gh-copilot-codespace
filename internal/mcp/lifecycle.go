@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/connecttiming"
 	"github.com/ekroon/gh-copilot-codespace/internal/provisioner"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
@@ -485,29 +486,49 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 			return toolError(fmt.Sprintf("alias %q already in use", alias)), nil
 		}
 
+		trace := connecttiming.NewFromEnv("connect_codespace "+csName, os.Stderr, nil)
+		defer trace.Finish()
+
 		// Look up the codespace to get its repository
-		repoInfo := lookupCSRepository(ctx, csName)
+		var repoInfo string
+		_ = trace.Step(connecttiming.StageRepositoryLookup, func() error {
+			repoInfo = lookupCSRepository(ctx, csName)
+			return nil
+		})
 
 		// Setup SSH
 		sshClient := ssh.NewClient(csName)
-		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+		if err := trace.Step(connecttiming.StageSSHMultiplexing, func() error {
+			return sshClient.SetupMultiplexing(ctx)
+		}); err != nil {
 			return toolError(fmt.Sprintf("SSH setup failed: %v", err)), nil
 		}
 
 		// Deploy and select a compatible helper binary.
 		var helperPath string
 		if state.cfg.DeployFunc != nil {
-			remotePath, err := state.cfg.DeployFunc(ctx, sshClient, csName)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed for %s: %v\n", csName, err)
-			} else if selected := sshClient.FilesystemHelperPath(); selected == "" || selected != remotePath {
-				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy returned an unverified helper path %q for %s\n", remotePath, csName)
-			} else {
-				helperPath = selected
-			}
+			_ = trace.Step(connecttiming.StageHelperDeployment, func() error {
+				remotePath, err := state.cfg.DeployFunc(ctx, sshClient, csName)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed for %s: %v\n", csName, err)
+					return err
+				}
+				selectedPath := sshClient.FilesystemHelperPath()
+				if selectedPath == "" || selectedPath != remotePath {
+					err = fmt.Errorf("unverified helper path %q", remotePath)
+					fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy returned an unverified helper path %q for %s\n", remotePath, csName)
+					return err
+				}
+				helperPath = selectedPath
+				return nil
+			})
 		}
 
-		workdir := detectCSWorkdir(ctx, sshClient, repoInfo)
+		workdir := ""
+		_ = trace.Step(connecttiming.StageWorkdirDetection, func() error {
+			workdir = detectCSWorkdir(ctx, sshClient, repoInfo)
+			return nil
+		})
 		sshClient.SetWorkdir(workdir)
 
 		cs := &registry.ManagedCodespace{
@@ -519,9 +540,13 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 			HelperPath: helperPath,
 		}
 		if state.cfg.ExecutorSetup != nil {
-			if err := state.cfg.ExecutorSetup(ctx, cs); err != nil {
-				fmt.Fprintf(os.Stderr, "  ⚠ executor setup failed for %s: %v\n", csName, err)
-			}
+			_ = trace.Step(connecttiming.StageExecutorSetup, func() error {
+				if err := state.cfg.ExecutorSetup(ctx, cs); err != nil {
+					fmt.Fprintf(os.Stderr, "  ⚠ executor setup failed for %s: %v\n", csName, err)
+					return err
+				}
+				return nil
+			})
 		}
 		if err := reg.Register(cs); err != nil {
 			if cs.Cleanup != nil {
@@ -538,7 +563,10 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 				Repository:     repoInfo,
 				IsNewCodespace: false,
 			}
-			provisioner.RunAll(ctx, state.cfg.Provisioners, rctx, target)
+			_ = trace.Step(connecttiming.StageProvisioning, func() error {
+				provisioner.RunAll(ctx, state.cfg.Provisioners, rctx, target)
+				return nil
+			})
 		}
 
 		return toolSuccess(fmt.Sprintf("Connected to codespace %q (alias: %s)\nWorkdir: %s", csName, alias, workdir)), nil

@@ -15,8 +15,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/connecttiming"
 	"github.com/ekroon/gh-copilot-codespace/internal/helperinfo"
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
+	"github.com/ekroon/gh-copilot-codespace/internal/provisioner"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
@@ -134,7 +136,7 @@ func toolRuntimeInputsFromEnv() (*registry.Registry, mcp.LifecycleConfig, error)
 
 	var reg *registry.Registry
 	if registryJSON != "" {
-		reg, err = registryFromJSON(registryJSON)
+		reg, err = registryFromJSON(context.Background(), registryJSON)
 		if err != nil {
 			return nil, mcp.LifecycleConfig{}, fmt.Errorf("invalid CODESPACE_REGISTRY: %w", err)
 		}
@@ -216,12 +218,12 @@ func lifecycleConfigEnvJSON(cfg mcp.LifecycleConfig) string {
 }
 
 // registryFromJSON deserializes CODESPACE_REGISTRY env var and creates SSH clients.
-func registryFromJSON(data string) (*registry.Registry, error) {
+func registryFromJSON(ctx context.Context, data string) (*registry.Registry, error) {
 	var entries []registryEntry
 	if err := json.Unmarshal([]byte(data), &entries); err != nil {
 		return nil, fmt.Errorf("parsing registry: %w", err)
 	}
-	return registryFromEntries(context.Background(), entries, func(ctx context.Context, e registryEntry) (*registry.ManagedCodespace, error) {
+	return registryFromEntries(ctx, entries, func(ctx context.Context, e registryEntry) (*registry.ManagedCodespace, error) {
 		sshClient := ssh.NewClient(e.Name)
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "extension-host: multiplexing warning for %s: %v\n", e.Alias, err)
@@ -234,7 +236,7 @@ func registryFromJSON(data string) (*registry.Registry, error) {
 			helperPath = e.LegacyExecAgent
 		}
 		if helperPath != "" {
-			if err := restoreDeployedHelper(sshClient, e.Name, helperPath); err != nil {
+			if err := restoreDeployedHelper(ctx, sshClient, e.Name, helperPath); err != nil {
 				fmt.Fprintf(os.Stderr, "extension-host: ignoring incompatible helper for %s: %v\n", e.Alias, err)
 				helperPath = ""
 			}
@@ -440,51 +442,9 @@ func runLauncher(args []string) error {
 	provisioners := loadProvisioners()
 
 	for _, selected := range selectedList {
-		fmt.Printf("Selected: %s (%s)\n", selected.DisplayName, selected.Repository)
-
-		// Start codespace if needed
-		if selected.State != "Available" {
-			if err := startCodespace(selected.Name); err != nil {
-				return err
-			}
-		}
-
-		// Detect workspace directory
-		workdir, err := detectWorkdir(selected.Name, selected.Repository)
-		if err != nil {
+		if err := connectSelectedCodespace(ctx, reg, selected, provisioners); err != nil {
 			return err
 		}
-		fmt.Printf("  Workspace: %s\n", workdir)
-
-		// Set up SSH multiplexing early for remote tools and IDE forwarding.
-		sshClient := ssh.NewClient(selected.Name)
-		if err := sshClient.SetupMultiplexing(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: SSH multiplexing failed for %s: %v\n", selected.Name, err)
-		}
-
-		// Deploy exec agent binary
-		remoteBinary, err := deployBinary(ctx, sshClient, selected.Name)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not deploy exec agent for %s: %v\n", selected.Name, err)
-		}
-
-		// Detect branch
-		branch := detectRemoteBranch(sshClient, selected.Name, workdir)
-
-		alias := registry.DefaultAlias(selected.Repository, reg.Aliases())
-		sshClient.SetWorkdir(workdir)
-		if err := reg.Register(&registry.ManagedCodespace{
-			Alias:      alias,
-			Name:       selected.Name,
-			Repository: selected.Repository,
-			Branch:     branch,
-			Workdir:    workdir,
-			Executor:   sshClient,
-			HelperPath: remoteBinary,
-		}); err != nil {
-			return fmt.Errorf("registering selected codespace %q: %w", selected.Name, err)
-		}
-		runProvisioners(ctx, provisioners, selected.Name, selected.Repository, workdir, sshClient, false)
 	}
 
 	launchCtx := resolveLaunchContext(originalCWD)
@@ -529,6 +489,75 @@ func runLauncher(args []string) error {
 
 func prepareLaunchDirectory(dir string) error {
 	return os.Chdir(dir)
+}
+
+func connectSelectedCodespace(ctx context.Context, reg *registry.Registry, selected codespace, provisioners []provisioner.Provisioner) error {
+	fmt.Printf("Selected: %s (%s)\n", selected.DisplayName, selected.Repository)
+
+	trace := connecttiming.NewFromEnv(fmt.Sprintf("launcher connection %s", selected.Name), os.Stderr, nil)
+	defer trace.Finish()
+
+	if selected.State != "Available" {
+		if err := trace.Step("start codespace", func() error {
+			return startCodespace(selected.Name)
+		}); err != nil {
+			return err
+		}
+	}
+
+	sshClient := ssh.NewClient(selected.Name)
+	_ = trace.Step(connecttiming.StageSSHMultiplexing, func() error {
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: SSH multiplexing failed for %s: %v\n", selected.Name, err)
+			return err
+		}
+		return nil
+	})
+
+	var remoteBinary string
+	_ = trace.Step(connecttiming.StageHelperDeployment, func() error {
+		var err error
+		remoteBinary, err = deployBinary(ctx, sshClient, selected.Name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not deploy exec agent for %s: %v\n", selected.Name, err)
+		}
+		return err
+	})
+
+	var workdir string
+	_ = trace.Step(connecttiming.StageWorkdirDetection, func() error {
+		workdir = detectWorkdir(ctx, sshClient, selected.Repository)
+		return nil
+	})
+	fmt.Printf("  Workspace: %s\n", workdir)
+
+	var branch string
+	_ = trace.Step(connecttiming.StageBranchDetection, func() error {
+		branch = detectRemoteBranch(sshClient, selected.Name, workdir)
+		return nil
+	})
+
+	alias := registry.DefaultAlias(selected.Repository, reg.Aliases())
+	sshClient.SetWorkdir(workdir)
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:      alias,
+		Name:       selected.Name,
+		Repository: selected.Repository,
+		Branch:     branch,
+		Workdir:    workdir,
+		Executor:   sshClient,
+		HelperPath: remoteBinary,
+	}); err != nil {
+		return fmt.Errorf("registering selected codespace %q: %w", selected.Name, err)
+	}
+	if len(provisioners) > 0 {
+		_ = trace.Step(connecttiming.StageProvisioning, func() error {
+			runProvisioners(ctx, provisioners, selected.Name, selected.Repository, workdir, sshClient, false)
+			return nil
+		})
+	}
+
+	return nil
 }
 
 // lookupCodespace finds a codespace by name (exact or prefix match).
@@ -694,17 +723,15 @@ func startCodespace(name string) error {
 	return fmt.Errorf("timed out waiting for codespace SSH")
 }
 
-func detectWorkdir(codespaceName, repository string) (string, error) {
-	out, err := exec.Command("gh", "codespace", "ssh", "-c", codespaceName,
-		"--", "ls -d /workspaces/*/ 2>/dev/null",
-	).Output()
-	if err != nil {
-		return "/workspaces", nil
+func detectWorkdir(ctx context.Context, client *ssh.Client, repository string) string {
+	stdout, _, exitCode, err := client.Exec(ctx, "ls -d /workspaces/*/ 2>/dev/null")
+	if err != nil || exitCode != 0 {
+		return "/workspaces"
 	}
 
-	raw := strings.TrimSpace(string(out))
+	raw := strings.TrimSpace(stdout)
 	if raw == "" {
-		return "/workspaces", nil
+		return "/workspaces"
 	}
 
 	// Parse directory list and strip trailing slashes
@@ -716,18 +743,22 @@ func detectWorkdir(codespaceName, repository string) (string, error) {
 		}
 	}
 	if len(dirs) == 0 {
-		return "/workspaces", nil
+		return "/workspaces"
 	}
 
 	// Try automatic selection based on repository name
 	repoName := repoBaseName(repository)
 	chosen := chooseWorkdir(dirs, repoName)
 	if chosen != "" {
-		return chosen, nil
+		return chosen
 	}
 
 	// Multiple dirs, no repo match — interactive selection
-	return selectWorkdir(dirs)
+	chosen, chooseErr := selectWorkdir(dirs)
+	if chooseErr != nil || chosen == "" {
+		return "/workspaces"
+	}
+	return chosen
 }
 
 func sshCommand(codespaceName, command string) (string, error) {
