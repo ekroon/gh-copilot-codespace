@@ -396,6 +396,37 @@ func (e *Executor) RunBash(ctx context.Context, command, cwd string) (stdout, st
 		cwd = e.GetWorkdir()
 	}
 	raw, err := e.call(ctx, daemonproto.VerbRunBash, daemonproto.RunBashParams{Command: command, Cwd: cwd})
+	return decodeRunBashResult(raw, err)
+}
+
+// RunBashIfConnected runs a command only on the currently live generation.
+// It never probes, reconnects, wakes the transport, or replays the command.
+// Cancellation still sends a bounded cancel request on the same generation.
+func (e *Executor) RunBashIfConnected(ctx context.Context, command, cwd string) (stdout, stderr string, exitCode int, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", -1, err
+	}
+	e.mu.Lock()
+	closed, conn := e.closed, e.conn
+	e.mu.Unlock()
+	if closed {
+		return "", "", -1, ErrClosed
+	}
+	if conn == nil {
+		return "", "", -1, errors.New("daemonclient: no daemon connection is available")
+	}
+	if conn.dead() {
+		return "", "", -1, fmt.Errorf("daemonclient: daemon connection is unavailable: %w", conn.cause())
+	}
+	if cwd == "" {
+		cwd = e.GetWorkdir()
+	}
+	raw, err := e.callOnWithOptions(ctx, conn, daemonproto.VerbRunBash,
+		daemonproto.RunBashParams{Command: command, Cwd: cwd}, callOptions{sendCancel: true})
+	return decodeRunBashResult(raw, err)
+}
+
+func decodeRunBashResult(raw json.RawMessage, err error) (stdout, stderr string, exitCode int, resultErr error) {
 	if err != nil {
 		return "", "", -1, err
 	}

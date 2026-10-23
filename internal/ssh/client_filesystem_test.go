@@ -3263,6 +3263,9 @@ func TestFilesystemRunnerEditRejectsSymlinkPath(t *testing.T) {
 			if err := os.WriteFile(path, []byte("before\n"), 0o751); err != nil {
 				t.Fatalf("WriteFile() error = %v", err)
 			}
+			if err := os.Chmod(path, 0o751); err != nil {
+				t.Fatalf("Chmod() error = %v", err)
+			}
 
 			_, stderr, exitCode := runFilesystemRunner(t, "edit", map[string]any{
 				"path":    path,

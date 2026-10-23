@@ -35,6 +35,8 @@ type extensionLaunch struct {
 	ManifestPath string
 	HostEnv      map[string]string
 	ProcessEnv   map[string]string
+	LocalWorkdir string
+	ArtifactDir  string
 }
 
 func extensionSessionToken() string {
@@ -170,14 +172,24 @@ func generateProjectExtension(_ string) error {
 }
 
 func installUserExtension() error {
+	return installUserExtensionWithCleanup(true)
+}
+
+func installUserExtensionWithCleanup(cleanupLegacy bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("getting home dir: %w", err)
 	}
 	root := filepath.Join(home, ".copilot", "extensions")
-	if err := cleanupLegacyGeneratedUserExtensions(root, time.Now()); err != nil {
-		return err
+	if cleanupLegacy {
+		if err := cleanupLegacyGeneratedUserExtensions(root, time.Now()); err != nil {
+			return err
+		}
 	}
+	return installExtensionAtRoot(root)
+}
+
+func installExtensionAtRoot(root string) error {
 	extDir := filepath.Join(root, userExtensionName)
 	if err := os.MkdirAll(extDir, 0o755); err != nil {
 		return fmt.Errorf("creating user extension dir: %w", err)
@@ -234,6 +246,7 @@ function loadManifest() {
 }
 
 const manifest = loadManifest();
+const remoteNative = process.env.%s === "1" || Boolean(manifest?.env?.CODESPACE_WORKSPACE_CONFIG);
 
 function isToolResultContent(entry) {
   if (typeof entry !== "object" || entry === null || typeof entry.type !== "string") return false;
@@ -434,8 +447,50 @@ function normalizeToolResult(result) {
   return result;
 }
 
+function nativeSessionOptions() {
+  // Inherit the CLI session's launch cwd/profile and live plugin/MCP snapshot.
+  // Repeating context/discovery fields on resume can rebuild that snapshot.
+  return {
+    enableSkills: false,
+    skipCustomInstructions: true,
+    enableHostGitOperations: false,
+    enableOnDemandInstructionDiscovery: false,
+    enableFileHooks: false,
+    availableTools: ["custom:*", "mcp:*", "builtin:task", "builtin:ask_user"],
+  };
+}
+
+function normalizeToolArgs(name, args) {
+  // The SDK unwraps the built-in apply_patch string schema before invocation.
+  return name === "apply_patch" && typeof args === "string" ? { patch: args } : args;
+}
+
+function mayOverrideBuiltIn(definition, native) {
+  const ordinary = new Set(["view", "edit", "create", "apply_patch", "rg", "glob", "bash",
+    "write_bash", "read_bash", "stop_bash", "list_bash"]);
+  return native && definition.overridesBuiltInTool === true && ordinary.has(definition.name);
+}
+
+let session;
+async function reportNativeFailure(error) {
+  const message = "remote-native extension unavailable: " + String(error?.message || error) +
+    ". STOP repository work; no local source fallback. Built-in source tools remain excluded by launcher startup filters. UI commands and configured MCP/custom tools are not globally sandboxed.";
+  if (!session) {
+    session = await joinSession({
+      tools: [],
+      ...nativeSessionOptions(),
+      systemMessage: { mode: "append", content: message },
+    });
+  }
+  await session.log(message, { level: "error" });
+}
+
 if (!manifest) {
-  await joinSession({ tools: [] });
+  if (remoteNative) {
+    await reportNativeFailure(new Error("missing or invalid launcher manifest"));
+  } else {
+    await joinSession({ tools: [] });
+  }
 } else {
   const host = spawn(manifest.selfBinary, ["extension-host"], {
     stdio: ["pipe", "pipe", "inherit"],
@@ -445,6 +500,20 @@ if (!manifest) {
   let nextId = 1;
   let buffer = "";
   const pending = new Map();
+  let hostFailure;
+
+  function hostFailed(error) {
+    if (hostFailure) return;
+    hostFailure = error;
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+    if (remoteNative && session) {
+      void reportNativeFailure(error).catch((logError) => console.error(String(logError)));
+    }
+  }
+
+  host.on("error", hostFailed);
+  host.stdin.on("error", hostFailed);
 
   host.stdout.setEncoding("utf8");
   host.stdout.on("data", (chunk) => {
@@ -473,14 +542,11 @@ if (!manifest) {
   });
 
   host.on("exit", (code, signal) => {
-    const error = new Error("extension host exited (" + (code ?? signal ?? "unknown") + ")");
-    for (const waiter of pending.values()) {
-      waiter.reject(error);
-    }
-    pending.clear();
+    hostFailed(new Error("extension host exited (" + (code ?? signal ?? "unknown") + ")"));
   });
 
   function request(method, payload = {}) {
+    if (hostFailure) return Promise.reject(hostFailure);
     const id = nextId++;
     const message = { id, method, ...payload };
     return new Promise((resolve, reject) => {
@@ -494,7 +560,14 @@ if (!manifest) {
     });
   }
 
-  const bootstrap = await request("list_tools");
+  try {
+  let timer;
+  const bootstrap = await (remoteNative ? Promise.race([
+    request("list_tools"),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("extension host readiness timed out")), 20000);
+    }),
+  ]).finally(() => clearTimeout(timer)) : request("list_tools"));
   // The Go side returns { tools, systemMessage?, customAgents? }. Older builds
   // returned a bare array of tool definitions; tolerate that shape too so a
   // mid-rollout binary skew never breaks the extension.
@@ -505,13 +578,24 @@ if (!manifest) {
       : [];
   const systemMessage = Array.isArray(bootstrap) ? undefined : bootstrap?.systemMessage;
   const customAgents = Array.isArray(bootstrap) ? undefined : bootstrap?.customAgents;
+  const workspace = Array.isArray(bootstrap) ? undefined : bootstrap?.workspace;
+  if (remoteNative) {
+    const expected = JSON.parse(manifest.env.CODESPACE_WORKSPACE_CONFIG || "null");
+    if (!workspace || workspace.alias !== expected?.alias ||
+        typeof workspace.localWorkdir !== "string" || !workspace.localWorkdir ||
+        !systemMessage?.content || !definitions.some((definition) => definition.name === "view" && definition.overridesBuiltInTool === true) ||
+        !definitions.some((definition) => definition.name === "workspace_skill")) {
+      throw new Error("host does not provide the pinned remote-native workspace protocol");
+    }
+  }
   const tools = definitions.map((definition) => ({
     name: definition.name,
     description: definition.description,
     parameters: definition.parameters,
+    ...(mayOverrideBuiltIn(definition, remoteNative) ? { overridesBuiltInTool: true } : {}),
     handler: async (args) => {
       try {
-        return normalizeToolResult(await request("call_tool", { tool: definition.name, args }));
+        return normalizeToolResult(await request("call_tool", { tool: definition.name, args: normalizeToolArgs(definition.name, args) }));
       } catch (error) {
         return {
           textResultForLlm: String(error?.message || error),
@@ -521,7 +605,7 @@ if (!manifest) {
     },
   }));
 
-  const sessionConfig = { tools };
+  const sessionConfig = { tools, ...(remoteNative ? nativeSessionOptions() : {}) };
   if (systemMessage && typeof systemMessage.content === "string" && systemMessage.content.length > 0) {
     sessionConfig.systemMessage = systemMessage;
   }
@@ -529,7 +613,33 @@ if (!manifest) {
     sessionConfig.customAgents = customAgents;
   }
 
-  await joinSession(sessionConfig);
+  session = await joinSession(sessionConfig);
+  if (remoteNative) {
+    if (hostFailure) throw hostFailure;
+    await session.log(
+      "Remote-native workspace ready. LOCAL HOST folder: " + workspace.localWorkdir +
+      "; remote alias: " + workspace.alias + "; repository: " + workspace.repository +
+      "; branch: " + workspace.branch + "; remote workdir: " + workspace.workdir +
+      "; LOCAL artifact root: " + workspace.artifactDir +
+      ". Skills: native discovery disabled (/skills is empty); workspace_skill reads explicit remote roots only.",
+      { level: "info" },
+    );
+    await session.log(
+      "LOCAL HOST WARNING: /diff, /cwd, ! shell and @attachment UI are LOCAL, NOT remoted. " +
+      "UI /resume, /agent, /add-dir, /worktree, /fork and workspace switching are unsupported; relaunch instead. " +
+      "Normal permissions/trust/sandbox remain in effect. No global shell sandbox is claimed. " +
+      "Configured local MCP/custom tools retain their own behavior.",
+      { level: "warning" },
+    );
+  }
+  } catch (error) {
+    host.kill();
+    if (remoteNative) {
+      await reportNativeFailure(error);
+    } else {
+      throw error;
+    }
+  }
 }
-`, codespaceExtensionTokenEnv, codespaceExtensionManifestEnv)
+`, codespaceExtensionTokenEnv, codespaceExtensionManifestEnv, codespaceRemoteNativeEnv)
 }

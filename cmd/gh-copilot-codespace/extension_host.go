@@ -43,6 +43,7 @@ type bootstrapPayload struct {
 	Tools         []mcp.ToolDefinition `json:"tools"`
 	SystemMessage *systemMessageWire   `json:"systemMessage,omitempty"`
 	CustomAgents  []customAgentWire    `json:"customAgents,omitempty"`
+	Workspace     *nativeWorkspaceWire `json:"workspace,omitempty"`
 }
 
 // systemMessageWire matches @github/copilot-sdk's SystemMessageAppendConfig.
@@ -73,12 +74,53 @@ func runExtensionHostIO(ctx context.Context, in io.Reader, out io.Writer) error 
 		return err
 	}
 	wrapExecutorsWithDaemon(ctx, reg)
+	// Register cleanup before validation/cache initialization can fail.
+	defer func() {
+		for _, cs := range reg.All() {
+			if cs.Cleanup != nil {
+				cs.Cleanup()
+			}
+		}
+	}()
 	lifecycleCfg.ExecutorSetup = func(setupCtx context.Context, cs *registry.ManagedCodespace) error {
 		_, err := wrapExecutorWithDaemon(setupCtx, cs)
 		if err != nil {
 			return err
 		}
 		return nil
+	}
+	var workspace *mcp.WorkspaceConfig
+	if data := os.Getenv(codespaceWorkspaceConfigEnv); data != "" {
+		workspace = &mcp.WorkspaceConfig{}
+		if err := json.Unmarshal([]byte(data), workspace); err != nil {
+			return fmt.Errorf("invalid %s: %w", codespaceWorkspaceConfigEnv, err)
+		}
+	}
+	if os.Getenv(codespaceRemoteNativeEnv) == "1" && workspace == nil {
+		return fmt.Errorf("remote-native requires %s; refusing legacy fallback", codespaceWorkspaceConfigEnv)
+	}
+	runtime, bootstrap, err := newExtensionHostRuntime(reg, lifecycleCfg, workspace)
+	if err != nil {
+		return err
+	}
+
+	var sampler *nativeStatusSampler
+	if statusPath := os.Getenv(codespaceNativeStatusEnv); workspace != nil && statusPath != "" {
+		sampler, err = newNativeStatusSampler(reg, workspace.Alias, statusPath, os.Stderr)
+		if err != nil {
+			return err
+		}
+	}
+	return runExtensionHostWithNativeStatus(ctx, in, out, runtime, bootstrap, sampler)
+}
+
+func newExtensionHostRuntime(reg *registry.Registry, lifecycleCfg mcp.LifecycleConfig, workspace *mcp.WorkspaceConfig) (extensionHostRuntime, *bootstrapPayload, error) {
+	if workspace != nil {
+		runtime, err := mcp.NewWorkspaceRuntime(reg, lifecycleCfg, *workspace)
+		if err != nil {
+			return nil, nil, fmt.Errorf("initializing native workspace: %w", err)
+		}
+		return runtime, nativeBootstrap(reg, lifecycleCfg, *workspace), nil
 	}
 	runtime := mcp.NewToolRuntime(reg, lifecycleCfg)
 	mode := preambleModeFromEnv(os.Getenv(codespaceExtensionModeEnv))
@@ -104,17 +146,7 @@ func runExtensionHostIO(ctx context.Context, in io.Reader, out io.Writer) error 
 		}
 	}
 
-	// Cleanup uses ManagedCodespace.Cleanup as the authoritative idempotent
-	// cleanup; no separate shared closers slice.
-	defer func() {
-		for _, cs := range reg.All() {
-			if cs.Cleanup != nil {
-				cs.Cleanup()
-			}
-		}
-	}()
-
-	return runExtensionHostServer(ctx, in, out, runtime, bootstrap)
+	return runtime, bootstrap, nil
 }
 
 // runExtensionHostServer is the context-aware concurrent protocol coordinator.
@@ -222,6 +254,7 @@ loop:
 				if bootstrap != nil {
 					payload.SystemMessage = bootstrap.SystemMessage
 					payload.CustomAgents = bootstrap.CustomAgents
+					payload.Workspace = bootstrap.Workspace
 				}
 				sendResponse(extensionHostResponse{ID: req.ID, Result: payload})
 

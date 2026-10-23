@@ -300,6 +300,11 @@ func (c *connection) writeFrameWithDeadline(ctx context.Context, writer daemonWr
 	}
 	resetErr := writer.SetWriteDeadline(time.Time{})
 
+	// A complete frame remains valid if cancellation races with Write's return.
+	// Let the caller send its cancel frame instead of killing this generation.
+	if writeErr == nil && resetErr == nil {
+		return true, nil
+	}
 	if ctx.Err() != nil {
 		if written > 0 {
 			c.fail(fmt.Errorf("daemonclient: stream write abandoned after %d bytes: %w", written, ctx.Err()))

@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,186 @@ import (
 	"github.com/ekroon/gh-copilot-codespace/internal/helperinfo"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
+
+func buildLinuxHelperFixture(t *testing.T, goos, arch string) string {
+	t.Helper()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(source, []byte("package main\nfunc main() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(dir, "helper")
+	cmd := exec.Command("go", "build", "-o", binary, source)
+	cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+arch, "CGO_ENABLED=0")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build %s/%s fixture: %v\n%s", goos, arch, err, output)
+	}
+	return binary
+}
+
+func TestLinuxHelperOverrideUsesSuppliedArtifactWithoutCleanup(t *testing.T) {
+	artifact := buildLinuxHelperFixture(t, "linux", runtime.GOARCH)
+	t.Setenv("COPILOT_CODESPACE_LINUX_HELPER", artifact)
+	got, cleanup, err := getLinuxBinary(context.Background(), runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != artifact || cleanup != nil {
+		t.Fatalf("override = %q, cleanup present = %v; want %q with no cleanup", got, cleanup != nil, artifact)
+	}
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("user artifact was deleted: %v", err)
+	}
+}
+
+func TestLinuxHelperOverrideRejectsInvalidArtifactWithoutFallback(t *testing.T) {
+	dir := t.TempDir()
+	text := filepath.Join(dir, "not-elf")
+	if err := os.WriteFile(text, []byte("not an ELF binary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unreadable := filepath.Join(dir, "unreadable")
+	if err := os.WriteFile(unreadable, []byte("unreadable"), 0); err != nil {
+		t.Fatal(err)
+	}
+	// A well-formed empty ELF header has no Go buildinfo.
+	elfHeader := make([]byte, 64)
+	copy(elfHeader, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	elfHeader[16], elfHeader[18], elfHeader[20], elfHeader[52] = 2, 62, 1, 64
+	noBuildInfo := filepath.Join(dir, "no-buildinfo")
+	if err := os.WriteFile(noBuildInfo, elfHeader, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherArch := "arm64"
+	if runtime.GOARCH == otherArch {
+		otherArch = "amd64"
+	}
+	cases := []struct {
+		name, artifact, want string
+	}{
+		{"empty", "", "absolute"},
+		{"relative", "relative/helper", "absolute"},
+		{"missing", filepath.Join(dir, "missing"), "stat"},
+		{"directory", dir, "regular"},
+		{"text", text, "ELF"},
+		{"no Go buildinfo", noBuildInfo, "buildinfo"},
+		{"Darwin", buildLinuxHelperFixture(t, "darwin", runtime.GOARCH), "ELF"},
+		{"wrong architecture", buildLinuxHelperFixture(t, "linux", otherArch), "GOARCH"},
+		{"non-Linux ELF", buildLinuxHelperFixture(t, "freebsd", runtime.GOARCH), "GOOS"},
+	}
+	if os.Geteuid() != 0 {
+		cases = append(cases, struct{ name, artifact, want string }{"unreadable", unreadable, "open"})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("COPILOT_CODESPACE_LINUX_HELPER", tc.artifact)
+			got, cleanup, err := getLinuxBinary(context.Background(), runtime.GOARCH)
+			if err == nil || !strings.Contains(err.Error(), "COPILOT_CODESPACE_LINUX_HELPER") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("override error = %v, want explicit override %q failure", err, tc.want)
+			}
+			if got != "" || cleanup != nil {
+				t.Fatalf("invalid override fell back: %q, cleanup present = %v", got, cleanup != nil)
+			}
+		})
+	}
+}
+
+func TestLinuxHelperOverrideUnsetPreservesNativeBinary(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native Linux self-binary path only")
+	}
+	t.Setenv("COPILOT_CODESPACE_LINUX_HELPER", "")
+	if err := os.Unsetenv("COPILOT_CODESPACE_LINUX_HELPER"); err != nil {
+		t.Fatal(err)
+	}
+	got, cleanup, err := getLinuxBinary(context.Background(), runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != self || cleanup != nil {
+		t.Fatalf("default native helper = %q, cleanup present = %v; want %q", got, cleanup != nil, self)
+	}
+}
+
+func TestNativeDeploymentNeverCrossCompilesLocalSource(t *testing.T) {
+	otherArch := "arm64"
+	if runtime.GOARCH == otherArch {
+		otherArch = "amd64"
+	}
+	for _, mode := range []string{"native initial", "native lifecycle", "legacy"} {
+		t.Run(mode, func(t *testing.T) {
+			bin := t.TempDir()
+			marker := filepath.Join(t.TempDir(), "local-build-attempted")
+			for name, script := range map[string]string{
+				"go": "#!/bin/sh\n/bin/mkdir \"$FAKE_GO_MARKER\"\nexit 73\n",
+				"gh": "#!/bin/sh\nexit 74\n",
+			} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", bin)
+			t.Setenv("FAKE_GO_MARKER", marker)
+			t.Setenv(codespaceRemoteNativeEnv, "")
+			t.Setenv(codespaceWorkspaceConfigEnv, "")
+			t.Setenv(codespaceLinuxHelperEnv, "")
+			if err := os.Unsetenv(codespaceLinuxHelperEnv); err != nil {
+				t.Fatal(err)
+			}
+			switch mode {
+			case "native initial":
+				t.Setenv(codespaceRemoteNativeEnv, "1")
+			case "native lifecycle":
+				t.Setenv(codespaceWorkspaceConfigEnv, `{"alias":"pinned"}`)
+			}
+			got, cleanup, err := getLinuxBinary(context.Background(), otherArch)
+			if cleanup != nil {
+				defer cleanup()
+			}
+			if mode == "legacy" {
+				if _, err := os.Stat(marker); err != nil {
+					t.Fatalf("legacy no longer attempts local cross-build: %v", err)
+				}
+				return
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Errorf("native deployment attempted a local source build: %v", err)
+			}
+			if err == nil || !strings.Contains(err.Error(), codespaceLinuxHelperEnv) || !strings.Contains(err.Error(), "remote-native") {
+				t.Errorf("missing native override guidance: %v", err)
+			}
+			if got != "" || cleanup != nil {
+				t.Errorf("failed native deployment returned helper %q, cleanup present = %v", got, cleanup != nil)
+			}
+		})
+	}
+}
+
+func TestNativeDeploymentCanReuseLinuxSelf(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native Linux self-binary path only")
+	}
+	t.Setenv(codespaceRemoteNativeEnv, "1")
+	t.Setenv(codespaceLinuxHelperEnv, "")
+	if err := os.Unsetenv(codespaceLinuxHelperEnv); err != nil {
+		t.Fatal(err)
+	}
+	got, cleanup, err := getLinuxBinary(context.Background(), runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != self || cleanup != nil {
+		t.Fatalf("native self helper = %q, cleanup present = %v; want %q", got, cleanup != nil, self)
+	}
+}
 
 type fakeDeployRemote struct {
 	t               *testing.T

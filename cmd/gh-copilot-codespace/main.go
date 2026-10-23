@@ -43,6 +43,14 @@ Flags:
       --no-codespace     Start without connecting to any codespace (skip picker)
       --selected-only[=BOOL]
                          Limit the agent to codespaces selected at startup
+      --remote-native    Opt in to pinned remote workspace tools (one initial codespace)
+      --skill-root PATH  Explicit absolute remote skill root (native only, repeatable)
+      --artifact-dir PATH
+                         Absolute local artifact root (native only)
+
+Native forwarding: only --model VALUE and --reasoning-effort VALUE are supported.
+Native UI /diff, /cwd, ! shell and @attachment remain LOCAL HOST operations.
+Do not use UI workspace/session switching in native mode; relaunch instead.
 
 Subcommands:
   exec                   Execute a command on the codespace (used internally)
@@ -92,6 +100,14 @@ func main() {
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(helperinfo.Current()); err != nil {
 			fmt.Fprintf(os.Stderr, "helper-info: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "native-status" {
+		if err := runNativeStatus(os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "native-status: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -272,6 +288,9 @@ type launcherOptions struct {
 	noCodespace    bool
 	selectedOnly   optionalBool
 	copilotArgs    []string
+	remoteNative   bool
+	skillRoots     []string
+	artifactDir    string
 }
 
 type optionalBool struct {
@@ -320,6 +339,20 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 		}
 
 		switch {
+		case args[i] == "--remote-native":
+			opts.remoteNative = true
+		case args[i] == "--skill-root" || strings.HasPrefix(args[i], "--skill-root="):
+			value, err := launcherPathArg(args, &i, "--skill-root")
+			if err != nil {
+				return launcherOptions{}, err
+			}
+			opts.skillRoots = append(opts.skillRoots, value)
+		case args[i] == "--artifact-dir" || strings.HasPrefix(args[i], "--artifact-dir="):
+			value, err := launcherPathArg(args, &i, "--artifact-dir")
+			if err != nil {
+				return launcherOptions{}, err
+			}
+			opts.artifactDir = value
 		case args[i] == "--here" || strings.HasPrefix(args[i], "--here="):
 			return launcherOptions{}, fmt.Errorf("--here is no longer supported")
 		case args[i] == "--workdir" || strings.HasPrefix(args[i], "--workdir="):
@@ -350,6 +383,9 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 
 	if opts.noCodespace && len(opts.codespaceNames) > 0 {
 		return launcherOptions{}, fmt.Errorf("--no-codespace and --codespace are mutually exclusive")
+	}
+	if err := validateRemoteNativeOptions(opts); err != nil {
+		return launcherOptions{}, err
 	}
 
 	return opts, nil
@@ -402,6 +438,13 @@ func runLauncher(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Deployment occurs during the initial connection, before the extension
+	// manifest exists. Enable source-authority protection before any connection.
+	if opts.remoteNative {
+		if err := os.Setenv(codespaceRemoteNativeEnv, "1"); err != nil {
+			return fmt.Errorf("enabling native deployment mode: %w", err)
+		}
+	}
 
 	self, err := os.Executable()
 	if err != nil {
@@ -427,6 +470,9 @@ func runLauncher(args []string) error {
 	if err := validateSelectedOnlySelection(opts, selectedList); err != nil {
 		return err
 	}
+	if err := validateRemoteNativeSelection(opts, selectedList); err != nil {
+		return err
+	}
 
 	lifecycleCfg := mcp.LifecycleConfig{}
 	if opts.selectedOnly.resolve(false) {
@@ -448,16 +494,25 @@ func runLauncher(args []string) error {
 	}
 
 	launchCtx := resolveLaunchContext(originalCWD)
-	fmt.Printf("  Local cwd:  %s\n", originalCWD)
-
-	// Preserve the caller's working directory for Copilot and all local tools.
-	if err := prepareLaunchDirectory(launchCtx.copilotCWD); err != nil {
-		return fmt.Errorf("changing to copilot directory: %w", err)
+	var extensionLaunch extensionLaunch
+	if opts.remoteNative {
+		extensionLaunch, err = prepareRemoteNativeLaunch(self, reg, lifecycleCfg, opts)
+		launchCtx.copilotCWD = extensionLaunch.LocalWorkdir
+	} else {
+		extensionLaunch, err = prepareExtensionLaunch(self, reg, lifecycleCfg)
 	}
-
-	extensionLaunch, err := prepareExtensionLaunch(self, reg, lifecycleCfg)
 	if err != nil {
 		return fmt.Errorf("preparing extension launch: %w", err)
+	}
+	if opts.remoteNative {
+		fmt.Printf("  LOCAL HOST cwd: %s\n", launchCtx.copilotCWD)
+		fmt.Printf("  Local artifacts: %s\n", extensionLaunch.ArtifactDir)
+		fmt.Fprintln(os.Stderr, nativeHostUIWarning)
+	} else {
+		fmt.Printf("  Local cwd:  %s\n", originalCWD)
+	}
+	if err := prepareLaunchDirectory(launchCtx.copilotCWD); err != nil {
+		return fmt.Errorf("changing to copilot directory: %w", err)
 	}
 	for name, value := range extensionLaunch.ProcessEnv {
 		os.Setenv(name, value)
@@ -465,6 +520,9 @@ func runLauncher(args []string) error {
 
 	// Forward IDE connections from all connected codespaces
 	for _, cs := range reg.All() {
+		if opts.remoteNative {
+			continue // Do not register a host folder as a remote repository IDE workspace.
+		}
 		if sshClient, ok := cs.Executor.(*ssh.Client); ok && sshClient.SSHConfigPath() != "" {
 			_, err = forwardIDEConnections(sshClient, cs.Name, launchCtx.copilotCWD, cs.Workdir)
 			if err != nil {
@@ -473,7 +531,12 @@ func runLauncher(args []string) error {
 		}
 	}
 
-	fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
+	if opts.remoteNative {
+		fmt.Printf("\nLaunching Copilot CLI with remote-native startup tool filters...\n")
+		fmt.Fprintln(os.Stderr, "Source tools are unavailable until 'Remote-native workspace ready' appears. Missing readiness is a startup failure; do not fall back to host tools or UI.")
+	} else {
+		fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
+	}
 	if reg.Len() == 0 {
 		fmt.Printf("  Codespace: none connected yet\n")
 	}
@@ -484,6 +547,9 @@ func runLauncher(args []string) error {
 	fmt.Printf("\n")
 
 	// Exec copilot
+	if opts.remoteNative {
+		return execCopilot(remoteNativeCopilotArgs(opts.copilotArgs))
+	}
 	return execCopilot(opts.copilotArgs)
 }
 

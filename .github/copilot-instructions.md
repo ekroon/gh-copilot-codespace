@@ -1,5 +1,7 @@
 # Copilot Instructions
 
+<sub>🤖 Remote-native guidance drafted with AI assistance</sub>
+
 ## Build, test, and lint
 
 ```bash
@@ -18,10 +20,11 @@ The single Go binary operates in four modes:
 1. **Launcher** (`gh-copilot-codespace [flags]`) — `cmd/gh-copilot-codespace/main.go`
    - Selects zero or more Codespaces, starts them when needed, detects their repository working directories, and establishes multiplexed SSH connections.
    - Deploys the helper binary and runs provisioners for initially connected Codespaces.
-   - Keeps Copilot in the caller's current checkout. Local instructions, agents, skills, and files remain the source of context.
-   - Leaves all Copilot built-in local tools enabled.
+   - By default, keeps Copilot in the caller's current checkout with local context and built-in tools.
+   - `--remote-native` instead uses a non-repository local host directory, pins ordinary source tools to one initial Codespace, and disables host Git context and ambient native skills.
+   - Native launches scope UI settings with a private `COPILOT_HOME` profile, hide local Git/cwd/navigation indicators, and retain host MCP, model/context/usage and permission preferences without rewriting global settings.
    - Installs the stable user-scoped extension, creates a token-protected per-session manifest, and execs Copilot.
-   - Forwards unconsumed arguments, including Copilot's `--resume`, directly to Copilot.
+   - Default mode forwards unconsumed arguments, including Copilot's `--resume`; remote-native mode rejects context-changing arguments it cannot safely support.
    - Falls back to `gh copilot` when the standalone `copilot` binary is unavailable.
 
 2. **Exec agent** (`gh-copilot-codespace exec`) — `cmd/gh-copilot-codespace/exec.go`
@@ -30,11 +33,12 @@ The single Go binary operates in four modes:
 
 3. **Extension host** (`gh-copilot-codespace extension-host`) — `cmd/gh-copilot-codespace/extension_host.go`
    - Is spawned locally by the user-scoped Copilot extension.
-   - Owns the shared `mcp.ToolRuntime`, exposing its 21 first-party remote and lifecycle tools through a small stdio JSON protocol.
+   - Owns the shared `mcp.ToolRuntime`, exposing its first-party remote and lifecycle tools through a small stdio JSON protocol. Remote-native mode wraps it in `mcp.WorkspaceRuntime` for pinned ordinary tools, scoped local artifacts, and explicit remote skills.
    - Returns `{tools, systemMessage, customAgents}` from `list_tools`; the JavaScript extension forwards these values to `joinSession`.
-   - Always builds current-directory guidance: local files supply project context, while repository reads, edits, commands, tests, dependencies, scripts, and Git operations must use the appropriate `remote_*` tools.
+   - Builds mode-specific guidance: default mode uses local context and explicit `remote_*` operations; remote-native mode uses the remote source workspace and separates the local host/artifact surfaces.
    - Supplies `@remote-explorer` as an inline custom agent whenever at least one Codespace is connected; no project agent file is generated.
    - Wraps registered `ssh.Client` executors with `daemonclient.Executor` by default. Wrap or dial failures fall back transparently to direct SSH.
+   - Native status samples actual Git metadata once per second through the existing pinned live daemon connection into an atomic local cache, with a two-second deadline and no overlapping samples. The one-second renderer never queries local Git or opens SSH per repaint, and reports age/staleness/errors explicitly. Status never wakes/reconnects/replays; only ordinary tools retain recovery. Direct-SSH fallback or executors without passive-query support have no live status.
 
 4. **Sandbox daemon** (`gh-copilot-codespace daemon`) — `cmd/gh-copilot-codespace/daemon.go`
    - Runs as a long-lived stdio JSON server inside each connected Codespace.
@@ -45,9 +49,15 @@ The single Go binary operates in four modes:
 
 ## Context and tool routing
 
-- Copilot always stays in the current local checkout.
+- In default mode, Copilot stays in the current local checkout. In `--remote-native` mode, it runs in a separate non-repository local host directory, and ordinary source/command tool names route to the pinned remote workspace.
+- After remote-native extension readiness, use only `workspace_skill` from explicit remote `--skill-root` directories; native `/skills` is not that catalog. The stock CLI may enumerate ambient skill metadata before the extension disables native skills, so do not claim zero ambient startup reads.
+- Remote-native local output uses scoped artifact tools and explicit import/export. Its `remote_copy` local root is the artifact directory, not the source checkout.
+- Stock CLI `!`, `/cwd`, `/diff`, worktree UI, and `@` attachments are not a remote filesystem API. Do not represent them as remote; consult the README for supported host controls and limitations.
+- Native `footer`, `tabs`, and `statusLine` configuration is supported independently of `session.ui`. Hiding the local navigation bar does not disable its commands or the local `!` shell. Keep ordinary-mode UI unchanged.
+- Preserve local MCP servers and normal permissions. Never bulk-forward local credentials, bypass approval, or assume local sandbox rules enforce remote shell access.
+- Ordinary remote-native names are custom extension tools, not locally executing built-ins; retain truthful remote labels and custom-tool permission prompts. Global host startup hooks may still run, so this is not a clean-room profile.
 - Local project components are context only and are not synchronized with a Codespace.
-- All local tools remain enabled, but repository implementation work belongs in the remote working copy.
+- In default mode, local tools remain enabled, but repository implementation work belongs in the remote working copy.
 - Use `remote_view`, `remote_edit`, `remote_create`, `remote_apply_patch`, `remote_grep`, and `remote_glob` for repository files.
 - Use `remote_bash`, `remote_write_bash`, `remote_read_bash`, `remote_list_bash`, and `remote_stop_bash` for builds, tests, linters, dependency operations, repository scripts, Git, and interactive diagnostics.
 - Start with `list_codespaces`, use each target repository's `workdir` as the initial base, and pass explicit `cwd` on every `remote_bash`/`remote_grep`/`remote_glob` call.

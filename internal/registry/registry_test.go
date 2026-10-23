@@ -154,6 +154,14 @@ func TestDefaultAlias_FromRepository(t *testing.T) {
 		{"ekroon/web-app", "web-app"},
 		{"org/my-service", "my-service"},
 		{"single", "single"},
+		{"org/.github", "github"},
+		{"org/_project", "project"},
+		{"org/-project", "project"},
+		{"org/._-", "codespace"},
+		{"org/", "codespace"},
+		{"", "codespace"},
+		{"org/my project!", "my-project-"},
+		{"org/" + strings.Repeat("a", 129), strings.Repeat("a", 128)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.repo, func(t *testing.T) {
@@ -181,5 +189,26 @@ func TestDefaultAlias_MultipleConflicts(t *testing.T) {
 	got := DefaultAlias("github/github", existing)
 	if got != "github-4" {
 		t.Errorf("got %q, want %q", got, "github-4")
+	}
+}
+
+func TestDefaultAlias_NormalizedConflicts(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		repo     string
+		existing []string
+		want     string
+	}{
+		{"leading punctuation", "org/.github", []string{"github", "github-2"}, "github-3"},
+		{"empty base", "org/", []string{"codespace"}, "codespace-2"},
+		{"length limit", "org/" + strings.Repeat("a", 128),
+			[]string{strings.Repeat("a", 128), strings.Repeat("a", 126) + "-2"},
+			strings.Repeat("a", 126) + "-3"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DefaultAlias(tt.repo, tt.existing); got != tt.want {
+				t.Fatalf("DefaultAlias(%q, %v) = %q, want %q", tt.repo, tt.existing, got, tt.want)
+			}
+		})
 	}
 }

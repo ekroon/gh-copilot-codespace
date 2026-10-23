@@ -2,6 +2,7 @@ package daemonclient_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -272,17 +273,16 @@ func TestE2E_ToolRuntimeConcurrentCalls(t *testing.T) {
 }
 
 func TestE2E_ContextCancelPropagatesThroughRuntime(t *testing.T) {
-	runtime, _ := singleCodespaceRuntime(t)
+	runtime, executor := singleCodespaceRuntime(t)
 	bashTool := findRuntimeTool(t, runtime, "remote_bash", "run_bash", "bash")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
 	result, err := runtime.Call(ctx, bashTool, map[string]any{
-		"command": "sleep 30",
-		// Force the sync fallback path so ToolRuntime waits on daemon RunBash,
-		// letting the context cancel reach the daemon process group.
-		"shellId": "force-fallback\x00",
+		"command":      "sleep 30",
+		"shellId":      "cancel-runtime",
+		"initial_wait": 60.0,
 	})
 	elapsed := time.Since(start)
 	if err != nil {
@@ -296,6 +296,16 @@ func TestE2E_ContextCancelPropagatesThroughRuntime(t *testing.T) {
 	}
 	if !strings.Contains(result.TextResultForLlm, "context deadline exceeded") && !strings.Contains(result.TextResultForLlm, "context canceled") {
 		t.Fatalf("result text = %q, want context cancellation", result.TextResultForLlm)
+	}
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer checkCancel()
+	_, err = executor.ReadSession(checkCtx, "cancel-runtime")
+	var remote *daemonclient.RemoteError
+	if !errors.As(err, &remote) {
+		t.Fatalf("canceled session cleanup returned %v, want a remote missing-session error", err)
+	}
+	if _, err := executor.Ping(checkCtx); err != nil {
+		t.Fatalf("daemon connection unusable after cancellation: %v", err)
 	}
 }
 

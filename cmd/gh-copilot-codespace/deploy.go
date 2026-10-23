@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"debug/buildinfo"
+	"debug/elf"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -23,8 +24,9 @@ import (
 // Published helpers are intentionally retained. A helper may still back a
 // daemon or per-call fallback, so automatic cleanup must never unlink it.
 const (
-	legacyRemoteBinaryPath = "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace"
-	remoteHelperCacheDir   = ".cache/gh-copilot-codespace/helpers"
+	legacyRemoteBinaryPath  = "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace"
+	remoteHelperCacheDir    = ".cache/gh-copilot-codespace/helpers"
+	codespaceLinuxHelperEnv = "COPILOT_CODESPACE_LINUX_HELPER"
 )
 
 type deployBinaryDeps struct {
@@ -260,6 +262,14 @@ func runRemoteCommandOnClient(ctx context.Context, sshClient *ssh.Client, comman
 // getLinuxBinary returns a path to a linux binary for the given arch.
 // Returns the path and an optional cleanup function.
 func getLinuxBinary(ctx context.Context, arch string) (string, func(), error) {
+	if artifact, set := os.LookupEnv(codespaceLinuxHelperEnv); set {
+		if err := validateLinuxHelperArtifact(artifact, arch); err != nil {
+			return "", nil, fmt.Errorf("%s: %w", codespaceLinuxHelperEnv, err)
+		}
+		// The caller owns this artifact; never delete it or silently substitute
+		// a local cross-build/release after an explicit override fails validation.
+		return artifact, nil, nil
+	}
 	// If we're already on linux with matching arch, use ourselves
 	if runtime.GOOS == "linux" && runtime.GOARCH == arch {
 		self, err := os.Executable()
@@ -269,6 +279,16 @@ func getLinuxBinary(ctx context.Context, arch string) (string, func(), error) {
 		return self, nil, nil
 	}
 
+	if os.Getenv(codespaceRemoteNativeEnv) == "1" || os.Getenv(codespaceWorkspaceConfigEnv) != "" {
+		// Native source authority is remote, including deployment builds. Never
+		// inspect or compile a host checkout as an implicit helper source.
+		path, cleanup, err := downloadReleaseBinary(ctx, arch)
+		if err != nil {
+			return "", nil, fmt.Errorf("remote-native deployment cannot cross-build local source; set %s to an absolute local path to a remotely built linux/%s helper: %w", codespaceLinuxHelperEnv, arch, err)
+		}
+		return path, cleanup, nil
+	}
+
 	// Try cross-compile first (dev mode — Go installed)
 	if path, cleanup, err := crossCompile(ctx, arch); err == nil {
 		return path, cleanup, nil
@@ -276,6 +296,59 @@ func getLinuxBinary(ctx context.Context, arch string) (string, func(), error) {
 
 	// Fall back to downloading from release
 	return downloadReleaseBinary(ctx, arch)
+}
+
+func validateLinuxHelperArtifact(artifact, arch string) error {
+	if !filepath.IsAbs(artifact) {
+		return fmt.Errorf("helper artifact must be an absolute local path: %q", artifact)
+	}
+	info, err := os.Stat(artifact)
+	if err != nil {
+		return fmt.Errorf("stat helper artifact: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("helper artifact must be a regular file: %q", artifact)
+	}
+	file, err := os.Open(artifact)
+	if err != nil {
+		return fmt.Errorf("open readable helper artifact: %w", err)
+	}
+	defer file.Close()
+	info, err = file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat opened helper artifact: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("opened helper artifact must be a regular file")
+	}
+	header, err := elf.NewFile(file)
+	if err != nil {
+		return fmt.Errorf("helper artifact must be a Linux ELF binary: %w", err)
+	}
+	build, err := buildinfo.Read(file)
+	if err != nil {
+		return fmt.Errorf("read helper Go buildinfo: %w", err)
+	}
+	var goos, goarch string
+	for _, setting := range build.Settings {
+		switch setting.Key {
+		case "GOOS":
+			goos = setting.Value
+		case "GOARCH":
+			goarch = setting.Value
+		}
+	}
+	if goos != "linux" {
+		return fmt.Errorf("helper buildinfo GOOS = %q, want linux", goos)
+	}
+	if goarch != arch {
+		return fmt.Errorf("helper buildinfo GOARCH = %q, want %q", goarch, arch)
+	}
+	machines := map[string]elf.Machine{"amd64": elf.EM_X86_64, "arm64": elf.EM_AARCH64}
+	if machine, supported := machines[arch]; !supported || header.Machine != machine {
+		return fmt.Errorf("helper ELF machine %s does not match requested GOARCH %q", header.Machine, arch)
+	}
+	return nil
 }
 
 // crossCompile builds a linux binary for the given arch.

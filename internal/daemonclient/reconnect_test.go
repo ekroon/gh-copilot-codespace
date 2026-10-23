@@ -243,6 +243,220 @@ func waitConnectionDead(t *testing.T, c *connection) {
 	t.Fatal("timed out waiting for connection to die")
 }
 
+func assertPassiveTransportCounts(t *testing.T, transport *scriptedTransport) {
+	t.Helper()
+	if got := transport.deployCount(); got != 1 {
+		t.Fatalf("deploy count = %d, want 1", got)
+	}
+	if got := transport.spawnCount(); got != 1 {
+		t.Fatalf("spawn count = %d, want 1", got)
+	}
+	if got := transport.recoverCount(); got != 0 {
+		t.Fatalf("recover count = %d, want 0", got)
+	}
+}
+
+func TestExecutorRunBashIfConnectedResultAndCwd(t *testing.T) {
+	e := dialDaemon(t)
+	original := e.current()
+	workdir, explicit := testDir(t), testDir(t)
+	e.SetWorkdir(workdir)
+	for _, cwd := range []string{"", explicit, ""} {
+		wantDir := cwd
+		if wantDir == "" {
+			wantDir = workdir
+		}
+		stdout, stderr, code, err := e.RunBashIfConnected(testContext(t),
+			"printf 'passive:'; pwd; printf diagnostic >&2; exit 7", cwd)
+		if err != nil {
+			t.Fatalf("RunBashIfConnected(%q) error = %v", cwd, err)
+		}
+		if stdout != "passive:"+wantDir+"\n" || stderr != "diagnostic" || code != 7 {
+			t.Fatalf("RunBashIfConnected(%q) = (%q, %q, %d), want cwd %q and exit 7",
+				cwd, stdout, stderr, code, wantDir)
+		}
+		if e.current() != original {
+			t.Fatal("passive command replaced the persistent generation")
+		}
+	}
+}
+
+func TestExecutorRunBashIfConnectedUnavailableDoesNotRecover(t *testing.T) {
+	for _, state := range []string{"dead", "closed", "missing", "reconnecting"} {
+		t.Run(state, func(t *testing.T) {
+			first := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
+			second := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
+			e, transport := dialScripted(t, first, second)
+			original := e.current()
+			switch state {
+			case "dead":
+				first.daemon.kill()
+				waitConnectionDead(t, original)
+			case "closed":
+				if err := e.Close(); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				e.mu.Lock()
+				e.conn = nil
+				if state == "reconnecting" {
+					e.reconnecting = make(chan struct{})
+				}
+				e.mu.Unlock()
+				t.Cleanup(func() {
+					e.mu.Lock()
+					e.conn = original
+					e.reconnecting = nil
+					e.mu.Unlock()
+				})
+			}
+			for i := 0; i < 3; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				start := time.Now()
+				stdout, stderr, code, err := e.RunBashIfConnected(ctx, "true", "/workspaces/project")
+				cancel()
+				if err == nil || errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("passive call %d error = %v, want immediate unavailable error", i, err)
+				}
+				if state == "closed" && !errors.Is(err, ErrClosed) {
+					t.Fatalf("closed executor error = %v, want ErrClosed", err)
+				}
+				if stdout != "" || stderr != "" || code != -1 {
+					t.Fatalf("unavailable result = (%q, %q, %d), want empty output and -1", stdout, stderr, code)
+				}
+				if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+					t.Fatalf("unavailable call took %s, want immediate return", elapsed)
+				}
+				assertPassiveTransportCounts(t, transport)
+			}
+			if first.daemon.requestCount() != 0 || second.daemon.requestCount() != 0 {
+				t.Fatal("unavailable passive calls dispatched requests")
+			}
+			if state == "dead" {
+				if _, _, _, err := e.RunBash(testContext(t), "true", "/workspaces/project"); err != nil {
+					t.Fatalf("ordinary RunBash() after passive failures: %v", err)
+				}
+				if transport.spawnCount() != 2 || transport.recoverCount() != 1 || transport.deployCount() != 1 {
+					t.Fatal("ordinary RunBash did not retain lazy recovery")
+				}
+				if frame := second.daemon.nextRequest(t); frame.Verb != daemonproto.VerbRunBash {
+					t.Fatalf("replacement request = %q, want run_bash", frame.Verb)
+				}
+			}
+		})
+	}
+}
+
+func TestExecutorRunBashIfConnectedLossAfterDispatchDoesNotRecoverOrReplay(t *testing.T) {
+	first := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
+	second := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
+	e, transport := dialScripted(t, first, second)
+	first.daemon.silent.Store(true)
+	original := e.current()
+	result := make(chan error, 1)
+	go func() {
+		_, _, _, err := e.RunBashIfConnected(testContext(t), "printf once", "/workspaces/project")
+		result <- err
+	}()
+	if frame := first.daemon.nextRequest(t); frame.Verb != daemonproto.VerbRunBash {
+		t.Fatalf("dispatched request = %q, want run_bash", frame.Verb)
+	}
+	first.daemon.kill()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("passive call succeeded after connection loss")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("passive call did not return promptly after connection loss")
+	}
+	assertPassiveTransportCounts(t, transport)
+	if e.current() != original || first.daemon.requestCount() != 0 || second.daemon.requestCount() != 0 {
+		t.Fatal("passive call replaced its generation or replayed the request")
+	}
+}
+
+func TestExecutorRunBashIfConnectedPreCanceledDoesNotDispatch(t *testing.T) {
+	generation := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
+	e, transport := dialScripted(t, generation)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, closed := range []bool{false, true} {
+		if closed {
+			if err := e.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, _, _, err := e.RunBashIfConnected(ctx, "true", ""); !errors.Is(err, context.Canceled) {
+			t.Fatalf("pre-canceled call (closed=%v) error = %v, want context.Canceled", closed, err)
+		}
+	}
+	if generation.daemon.requestCount() != 0 {
+		t.Fatal("pre-canceled passive call dispatched a request")
+	}
+	assertPassiveTransportCounts(t, transport)
+}
+
+func TestExecutorRunBashIfConnectedCancellationDoesNotProbeOrRecover(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		t.Run(fmt.Sprintf("timeout=%v", timeout), func(t *testing.T) {
+			generation := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
+			e, transport := dialScripted(t, generation)
+			e.idleProbeAfter = 0
+			e.inFlightProbeAfter = time.Millisecond
+			e.probeTimeout = time.Millisecond
+			generation.daemon.silent.Store(true)
+			ctx, cancel := context.WithCancel(context.Background())
+			wantErr := context.Canceled
+			if timeout {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+				wantErr = context.DeadlineExceeded
+			}
+			defer cancel()
+			result := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				_, _, _, err := e.RunBashIfConnected(ctx, "sleep 30", "/workspaces/project")
+				result <- err
+			}()
+			request := generation.daemon.nextRequest(t)
+			if request.Type != daemonproto.TypeRequest || request.Verb != daemonproto.VerbRunBash {
+				t.Fatalf("first frame = type %q verb %q, want run_bash request", request.Type, request.Verb)
+			}
+			if !timeout {
+				time.Sleep(30 * time.Millisecond)
+				cancel()
+			}
+			frame := generation.daemon.nextRequest(t)
+			if frame.Type != daemonproto.TypeCancel || frame.ID != request.ID {
+				t.Fatalf("next frame = type %q verb %q id %d, want cancel id %d",
+					frame.Type, frame.Verb, frame.ID, request.ID)
+			}
+			select {
+			case err := <-result:
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("passive cancellation error = %v, want %v", err, wantErr)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("passive cancellation did not return promptly")
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Fatalf("passive cancellation took %s, want bounded cancellation", elapsed)
+			}
+			assertPassiveTransportCounts(t, transport)
+			if e.current().dead() || generation.daemon.requestCount() != 0 {
+				t.Fatal("passive cancellation killed the generation or sent extra requests")
+			}
+			generation.daemon.silent.Store(false)
+			if _, _, _, err := e.RunBash(testContext(t), "true", ""); err != nil {
+				t.Fatalf("ordinary RunBash() after passive cancellation: %v", err)
+			}
+			assertPassiveTransportCounts(t, transport)
+		})
+	}
+}
+
 func TestExecutorReconnectsAfterStreamDeath(t *testing.T) {
 	first := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
 	second := newDaemonGeneration(t, daemonproto.ProtocolVersion, daemonproto.AllVerbs())
@@ -444,6 +658,58 @@ func TestExecutorContextCancelDuringProbeSendsOriginalCancel(t *testing.T) {
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("RunBash() error = %v, want context.Canceled", err)
 	}
+}
+
+type cancelAfterWriteConn struct {
+	net.Conn
+	cancel context.CancelFunc
+	armed  atomic.Bool
+}
+
+func (c *cancelAfterWriteConn) Write(data []byte) (int, error) {
+	n, err := c.Conn.Write(data)
+	if err == nil && n == len(data) && c.armed.Swap(false) {
+		c.cancel()
+	}
+	return n, err
+}
+
+func TestExecutorCanceledAfterCompleteWriteKeepsConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client, server := net.Pipe()
+	writer := &cancelAfterWriteConn{Conn: client, cancel: cancel}
+	generation := &daemonGeneration{
+		stream: newCloseSignalConn(writer),
+		daemon: newFakeDaemon(t, server, daemonproto.ProtocolVersion, daemonproto.AllVerbs()),
+	}
+	e, transport := dialScripted(t, generation)
+	release := make(chan struct{})
+	generation.daemon.block(daemonproto.VerbRunBash, release)
+	defer close(release)
+	writer.armed.Store(true)
+
+	_, _, _, err := e.RunBash(ctx, "sleep 30", "/workspaces/project")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunBash() error = %v, want context.Canceled", err)
+	}
+	if e.current().dead() {
+		t.Fatalf("complete frame followed by cancellation killed the connection: %v", e.current().cause())
+	}
+	request := generation.daemon.nextRequest(t)
+	if request.Verb != daemonproto.VerbRunBash {
+		t.Fatalf("request = %+v, want run_bash", request)
+	}
+	frame := generation.daemon.nextRequest(t)
+	if frame.Type != daemonproto.TypeCancel || frame.ID != request.ID {
+		t.Fatalf("cancel = %+v, want cancel id %d", frame, request.ID)
+	}
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), time.Second)
+	defer checkCancel()
+	if _, err := e.Ping(checkCtx); err != nil {
+		t.Fatalf("connection unusable after cancellation: %v", err)
+	}
+	assertPassiveTransportCounts(t, transport)
 }
 
 func TestExecutorSlowLargeResponseCountsByteProgressAsLiveness(t *testing.T) {

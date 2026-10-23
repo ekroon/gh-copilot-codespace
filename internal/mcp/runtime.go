@@ -13,9 +13,10 @@ import (
 
 // ToolDefinition is the transport-neutral shape used by extension-host.
 type ToolDefinition struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  mcpsdk.ToolInputSchema `json:"parameters"`
+	Name                 string                 `json:"name"`
+	Description          string                 `json:"description"`
+	Parameters           mcpsdk.ToolInputSchema `json:"parameters"`
+	OverridesBuiltInTool bool                   `json:"overridesBuiltInTool,omitempty"`
 }
 
 // RuntimeCallResult is the transport-neutral result returned by extension-host.

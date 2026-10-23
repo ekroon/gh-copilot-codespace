@@ -2,6 +2,7 @@ package registry
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -140,12 +141,35 @@ func (r *Registry) Len() int {
 	return len(r.codespaces)
 }
 
-// DefaultAlias derives an alias from a repository name (e.g., "github/github" → "github").
+const maxAliasLength = 128
+
+var aliasPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
+// ValidAlias reports whether an alias is a bounded, explicit workspace identifier.
+func ValidAlias(alias string) bool {
+	return len(alias) <= maxAliasLength && aliasPattern.MatchString(alias)
+}
+
+// DefaultAlias derives a valid alias from a repository name (e.g., "github/github" → "github").
 // If the derived alias conflicts with existing aliases, a numeric suffix is appended.
 func DefaultAlias(repository string, existing []string) string {
 	base := repository
 	if i := strings.LastIndex(repository, "/"); i >= 0 {
 		base = repository[i+1:]
+	}
+	base = strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' ||
+			r == '.' || r == '_' || r == '-' {
+			return r
+		}
+		return '-'
+	}, base)
+	base = strings.TrimLeft(base, "._-")
+	if base == "" {
+		base = "codespace"
+	}
+	if len(base) > maxAliasLength {
+		base = base[:maxAliasLength]
 	}
 
 	// Check for conflicts
@@ -159,7 +183,12 @@ func DefaultAlias(repository string, existing []string) string {
 	}
 
 	for i := 2; ; i++ {
-		candidate := fmt.Sprintf("%s-%d", base, i)
+		suffix := fmt.Sprintf("-%d", i)
+		stem := base
+		if len(stem)+len(suffix) > maxAliasLength {
+			stem = stem[:maxAliasLength-len(suffix)]
+		}
+		candidate := stem + suffix
 		if !taken[candidate] {
 			return candidate
 		}
