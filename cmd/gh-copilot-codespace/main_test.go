@@ -203,6 +203,50 @@ func TestParseSelectionIndices(t *testing.T) {
 	}
 }
 
+func TestSelectCodespacesGumCancellationDoesNotOpenFallback(t *testing.T) {
+	binDir := t.TempDir()
+	for name, script := range map[string]string{
+		"gh":  "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"cs-test\",\"displayName\":\"Test\",\"repository\":\"owner/repo\",\"state\":\"Available\"}]'\n",
+		"gum": "#!/bin/sh\nexit \"${GUM_EXIT_CODE}\"\n",
+	} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	inputPath := filepath.Join(t.TempDir(), "fallback-input")
+	if err := os.WriteFile(inputPath, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.Open(inputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = input.Close() })
+	originalStdin := os.Stdin
+	os.Stdin = input
+	t.Cleanup(func() { os.Stdin = originalStdin })
+
+	t.Setenv("GUM_EXIT_CODE", "130")
+	selected, err := selectCodespaces()
+	if err == nil || !strings.Contains(err.Error(), "cancel") {
+		t.Fatalf("selectCodespaces() = %v, %v; want cancellation error", selected, err)
+	}
+	if len(selected) != 0 {
+		t.Fatalf("selected = %v; want none after cancellation", selected)
+	}
+
+	t.Setenv("GUM_EXIT_CODE", "1")
+	if _, err := input.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	selected, err = selectCodespaces()
+	if err != nil || len(selected) != 1 || selected[0].Name != "cs-test" {
+		t.Fatalf("selectCodespaces() = %v, %v; want numbered fallback selection", selected, err)
+	}
+}
+
 func TestParseLauncherArgs(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -703,6 +704,10 @@ func selectCodespaces() ([]codespace, error) {
 		selected, err := cmd.Output()
 		if err == nil {
 			return resolveSelectedCodespaces(strings.Split(strings.TrimSpace(string(selected)), "\n"), byChoice), nil
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 130 {
+			return nil, fmt.Errorf("codespace selection canceled")
 		}
 		// gum failed (e.g., no TTY), fall through to numbered list.
 	}
