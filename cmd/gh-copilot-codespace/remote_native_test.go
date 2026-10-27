@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +147,101 @@ esac
 	if err != nil || !strings.HasPrefix(string(calls), "api repos/github/graph-hopper --jq .default_branch\napi repos/github/graph-hopper/codespaces/machines --jq ") ||
 		!strings.HasSuffix(string(calls), "\ncodespace create -R github/graph-hopper -b main -m premiumLinux32gb --devcontainer-path .devcontainer/devcontainer.json\n") {
 		t.Fatalf("gh calls = %q, error = %v", calls, err)
+	}
+}
+
+func TestRemoteNativeNoCodespaceOpensPermissionsReview(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("fake browser launcher uses a shell script")
+	}
+	for _, tt := range []struct {
+		name        string
+		createError string
+		openError   bool
+		wantOpen    bool
+		wantError   string
+	}{
+		{
+			name:        "permissions required",
+			createError: "You must authorize or deny additional permissions requested by this codespace before continuing. https://github.com/codespaces/test/permissions.",
+			wantOpen:    true,
+			wantError:   "review the permissions in your browser, then rerun the command",
+		},
+		{
+			name:        "browser fails",
+			createError: "You must authorize or deny additional permissions https://github.com/codespaces/test/permissions",
+			openError:   true,
+			wantOpen:    true,
+			wantError:   "could not open permissions review",
+		},
+		{
+			name:        "no URL",
+			createError: "You must authorize or deny additional permissions",
+			wantError:   "creating Codespace",
+		},
+		{
+			name:        "untrusted URL",
+			createError: "You must authorize or deny additional permissions https://github.com.evil.example/codespaces/test/permissions",
+			wantError:   "creating Codespace",
+		},
+		{
+			name:        "unrelated GitHub URL",
+			createError: "You must authorize or deny additional permissions https://github.com/owner/repo/settings",
+			wantError:   "creating Codespace",
+		},
+		{
+			name:        "unrelated error",
+			createError: "repository not found https://github.com/codespaces/test/permissions",
+			wantError:   "repository not found",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bin := t.TempDir()
+			log := filepath.Join(bin, "browser-args")
+			t.Setenv("BROWSER_TEST_LOG", log)
+			t.Setenv("CREATE_TEST_ERROR", tt.createError)
+			if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(`#!/bin/sh
+case "$1 $2" in
+  "api repos/owner/repo") echo main ;;
+  *) case "$*" in
+    "api repos/owner/repo/codespaces/machines --jq "*) echo basicLinux32gb ;;
+    "api repos/owner/repo/codespaces/new --jq .defaults.devcontainer_path") echo .devcontainer/devcontainer.json ;;
+    "codespace create -R owner/repo "*)
+      printf '%s\n' "$CREATE_TEST_ERROR" >&2
+      exit 1 ;;
+    *) exit 1 ;;
+  esac ;;
+esac
+`), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			browser := "open"
+			if runtime.GOOS == "linux" {
+				browser = "xdg-open"
+			}
+			if err := os.WriteFile(filepath.Join(bin, browser), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$BROWSER_TEST_LOG"
+if [ "$BROWSER_TEST_FAIL" = "1" ]; then exit 1; fi
+`), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if tt.openError {
+				t.Setenv("BROWSER_TEST_FAIL", "1")
+			}
+			t.Setenv("PATH", bin)
+			_, err := selectLauncherCodespaces(launcherOptions{remoteNative: true, noCodespace: true, createRepo: "owner/repo"})
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) || !strings.Contains(err.Error(), tt.createError) {
+				t.Fatalf("create error = %v", err)
+			}
+			opened, readErr := os.ReadFile(log)
+			if tt.wantOpen {
+				if readErr != nil || string(opened) != "https://github.com/codespaces/test/permissions\n" {
+					t.Fatalf("browser calls = %q, read error = %v", opened, readErr)
+				}
+			} else if !os.IsNotExist(readErr) {
+				t.Fatalf("unexpected browser calls = %q, read error = %v", opened, readErr)
+			}
+		})
 	}
 }
 

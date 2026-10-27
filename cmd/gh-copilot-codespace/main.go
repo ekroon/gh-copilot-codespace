@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -679,7 +681,15 @@ func selectLauncherCodespaces(opts launcherOptions) ([]codespace, error) {
 		if err != nil {
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
-				return nil, fmt.Errorf("creating Codespace for %s: %w: %s", repo, err, strings.TrimSpace(string(exitErr.Stderr)))
+				stderr := strings.TrimSpace(string(exitErr.Stderr))
+				createErr := fmt.Errorf("creating Codespace for %s: %w: %s", repo, err, stderr)
+				if reviewURL := codespacePermissionsURL(stderr); reviewURL != "" {
+					if openErr := openBrowserURL(reviewURL); openErr != nil {
+						return nil, fmt.Errorf("%w; could not open permissions review: %v; open %s manually, then rerun the command", createErr, openErr, reviewURL)
+					}
+					return nil, fmt.Errorf("%w; review the permissions in your browser, then rerun the command", createErr)
+				}
+				return nil, createErr
 			}
 			return nil, fmt.Errorf("creating Codespace for %s: %w", repo, err)
 		}
@@ -694,6 +704,34 @@ func selectLauncherCodespaces(opts launcherOptions) ([]codespace, error) {
 		return nil, nil
 	}
 	return selectCodespaces()
+}
+
+func codespacePermissionsURL(stderr string) string {
+	if !strings.Contains(strings.ToLower(stderr), "authorize or deny additional permissions") {
+		return ""
+	}
+	for _, word := range strings.Fields(stderr) {
+		candidate := strings.TrimRight(word, ".,;:!?)")
+		parsed, err := url.Parse(candidate)
+		if err == nil && parsed.Scheme == "https" && parsed.Host == "github.com" &&
+			strings.HasPrefix(parsed.Path, "/codespaces/") && strings.HasSuffix(parsed.Path, "/permissions") {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func openBrowserURL(link string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", link).Run()
+	case "linux":
+		return exec.Command("xdg-open", link).Run()
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", link).Run()
+	default:
+		return fmt.Errorf("no browser opener for %s", runtime.GOOS)
+	}
 }
 
 func prepareLaunchDirectory(dir string) error {
