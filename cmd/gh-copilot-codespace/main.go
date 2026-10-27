@@ -55,7 +55,9 @@ Flags:
       --artifact-dir PATH
                          Absolute local artifact root (native only)
 
-Native forwarding: only --model VALUE and --reasoning-effort VALUE are supported.
+Native forwarding: only --model VALUE, --reasoning-effort VALUE and Copilot's
+permission flags (--allow-all, --yolo, --allow-all-tools, --allow-all-paths,
+--allow-all-urls) are supported.
 Native UI /diff, /cwd, ! shell and @attachment remain LOCAL HOST operations.
 Do not use UI workspace/session switching in native mode; relaunch instead.
 

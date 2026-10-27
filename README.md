@@ -23,7 +23,7 @@ gh copilot-codespace --remote-native -c my-codespace-name \
 
 Remote-native mode pins one initial Codespace. With `--no-codespace`, it skips the picker, resolves the current checkout's GitHub repository (or `--create-repo OWNER/REPO`), chooses the smallest available machine, and creates a **new** Codespace with the repository's default branch and devcontainer explicitly supplied to avoid interactive selection. If no default devcontainer is reported, it chooses the first available path in lexical order; if none exist, GitHub's built-in default is used. It never skips a permissions review: if creation requires additional permissions, the launcher opens GitHub's review page in your browser; approve there, then rerun the command. It waits for SSH readiness and connects before Copilot starts. Creation does not copy uncommitted local changes into the Codespace or delete the Codespace when the session ends. Outside remote-native mode, `--no-codespace` still starts without a connection. Additional Codespaces remain accessible through the explicit `remote_*` and lifecycle tools; attaching another target does not silently change the primary workspace. The ordinary `view`, `edit`, `create`, `apply_patch`, `rg`, `glob`, `bash`, and bash-session tools use the existing daemon/SSH backend. Their paths and default cwd stay within the pinned startup workdir; use explicit `remote_*` tools for other remote paths. Remote failures are reported, never retried against the local checkout.
 
-Only `--model` and `--reasoning-effort` are forwarded in this mode. Conversation resume, arbitrary CLI flags, and UI workspace/session switching are not supported; relaunch for a different workspace. Legacy argument forwarding is unchanged.
+Only `--model`, `--reasoning-effort`, and Copilot's valueless permission flags (`--allow-all`, `--yolo`, `--allow-all-tools`, `--allow-all-paths`, `--allow-all-urls`) are forwarded in this mode. Conversation resume, arbitrary CLI flags, and UI workspace/session switching are not supported; relaunch for a different workspace. Legacy argument forwarding is unchanged.
 
 The stock CLI still runs locally, in a separate non-repository **host directory** rather than the caller's source checkout. Local MCP servers remain local; their configuration is not replaced, and local credentials are not bulk-forwarded to the Codespace. Repository reads, edits, Git commands, builds, and tests belong to the remote backend. This is not a source mirror or automatic synchronization system.
 
@@ -63,7 +63,7 @@ This is not a clean-room host profile. Local MCP servers and other configured ho
 - Native `/cwd`, `/diff`, `/ide`, worktree commands, `!` shell escapes, and `@` file attachments remain host-side surfaces, not remote equivalents. Hiding navigation does not disable their commands. Do not use them for Codespace repository work.
 - A local path shown in a host dialog or session history is not remote context. Use the explicitly labeled remote status, `list_codespaces`, `remote_cwd`, and remote Git commands for remote information; the ordinary tools remain pinned to their startup workdir even after an explicit `remote_cd`.
 - Tool overrides do not by themselves prove subagent routing. Keep subagent work on the supplied remote tools and verify the target in runtime evidence.
-- Normal permission and trust prompts remain enabled. Local filesystem sandbox rules do not automatically become a remote shell sandbox.
+- Normal permission and trust prompts remain enabled unless you explicitly pass Copilot's `--allow-all`/`--yolo` (or a granular `--allow-all-*`) flag, which then applies to the Codespace-backed tools too. Local filesystem sandbox rules do not automatically become a remote shell sandbox.
 - If the extension fails to load or its backend is unavailable, stop repository work rather than using stock local tools as a substitute.
 
 There is no supported extension API here for relabeling every stock UI surface as a remote repository. These limitations are explicit rather than hidden through patches to Copilot internals. Default launcher behavior remains available without `--remote-native`.
@@ -179,6 +179,9 @@ gh copilot-codespace --selected-only
 # Forward Copilot CLI arguments directly
 gh copilot-codespace -c my-codespace-name --resume <copilot-session>
 gh copilot-codespace --model claude-sonnet-4.5
+
+# Remote-native without approval prompts (Copilot's --allow-all / --yolo)
+gh copilot-codespace --remote-native -c my-codespace-name --yolo
 ```
 
 `--prompt` starts an interactive Copilot session and submits the prompt immediately; add `--autopilot` for autonomous continuation while retaining normal tool approvals. This is different from Copilot's `-p`, which runs non-interactively; use `-- -p "text"` to forward that option in default mode. The same startup flags work with `--remote-native -c NAME` and `--remote-native --no-codespace`. In the default mode, other arguments not consumed by this launcher are forwarded directly to Copilot. In particular, `--resume` is Copilot's conversation-resume option. Remote-native mode restricts arguments that would restore or redirect local workspace context.

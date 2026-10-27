@@ -31,6 +31,16 @@ func launcherPathArg(args []string, index *int, flag string) (string, error) {
 	return "", fmt.Errorf("%s requires an absolute path", flag)
 }
 
+// Copilot's own boolean permission flags are user opt-ins that do not change
+// workspace context, so remote-native forwards them unchanged.
+var remoteNativePermissionFlags = map[string]bool{
+	"--allow-all":       true,
+	"--yolo":            true,
+	"--allow-all-tools": true,
+	"--allow-all-paths": true,
+	"--allow-all-urls":  true,
+}
+
 func validateRemoteNativeOptions(opts launcherOptions) error {
 	if opts.createRepo != "" {
 		owner, repo, ok := strings.Cut(opts.createRepo, "/")
@@ -58,9 +68,12 @@ func validateRemoteNativeOptions(opts launcherOptions) error {
 	}
 	for i := 0; i < len(opts.copilotArgs); i++ {
 		arg := opts.copilotArgs[i]
+		if remoteNativePermissionFlags[arg] {
+			continue
+		}
 		name, value, equals := strings.Cut(arg, "=")
 		if name != "--model" && name != "--reasoning-effort" {
-			return fmt.Errorf("--remote-native does not support forwarded argument %q; only --model and --reasoning-effort are supported", arg)
+			return fmt.Errorf("--remote-native does not support forwarded argument %q; only --model, --reasoning-effort, --allow-all, --yolo, --allow-all-tools, --allow-all-paths and --allow-all-urls are supported", arg)
 		}
 		if !equals {
 			if i+1 >= len(opts.copilotArgs) || strings.HasPrefix(opts.copilotArgs[i+1], "-") {

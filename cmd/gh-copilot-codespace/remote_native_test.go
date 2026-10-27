@@ -44,7 +44,10 @@ func TestRemoteNativeArgs(t *testing.T) {
 		{"--remote-native", "--", "--session-id", "old"},
 		{"--remote-native", "--", "--add-dir=/source"},
 		{"--remote-native", "--", "--available-tools", "builtin:*"},
-		{"--remote-native", "--", "--allow-all-tools"},
+		{"--remote-native", "--", "--allow-all=false"},
+		{"--remote-native", "--", "--yolo=true"},
+		{"--remote-native", "--", "--allow-tool", "shell"},
+		{"--remote-native", "--", "--allow-url=github.com"},
 		{"--remote-native", "--", "-p", "run"},
 		{"--remote-native", "--", "--agent=local"},
 		{"--remote-native", "--", "--plugin-dir=/local"},
@@ -336,6 +339,25 @@ func TestRemoteNativeAutopilotPrompt(t *testing.T) {
 	want := []string{"--available-tools", "custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "builtin:task_complete", "--no-custom-instructions", "--model", "auto", "--autopilot", "--interactive=Inspect the remote workspace"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("native startup args = %q, want %q", got, want)
+	}
+}
+
+func TestRemoteNativeForwardsPermissionFlags(t *testing.T) {
+	for _, flag := range []string{"--allow-all", "--yolo", "--allow-all-tools", "--allow-all-paths", "--allow-all-urls"} {
+		for _, args := range [][]string{
+			{"--remote-native", "-c", "one", flag, "--model", "auto"},
+			{"--remote-native", "-c", "one", "--", flag, "--model", "auto"},
+		} {
+			opts, err := parseLauncherArgs(args)
+			if err != nil {
+				t.Fatalf("parseLauncherArgs(%q) error = %v", args, err)
+			}
+			got := remoteNativeCopilotArgs(launcherCopilotArgs(opts))
+			want := []string{"--available-tools", "custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "builtin:task_complete", "--no-custom-instructions", flag, "--model", "auto"}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("native startup args for %q = %q, want %q", args, got, want)
+			}
+		}
 	}
 }
 

@@ -24,7 +24,7 @@ The single Go binary operates in four modes:
    - `--remote-native` instead uses a non-repository local host directory, pins ordinary source tools to one initial Codespace, and disables host Git context and ambient native skills.
    - Native launches scope UI settings with a private `COPILOT_HOME` profile, hide local Git/cwd/navigation indicators, and retain host MCP, model/context/usage and permission preferences without rewriting global settings.
    - Installs the stable user-scoped extension, creates a token-protected per-session manifest, and execs Copilot.
-   - Default mode forwards unconsumed arguments, including Copilot's `--resume`; remote-native mode rejects context-changing arguments it cannot safely support.
+   - Default mode forwards unconsumed arguments, including Copilot's `--resume`; remote-native mode rejects context-changing arguments it cannot safely support and forwards only `--model`, `--reasoning-effort`, and the user's explicit valueless Copilot permission flags (`--allow-all`, `--yolo`, `--allow-all-tools|paths|urls`).
    - Falls back to `gh copilot` when the standalone `copilot` binary is unavailable.
 
 2. **Exec agent** (`gh-copilot-codespace exec`) — `cmd/gh-copilot-codespace/exec.go`
