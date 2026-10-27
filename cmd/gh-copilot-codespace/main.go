@@ -42,6 +42,8 @@ Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 Flags:
   -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
       --no-codespace     Start without connecting to any codespace (skip picker)
+      --prompt TEXT      Start an interactive session and submit this prompt
+      --autopilot        Start Copilot in Autopilot mode (combine with --prompt)
       --selected-only[=BOOL]
                          Limit the agent to codespaces selected at startup
       --remote-native    Opt in to pinned remote workspace tools (one initial codespace)
@@ -289,6 +291,8 @@ type launcherOptions struct {
 	noCodespace    bool
 	selectedOnly   optionalBool
 	copilotArgs    []string
+	prompt         string
+	autopilot      bool
 	remoteNative   bool
 	skillRoots     []string
 	artifactDir    string
@@ -342,6 +346,17 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 		switch {
 		case args[i] == "--remote-native":
 			opts.remoteNative = true
+		case args[i] == "--autopilot":
+			opts.autopilot = true
+		case args[i] == "--prompt" || strings.HasPrefix(args[i], "--prompt="):
+			if opts.prompt != "" {
+				return launcherOptions{}, fmt.Errorf("--prompt may only be specified once")
+			}
+			value, err := launcherPromptArg(args, &i)
+			if err != nil {
+				return launcherOptions{}, err
+			}
+			opts.prompt = value
 		case args[i] == "--skill-root" || strings.HasPrefix(args[i], "--skill-root="):
 			value, err := launcherPathArg(args, &i, "--skill-root")
 			if err != nil {
@@ -385,11 +400,45 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 	if opts.noCodespace && len(opts.codespaceNames) > 0 {
 		return launcherOptions{}, fmt.Errorf("--no-codespace and --codespace are mutually exclusive")
 	}
+	if opts.prompt != "" {
+		for _, arg := range opts.copilotArgs {
+			if arg == "-i" || arg == "-p" || arg == "--interactive" || arg == "--prompt" ||
+				strings.HasPrefix(arg, "--interactive=") || strings.HasPrefix(arg, "--prompt=") {
+				return launcherOptions{}, fmt.Errorf("launcher --prompt cannot be combined with a forwarded Copilot prompt")
+			}
+		}
+	}
 	if err := validateRemoteNativeOptions(opts); err != nil {
 		return launcherOptions{}, err
 	}
 
 	return opts, nil
+}
+
+func launcherPromptArg(args []string, index *int) (string, error) {
+	value := strings.TrimPrefix(args[*index], "--prompt=")
+	if args[*index] == "--prompt" {
+		if *index+1 >= len(args) || strings.HasPrefix(args[*index+1], "-") {
+			return "", fmt.Errorf("--prompt requires a non-empty prompt")
+		}
+		*index++
+		value = args[*index]
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("--prompt requires a non-empty prompt")
+	}
+	return value, nil
+}
+
+func launcherCopilotArgs(opts launcherOptions) []string {
+	args := buildCopilotArgs(opts.copilotArgs)
+	if opts.autopilot {
+		args = append(args, "--autopilot")
+	}
+	if opts.prompt != "" {
+		args = append(args, "--interactive="+opts.prompt)
+	}
+	return args
 }
 
 func resolveLaunchContext(originalCWD string) launchContext {
@@ -548,10 +597,11 @@ func runLauncher(args []string) error {
 	fmt.Printf("\n")
 
 	// Exec copilot
+	copilotArgs := launcherCopilotArgs(opts)
 	if opts.remoteNative {
-		return execCopilot(remoteNativeCopilotArgs(opts.copilotArgs))
+		return execCopilot(remoteNativeCopilotArgs(copilotArgs))
 	}
-	return execCopilot(opts.copilotArgs)
+	return execCopilot(copilotArgs)
 }
 
 func prepareLaunchDirectory(dir string) error {

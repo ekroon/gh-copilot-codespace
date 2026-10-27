@@ -99,6 +99,7 @@ if (scenario === "legacy") {
 if (config.enableSkills !== false || config.skipCustomInstructions !== true ||
     config.enableHostGitOperations !== false || config.enableFileHooks !== false ||
     config.enableOnDemandInstructionDiscovery !== false) throw new Error("native settings missing");
+if (JSON.stringify(config.availableTools) !== '["custom:*","mcp:*","builtin:task","builtin:ask_user","builtin:task_complete"]') throw new Error("native completion tool unavailable");
 if ("enableConfigDiscovery" in config || "onPermissionRequest" in config) throw new Error("MCP or permissions overridden");
 if (scenario === "ready" || scenario === "hostExit") {
   if (!logs.some(entry => entry.message.includes("LOCAL HOST folder: /host") && entry.message.includes("remote alias: pinned") && entry.message.includes("branch: topic"))) throw new Error("missing source identity status");

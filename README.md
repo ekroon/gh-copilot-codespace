@@ -144,6 +144,8 @@ go build -o gh-copilot-codespace ./cmd/gh-copilot-codespace
 
 ## Quick start
 
+<sub>🤖 Startup examples drafted with AI assistance</sub>
+
 ```bash
 # Interactive picker (select zero, one, or many)
 gh copilot-codespace
@@ -157,6 +159,12 @@ gh copilot-codespace -c codespace-1,codespace-2
 # Start without a Codespace, then create or connect from the agent
 gh copilot-codespace --no-codespace
 
+# Connect to a Codespace and run an initial prompt in interactive Autopilot mode
+gh copilot-codespace -c my-codespace-name --autopilot --prompt "Inspect the remote workspace"
+
+# Start without a Codespace and let the initial prompt connect one
+gh copilot-codespace --no-codespace --autopilot --prompt "Connect to my Codespace and inspect it"
+
 # Limit the agent to the Codespaces selected at startup
 gh copilot-codespace --selected-only
 
@@ -165,7 +173,7 @@ gh copilot-codespace -c my-codespace-name --resume <copilot-session>
 gh copilot-codespace --model claude-sonnet-4.5
 ```
 
-In the default mode, arguments not consumed by this launcher are forwarded directly to Copilot. In particular, `--resume` is Copilot's conversation-resume option. Remote-native mode restricts arguments that would restore or redirect local workspace context.
+`--prompt` starts an interactive Copilot session and submits the prompt immediately; add `--autopilot` for autonomous continuation while retaining normal tool approvals. This is different from Copilot's `-p`, which runs non-interactively; use `-- -p "text"` to forward that option in default mode. The same startup flags work with `--remote-native -c NAME`. In the default mode, other arguments not consumed by this launcher are forwarded directly to Copilot. In particular, `--resume` is Copilot's conversation-resume option. Remote-native mode restricts arguments that would restore or redirect local workspace context.
 
 If neither `-c/--codespace` nor `--no-codespace` is supplied, the interactive picker supports multiple selections. Press Enter without selecting a Codespace to launch with none connected. The agent can then use `list_available_codespaces`, `get_codespace_options`, `create_codespace`, or `connect_codespace`.
 

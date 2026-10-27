@@ -58,7 +58,19 @@ func TestRemoteNativeArgs(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := remoteNativeCopilotArgs([]string{"--model", "test"})
-	want := []string{"--available-tools", "custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "--no-custom-instructions", "--model", "test"}
+	want := []string{"--available-tools", "custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "builtin:task_complete", "--no-custom-instructions", "--model", "test"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("native startup args = %q, want %q", got, want)
+	}
+}
+
+func TestRemoteNativeAutopilotPrompt(t *testing.T) {
+	opts, err := parseLauncherArgs([]string{"--remote-native", "-c", "one", "--prompt", "Inspect the remote workspace", "--autopilot", "--model", "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := remoteNativeCopilotArgs(launcherCopilotArgs(opts))
+	want := []string{"--available-tools", "custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "builtin:task_complete", "--no-custom-instructions", "--model", "auto", "--autopilot", "--interactive=Inspect the remote workspace"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("native startup args = %q, want %q", got, want)
 	}

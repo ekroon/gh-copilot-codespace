@@ -80,7 +80,7 @@ func validateRemoteNativeSelection(opts launcherOptions, selected []codespace) e
 // extension cannot expose built-in file/search/shell tools as a fallback.
 // MCP/custom tools are deliberately retained, not claimed to be sandboxed.
 func remoteNativeCopilotArgs(extra []string) []string {
-	return append([]string{"--available-tools", "custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "--no-custom-instructions"}, extra...)
+	return append([]string{"--available-tools", "custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "builtin:task_complete", "--no-custom-instructions"}, extra...)
 }
 
 func prepareRemoteNativeLaunch(self string, reg *registry.Registry, cfg mcp.LifecycleConfig, opts launcherOptions) (extensionLaunch, error) {

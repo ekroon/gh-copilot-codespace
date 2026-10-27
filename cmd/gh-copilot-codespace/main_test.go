@@ -287,6 +287,51 @@ func TestParseLauncherArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "start without codespace in autopilot with prompt",
+			args: []string{"--no-codespace", "--autopilot", "--prompt", "Inspect the workspace"},
+			want: launcherOptions{
+				noCodespace: true,
+				autopilot:   true,
+				prompt:      "Inspect the workspace",
+			},
+		},
+		{
+			name: "start connected with an equals-form prompt",
+			args: []string{"-c", "cs-1", "--prompt=Check the remote repository"},
+			want: launcherOptions{
+				codespaceNames: []string{"cs-1"},
+				prompt:         "Check the remote repository",
+			},
+		},
+		{
+			name: "explicit separator leaves Copilot prompt arguments alone",
+			args: []string{"--no-codespace", "--", "-p", "one-shot"},
+			want: launcherOptions{
+				noCodespace: true,
+				copilotArgs: []string{"-p", "one-shot"},
+			},
+		},
+		{
+			name:    "rejects missing prompt",
+			args:    []string{"--no-codespace", "--prompt"},
+			wantErr: "--prompt requires a non-empty prompt",
+		},
+		{
+			name:    "rejects empty prompt",
+			args:    []string{"--prompt=  "},
+			wantErr: "--prompt requires a non-empty prompt",
+		},
+		{
+			name:    "rejects duplicate prompt",
+			args:    []string{"--prompt", "one", "--prompt", "two"},
+			wantErr: "--prompt may only be specified once",
+		},
+		{
+			name:    "rejects competing Copilot prompt",
+			args:    []string{"--prompt", "interactive", "--", "-p", "one-shot"},
+			wantErr: "launcher --prompt cannot be combined with a forwarded Copilot prompt",
+		},
+		{
 			name:    "no-codespace conflicts with explicit codespace",
 			args:    []string{"--no-codespace", "--codespace", "cs-1"},
 			wantErr: "--no-codespace and --codespace are mutually exclusive",
@@ -410,6 +455,43 @@ func TestBuildCopilotArgs(t *testing.T) {
 		if slicesContain(got, obsolete) {
 			t.Fatalf("buildCopilotArgs() unexpectedly contains %q: %v", obsolete, got)
 		}
+	}
+}
+
+func TestLauncherCopilotArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		opts launcherOptions
+		want []string
+	}{
+		{
+			name: "connected interactive autopilot",
+			opts: launcherOptions{copilotArgs: []string{"--model", "auto"}, prompt: "Check remote tools", autopilot: true},
+			want: []string{"--model", "auto", "--autopilot", "--interactive=Check remote tools"},
+		},
+		{
+			name: "prompt without autopilot remains interactive",
+			opts: launcherOptions{prompt: "Check remote tools"},
+			want: []string{"--interactive=Check remote tools"},
+		},
+		{
+			name: "autopilot without a prompt",
+			opts: launcherOptions{autopilot: true},
+			want: []string{"--autopilot"},
+		},
+		{
+			name: "normal launcher unchanged",
+			opts: launcherOptions{copilotArgs: []string{"--resume", "session"}},
+			want: []string{"--resume", "session"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := launcherCopilotArgs(tt.opts)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("launcherCopilotArgs() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

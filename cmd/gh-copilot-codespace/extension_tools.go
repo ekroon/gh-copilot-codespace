@@ -456,7 +456,7 @@ function nativeSessionOptions() {
     enableHostGitOperations: false,
     enableOnDemandInstructionDiscovery: false,
     enableFileHooks: false,
-    availableTools: ["custom:*", "mcp:*", "builtin:task", "builtin:ask_user"],
+    availableTools: ["custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "builtin:task_complete"],
   };
 }
 
