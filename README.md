@@ -4,8 +4,16 @@ Launch Copilot CLI with tools for working on GitHub Codespaces over SSH. The def
 
 ## Remote-native mode
 
+<sub>🤖 Remote-native startup guidance drafted with AI assistance</sub>
+
 ```bash
 gh copilot-codespace --remote-native -c my-codespace-name
+
+# Create a fresh Codespace for the current GitHub repository, then pin it.
+gh copilot-codespace --remote-native --no-codespace
+
+# Or create one for a different repository.
+gh copilot-codespace --remote-native --no-codespace --create-repo github/graph-hopper
 
 # Skills are explicit REMOTE directories, not ambient local skill sources.
 gh copilot-codespace --remote-native -c my-codespace-name \
@@ -13,7 +21,7 @@ gh copilot-codespace --remote-native -c my-codespace-name \
   --artifact-dir /absolute/local/output-directory
 ```
 
-Remote-native mode requires one initial Codespace and pins ordinary source and command tools to it. Additional Codespaces remain accessible through the explicit `remote_*` and lifecycle tools; attaching another target does not silently change the primary workspace. The ordinary `view`, `edit`, `create`, `apply_patch`, `rg`, `glob`, `bash`, and bash-session tools use the existing daemon/SSH backend. Their paths and default cwd stay within the pinned startup workdir; use explicit `remote_*` tools for other remote paths. Remote failures are reported, never retried against the local checkout.
+Remote-native mode pins one initial Codespace. With `--no-codespace`, it skips the picker, resolves the current checkout's GitHub repository (or `--create-repo OWNER/REPO`), chooses the smallest available machine, creates a **new** Codespace on its default branch, waits for SSH readiness, and connects it before Copilot starts. Creation does not copy uncommitted local changes into the Codespace or delete the Codespace when the session ends. Outside remote-native mode, `--no-codespace` still starts without a connection. Additional Codespaces remain accessible through the explicit `remote_*` and lifecycle tools; attaching another target does not silently change the primary workspace. The ordinary `view`, `edit`, `create`, `apply_patch`, `rg`, `glob`, `bash`, and bash-session tools use the existing daemon/SSH backend. Their paths and default cwd stay within the pinned startup workdir; use explicit `remote_*` tools for other remote paths. Remote failures are reported, never retried against the local checkout.
 
 Only `--model` and `--reasoning-effort` are forwarded in this mode. Conversation resume, arbitrary CLI flags, and UI workspace/session switching are not supported; relaunch for a different workspace. Legacy argument forwarding is unchanged.
 
@@ -173,7 +181,7 @@ gh copilot-codespace -c my-codespace-name --resume <copilot-session>
 gh copilot-codespace --model claude-sonnet-4.5
 ```
 
-`--prompt` starts an interactive Copilot session and submits the prompt immediately; add `--autopilot` for autonomous continuation while retaining normal tool approvals. This is different from Copilot's `-p`, which runs non-interactively; use `-- -p "text"` to forward that option in default mode. The same startup flags work with `--remote-native -c NAME`. In the default mode, other arguments not consumed by this launcher are forwarded directly to Copilot. In particular, `--resume` is Copilot's conversation-resume option. Remote-native mode restricts arguments that would restore or redirect local workspace context.
+`--prompt` starts an interactive Copilot session and submits the prompt immediately; add `--autopilot` for autonomous continuation while retaining normal tool approvals. This is different from Copilot's `-p`, which runs non-interactively; use `-- -p "text"` to forward that option in default mode. The same startup flags work with `--remote-native -c NAME` and `--remote-native --no-codespace`. In the default mode, other arguments not consumed by this launcher are forwarded directly to Copilot. In particular, `--resume` is Copilot's conversation-resume option. Remote-native mode restricts arguments that would restore or redirect local workspace context.
 
 If neither `-c/--codespace` nor `--no-codespace` is supplied, the interactive picker supports multiple selections. Press Enter without selecting a Codespace to launch with none connected. The agent can then use `list_available_codespaces`, `get_codespace_options`, `create_codespace`, or `connect_codespace`.
 

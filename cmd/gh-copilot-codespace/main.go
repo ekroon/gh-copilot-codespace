@@ -41,7 +41,9 @@ Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 
 Flags:
   -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
-      --no-codespace     Start without connecting to any codespace (skip picker)
+      --no-codespace     Skip picker; with --remote-native create a new Codespace
+      --create-repo OWNER/REPO
+                         Repository for native --no-codespace (default: current repo)
       --prompt TEXT      Start an interactive session and submit this prompt
       --autopilot        Start Copilot in Autopilot mode (combine with --prompt)
       --selected-only[=BOOL]
@@ -289,6 +291,7 @@ func registryFromEntries(ctx context.Context, entries []registryEntry, build fun
 type launcherOptions struct {
 	codespaceNames []string
 	noCodespace    bool
+	createRepo     string
 	selectedOnly   optionalBool
 	copilotArgs    []string
 	prompt         string
@@ -383,6 +386,12 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 			return launcherOptions{}, fmt.Errorf("--name is no longer supported")
 		case args[i] == "--no-codespace":
 			opts.noCodespace = true
+		case args[i] == "--create-repo" || strings.HasPrefix(args[i], "--create-repo="):
+			value, err := launcherValueArg(args, &i, "--create-repo")
+			if err != nil {
+				return launcherOptions{}, err
+			}
+			opts.createRepo = value
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
 			// Support comma-separated: -c cs1,cs2
 			for _, name := range strings.Split(args[i+1], ",") {
@@ -426,6 +435,21 @@ func launcherPromptArg(args []string, index *int) (string, error) {
 	}
 	if strings.TrimSpace(value) == "" {
 		return "", fmt.Errorf("--prompt requires a non-empty prompt")
+	}
+	return value, nil
+}
+
+func launcherValueArg(args []string, index *int, flag string) (string, error) {
+	value := strings.TrimPrefix(args[*index], flag+"=")
+	if args[*index] == flag {
+		if *index+1 >= len(args) || strings.HasPrefix(args[*index+1], "-") {
+			return "", fmt.Errorf("%s requires a value", flag)
+		}
+		*index++
+		value = args[*index]
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s requires a value", flag)
 	}
 	return value, nil
 }
@@ -501,21 +525,9 @@ func runLauncher(args []string) error {
 		return fmt.Errorf("finding executable: %w", err)
 	}
 
-	// Select codespace(s): use --codespace flag(s) or interactive picker
-	var selectedList []codespace
-	if len(opts.codespaceNames) > 0 {
-		for _, name := range opts.codespaceNames {
-			cs, err := lookupCodespace(name)
-			if err != nil {
-				return fmt.Errorf("codespace %q: %w", name, err)
-			}
-			selectedList = append(selectedList, cs)
-		}
-	} else if !opts.noCodespace {
-		selectedList, err = selectCodespaces()
-		if err != nil {
-			return err
-		}
+	selectedList, err := selectLauncherCodespaces(opts)
+	if err != nil {
+		return err
 	}
 	if err := validateSelectedOnlySelection(opts, selectedList); err != nil {
 		return err
@@ -602,6 +614,61 @@ func runLauncher(args []string) error {
 		return execCopilot(remoteNativeCopilotArgs(copilotArgs))
 	}
 	return execCopilot(copilotArgs)
+}
+
+func selectLauncherCodespaces(opts launcherOptions) ([]codespace, error) {
+	if len(opts.codespaceNames) > 0 {
+		var selectedList []codespace
+		for _, name := range opts.codespaceNames {
+			cs, err := lookupCodespace(name)
+			if err != nil {
+				return nil, fmt.Errorf("codespace %q: %w", name, err)
+			}
+			selectedList = append(selectedList, cs)
+		}
+		return selectedList, nil
+	}
+	if opts.remoteNative && opts.noCodespace {
+		repo := opts.createRepo
+		if repo == "" {
+			repoOutput, err := exec.Command("gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner").Output()
+			if err != nil {
+				return nil, fmt.Errorf("identifying current GitHub repository for new Codespace: %w", err)
+			}
+			repo = strings.TrimSpace(string(repoOutput))
+			if repo == "" {
+				return nil, fmt.Errorf("current GitHub repository is empty; launch from a repository checkout")
+			}
+		}
+		machineOutput, err := exec.Command("gh", "api", "repos/"+repo+"/codespaces/machines", "--jq",
+			".machines | sort_by(.cpus, .memory_in_bytes, .storage_in_bytes) | .[0].name").Output()
+		if err != nil {
+			return nil, fmt.Errorf("listing Codespace machines for %s: %w", repo, err)
+		}
+		machine := strings.TrimSpace(string(machineOutput))
+		if machine == "" || machine == "null" {
+			return nil, fmt.Errorf("no Codespace machines available for %s", repo)
+		}
+		fmt.Printf("Creating new Codespace for %s (machine: %s)...\n", repo, machine)
+		nameOutput, err := exec.Command("gh", "codespace", "create", "-R", repo, "-m", machine).Output()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return nil, fmt.Errorf("creating Codespace for %s: %w: %s", repo, err, strings.TrimSpace(string(exitErr.Stderr)))
+			}
+			return nil, fmt.Errorf("creating Codespace for %s: %w", repo, err)
+		}
+		name := strings.TrimSpace(string(nameOutput))
+		if name == "" {
+			return nil, fmt.Errorf("creating Codespace for %s returned no name", repo)
+		}
+		fmt.Printf("Created Codespace %s; waiting for SSH readiness...\n", name)
+		return []codespace{{Name: name, DisplayName: name, Repository: repo}}, nil
+	}
+	if opts.noCodespace {
+		return nil, nil
+	}
+	return selectCodespaces()
 }
 
 func prepareLaunchDirectory(dir string) error {

@@ -26,11 +26,15 @@ func TestRemoteNativeArgs(t *testing.T) {
 	for _, args := range [][]string{
 		{"--skill-root", "/skills"},
 		{"--artifact-dir", "/tmp/artifacts"},
+		{"--create-repo", "github/graph-hopper"},
+		{"--remote-native", "--create-repo", "github/graph-hopper"},
+		{"--remote-native", "-c", "one", "--create-repo", "github/graph-hopper"},
+		{"--remote-native", "--no-codespace", "--create-repo", "invalid"},
+		{"--remote-native", "--no-codespace", "--create-repo"},
 		{"--remote-native", "--skill-root", "relative"},
 		{"--remote-native", "--artifact-dir", "relative"},
 		{"--remote-native", "--skill-root"},
 		{"--remote-native", "--artifact-dir"},
-		{"--remote-native", "--no-codespace"},
 		{"--remote-native", "-c", "one,two"},
 		{"--remote-native", "--", "-C", "/source"},
 		{"--remote-native", "--", "-C/source"},
@@ -57,10 +61,98 @@ func TestRemoteNativeArgs(t *testing.T) {
 	if err := validateRemoteNativeSelection(launcherOptions{remoteNative: true}, []codespace{{Name: "one"}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := validateRemoteNativeSelection(launcherOptions{remoteNative: true, noCodespace: true}, nil); err == nil {
+		t.Fatal("accepted a native session without a connected Codespace")
+	}
 	got := remoteNativeCopilotArgs([]string{"--model", "test"})
 	want := []string{"--available-tools", "custom:*", "mcp:*", "builtin:task", "builtin:ask_user", "builtin:task_complete", "--no-custom-instructions", "--model", "test"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("native startup args = %q, want %q", got, want)
+	}
+}
+
+func TestRemoteNativeNoCodespaceCreatesInitialTarget(t *testing.T) {
+	bin := t.TempDir()
+	log := filepath.Join(bin, "gh-args")
+	t.Setenv("GH_TEST_LOG", log)
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$GH_TEST_LOG"
+case "$*" in
+  "repo view --json nameWithOwner --jq .nameWithOwner") echo owner/repo ;;
+  "api repos/owner/repo/codespaces/machines --jq "*) echo basicLinux32gb ;;
+  "codespace create -R owner/repo -m basicLinux32gb") echo newly-created ;;
+  *) exit 1 ;;
+esac
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	opts, err := parseLauncherArgs([]string{"--remote-native", "--no-codespace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := selectLauncherCodespaces(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(selected, []codespace{{Name: "newly-created", DisplayName: "newly-created", Repository: "owner/repo"}}) {
+		t.Fatalf("selected = %+v", selected)
+	}
+	if err := validateRemoteNativeSelection(opts, selected); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(calls), "repo view --json nameWithOwner --jq .nameWithOwner\napi repos/owner/repo/codespaces/machines --jq ") ||
+		!strings.HasSuffix(string(calls), "\ncodespace create -R owner/repo -m basicLinux32gb\n") {
+		t.Fatalf("gh calls = %q", calls)
+	}
+	legacy, err := selectLauncherCodespaces(launcherOptions{noCodespace: true})
+	if err != nil || len(legacy) != 0 {
+		t.Fatalf("default no-codespace selected %v: %v", legacy, err)
+	}
+}
+
+func TestRemoteNativeNoCodespaceExplicitRepository(t *testing.T) {
+	bin := t.TempDir()
+	log := filepath.Join(bin, "gh-args")
+	t.Setenv("GH_TEST_LOG", log)
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$GH_TEST_LOG"
+case "$*" in
+  "api repos/github/graph-hopper/codespaces/machines --jq "*) echo premiumLinux32gb ;;
+  "codespace create -R github/graph-hopper -m premiumLinux32gb") echo newly-created ;;
+  *) exit 1 ;;
+esac
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	opts, err := parseLauncherArgs([]string{"--remote-native", "--no-codespace", "--create-repo", "github/graph-hopper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := selectLauncherCodespaces(opts)
+	if err != nil || !reflect.DeepEqual(selected, []codespace{{Name: "newly-created", DisplayName: "newly-created", Repository: "github/graph-hopper"}}) {
+		t.Fatalf("selected = %+v, error = %v", selected, err)
+	}
+	calls, err := os.ReadFile(log)
+	if err != nil || !strings.HasPrefix(string(calls), "api repos/github/graph-hopper/codespaces/machines --jq ") ||
+		!strings.HasSuffix(string(calls), "\ncodespace create -R github/graph-hopper -m premiumLinux32gb\n") {
+		t.Fatalf("gh calls = %q, error = %v", calls, err)
+	}
+}
+
+func TestRemoteNativeNoCodespaceRequiresRepository(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\nprintf '\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	if _, err := selectLauncherCodespaces(launcherOptions{remoteNative: true, noCodespace: true}); err == nil || !strings.Contains(err.Error(), "current GitHub repository") {
+		t.Fatalf("missing repository error = %v", err)
 	}
 }
 

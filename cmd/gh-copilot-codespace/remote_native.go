@@ -32,13 +32,20 @@ func launcherPathArg(args []string, index *int, flag string) (string, error) {
 }
 
 func validateRemoteNativeOptions(opts launcherOptions) error {
+	if opts.createRepo != "" {
+		owner, repo, ok := strings.Cut(opts.createRepo, "/")
+		if !opts.remoteNative || !opts.noCodespace || !ok || owner == "" || repo == "" ||
+			strings.ContainsAny(opts.createRepo, " \t\r\n") || strings.Contains(repo, "/") {
+			return fmt.Errorf("--create-repo requires --remote-native --no-codespace and OWNER/REPO")
+		}
+	}
 	if !opts.remoteNative {
 		if len(opts.skillRoots) > 0 || opts.artifactDir != "" {
 			return fmt.Errorf("--skill-root and --artifact-dir require --remote-native")
 		}
 		return nil
 	}
-	if opts.noCodespace || len(opts.codespaceNames) > 1 {
+	if len(opts.codespaceNames) > 1 {
 		return fmt.Errorf("--remote-native requires exactly one initially selected codespace")
 	}
 	for _, root := range opts.skillRoots {
