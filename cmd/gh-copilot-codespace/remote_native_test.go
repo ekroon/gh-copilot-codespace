@@ -79,8 +79,10 @@ func TestRemoteNativeNoCodespaceCreatesInitialTarget(t *testing.T) {
 printf '%s\n' "$*" >> "$GH_TEST_LOG"
 case "$*" in
   "repo view --json nameWithOwner --jq .nameWithOwner") echo owner/repo ;;
+  "api repos/owner/repo --jq .default_branch") echo main ;;
   "api repos/owner/repo/codespaces/machines --jq "*) echo basicLinux32gb ;;
-  "codespace create -R owner/repo -m basicLinux32gb") echo newly-created ;;
+  "api repos/owner/repo/codespaces/new --jq .defaults.devcontainer_path") echo .devcontainer/devcontainer.json ;;
+  "codespace create -R owner/repo -b main -m basicLinux32gb --devcontainer-path .devcontainer/devcontainer.json") echo newly-created ;;
   *) exit 1 ;;
 esac
 `), 0o700); err != nil {
@@ -105,8 +107,8 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(calls), "repo view --json nameWithOwner --jq .nameWithOwner\napi repos/owner/repo/codespaces/machines --jq ") ||
-		!strings.HasSuffix(string(calls), "\ncodespace create -R owner/repo -m basicLinux32gb\n") {
+	if !strings.HasPrefix(string(calls), "repo view --json nameWithOwner --jq .nameWithOwner\napi repos/owner/repo --jq .default_branch\napi repos/owner/repo/codespaces/machines --jq ") ||
+		!strings.HasSuffix(string(calls), "\ncodespace create -R owner/repo -b main -m basicLinux32gb --devcontainer-path .devcontainer/devcontainer.json\n") {
 		t.Fatalf("gh calls = %q", calls)
 	}
 	legacy, err := selectLauncherCodespaces(launcherOptions{noCodespace: true})
@@ -122,8 +124,10 @@ func TestRemoteNativeNoCodespaceExplicitRepository(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(`#!/bin/sh
 printf '%s\n' "$*" >> "$GH_TEST_LOG"
 case "$*" in
+  "api repos/github/graph-hopper --jq .default_branch") echo main ;;
   "api repos/github/graph-hopper/codespaces/machines --jq "*) echo premiumLinux32gb ;;
-  "codespace create -R github/graph-hopper -m premiumLinux32gb") echo newly-created ;;
+  "api repos/github/graph-hopper/codespaces/new --jq .defaults.devcontainer_path") echo .devcontainer/devcontainer.json ;;
+  "codespace create -R github/graph-hopper -b main -m premiumLinux32gb --devcontainer-path .devcontainer/devcontainer.json") echo newly-created ;;
   *) exit 1 ;;
 esac
 `), 0o700); err != nil {
@@ -139,9 +143,80 @@ esac
 		t.Fatalf("selected = %+v, error = %v", selected, err)
 	}
 	calls, err := os.ReadFile(log)
-	if err != nil || !strings.HasPrefix(string(calls), "api repos/github/graph-hopper/codespaces/machines --jq ") ||
-		!strings.HasSuffix(string(calls), "\ncodespace create -R github/graph-hopper -m premiumLinux32gb\n") {
+	if err != nil || !strings.HasPrefix(string(calls), "api repos/github/graph-hopper --jq .default_branch\napi repos/github/graph-hopper/codespaces/machines --jq ") ||
+		!strings.HasSuffix(string(calls), "\ncodespace create -R github/graph-hopper -b main -m premiumLinux32gb --devcontainer-path .devcontainer/devcontainer.json\n") {
 		t.Fatalf("gh calls = %q, error = %v", calls, err)
+	}
+}
+
+func TestRemoteNativeNoCodespaceSelectsDefaultDevcontainer(t *testing.T) {
+	bin := t.TempDir()
+	log := filepath.Join(bin, "gh-args")
+	t.Setenv("GH_TEST_LOG", log)
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$GH_TEST_LOG"
+case "$*" in
+  "api repos/github/github --jq .default_branch") echo master ;;
+  "api repos/github/github/codespaces/machines --jq "*) echo xLargePremiumLinux ;;
+  "api repos/github/github/codespaces/new --jq .defaults.devcontainer_path") echo .devcontainer/devcontainer.json ;;
+  "codespace create -R github/github -b master -m xLargePremiumLinux --devcontainer-path .devcontainer/devcontainer.json") echo newly-created ;;
+  *) exit 1 ;;
+esac
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	opts, err := parseLauncherArgs([]string{"--remote-native", "--autopilot", "--no-codespace", "--create-repo", "github/github", "--prompt", "Run to completion"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := selectLauncherCodespaces(opts)
+	if err != nil || len(selected) != 1 || selected[0].Repository != "github/github" {
+		t.Fatalf("selected = %+v, error = %v", selected, err)
+	}
+	calls, err := os.ReadFile(log)
+	if err != nil || !strings.Contains(string(calls), "codespace create -R github/github -b master -m xLargePremiumLinux --devcontainer-path .devcontainer/devcontainer.json\n") {
+		t.Fatalf("gh calls = %q, error = %v", calls, err)
+	}
+}
+
+func TestRemoteNativeNoCodespaceWithoutDefaultDevcontainer(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		available   string
+		createFlags string
+	}{
+		{name: "multiple configurations", available: ".devcontainer/first/devcontainer.json", createFlags: " --devcontainer-path .devcontainer/first/devcontainer.json"},
+		{name: "no configurations"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bin := t.TempDir()
+			log := filepath.Join(bin, "gh-args")
+			t.Setenv("GH_TEST_LOG", log)
+			t.Setenv("GH_TEST_AVAILABLE", tt.available)
+			if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$GH_TEST_LOG"
+case "$*" in
+  "api repos/owner/repo --jq .default_branch") echo main ;;
+  "api repos/owner/repo/codespaces/machines --jq "*) echo basicLinux32gb ;;
+  "api repos/owner/repo/codespaces/new --jq .defaults.devcontainer_path") echo null ;;
+  "api repos/owner/repo/codespaces/devcontainers --jq "*) printf '%s\n' "$GH_TEST_AVAILABLE" ;;
+  "codespace create -R owner/repo -b main -m basicLinux32gb"*) echo newly-created ;;
+  *) exit 1 ;;
+esac
+`), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin)
+			selected, err := selectLauncherCodespaces(launcherOptions{remoteNative: true, noCodespace: true, createRepo: "owner/repo"})
+			if err != nil || len(selected) != 1 {
+				t.Fatalf("selected = %+v, error = %v", selected, err)
+			}
+			calls, err := os.ReadFile(log)
+			if err != nil || !strings.HasSuffix(string(calls), "\ncodespace create -R owner/repo -b main -m basicLinux32gb"+tt.createFlags+"\n") {
+				t.Fatalf("gh calls = %q, error = %v", calls, err)
+			}
+		})
 	}
 }
 

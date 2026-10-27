@@ -640,6 +640,14 @@ func selectLauncherCodespaces(opts launcherOptions) ([]codespace, error) {
 				return nil, fmt.Errorf("current GitHub repository is empty; launch from a repository checkout")
 			}
 		}
+		branchOutput, err := exec.Command("gh", "api", "repos/"+repo, "--jq", ".default_branch").Output()
+		if err != nil {
+			return nil, fmt.Errorf("finding default branch for %s: %w", repo, err)
+		}
+		branch := strings.TrimSpace(string(branchOutput))
+		if branch == "" || branch == "null" {
+			return nil, fmt.Errorf("no default branch available for %s", repo)
+		}
 		machineOutput, err := exec.Command("gh", "api", "repos/"+repo+"/codespaces/machines", "--jq",
 			".machines | sort_by(.cpus, .memory_in_bytes, .storage_in_bytes) | .[0].name").Output()
 		if err != nil {
@@ -649,8 +657,25 @@ func selectLauncherCodespaces(opts launcherOptions) ([]codespace, error) {
 		if machine == "" || machine == "null" {
 			return nil, fmt.Errorf("no Codespace machines available for %s", repo)
 		}
-		fmt.Printf("Creating new Codespace for %s (machine: %s)...\n", repo, machine)
-		nameOutput, err := exec.Command("gh", "codespace", "create", "-R", repo, "-m", machine).Output()
+		devcontainerOutput, err := exec.Command("gh", "api", "repos/"+repo+"/codespaces/new", "--jq", ".defaults.devcontainer_path").Output()
+		if err != nil {
+			return nil, fmt.Errorf("finding default devcontainer for %s: %w", repo, err)
+		}
+		devcontainer := strings.TrimSpace(string(devcontainerOutput))
+		if devcontainer == "" || devcontainer == "null" {
+			available, err := exec.Command("gh", "api", "repos/"+repo+"/codespaces/devcontainers", "--jq",
+				".devcontainers | map(.path) | sort | .[0] // empty").Output()
+			if err != nil {
+				return nil, fmt.Errorf("listing devcontainers for %s: %w", repo, err)
+			}
+			devcontainer = strings.TrimSpace(string(available))
+		}
+		fmt.Printf("Creating new Codespace for %s (branch: %s, machine: %s, devcontainer: %s)...\n", repo, branch, machine, devcontainer)
+		createArgs := []string{"codespace", "create", "-R", repo, "-b", branch, "-m", machine}
+		if devcontainer != "" {
+			createArgs = append(createArgs, "--devcontainer-path", devcontainer)
+		}
+		nameOutput, err := exec.Command("gh", createArgs...).Output()
 		if err != nil {
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
