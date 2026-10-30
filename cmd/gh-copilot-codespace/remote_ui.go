@@ -58,7 +58,9 @@ func prepareRemoteNativeProfile(self, hostDir, profileDir, statusPath string) er
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == "settings.json" || name == "extensions" {
+		// MCP writer ownership is bound to the profile directory's identity.
+		// Each private profile must create its own binding and matching lock.
+		if name == "settings.json" || name == "extensions" || name == ".mcp-writer.binding" || name == ".mcp-writer.lock" {
 			continue
 		}
 		if err := os.Symlink(filepath.Join(original, name), filepath.Join(profileDir, name)); err != nil {

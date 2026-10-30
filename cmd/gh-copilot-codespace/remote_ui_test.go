@@ -102,15 +102,17 @@ func TestRemoteUIProfilePreservesHostConfiguration(t *testing.T) {
 	settings := "// profile fixture\n" + `{"model":"keep","modelEffort":"high","theme":"keep","permissions":{"allow":["fixture-only"]},"auth":{"fixture":"not-a-secret"},"footer":{"showModelEffort":true,"showContextWindow":true,"showQuota":false,"showAiUsed":true,"showAgent":true,"showUsername":false,"showSandbox":true,"showYolo":true,"showSchedules":false,"customPreference":{"keep":1}},"tabs":{"custom":"keep"},"ide":{"custom":"keep"},"statusLine":{"command":"old"},}`
 	t.Setenv("REMOTE_UI_EXPECTED_SETTINGS", settings)
 	files := map[string]string{
-		"settings.json":                  settings,
-		"config.json":                    `{"keep":"config"}`,
-		"mcp-config.json":                `{"mcpServers":{"keep":{"command":"host-command"}}}`,
-		"plugins/plugin/config":          "preserve plugin",
-		"auth/state":                     "fixture host state",
-		"instructions/user.md":           "preserve instructions",
-		"hooks/hook":                     "preserve hook",
-		"skills/user/SKILL.md":           "preserve skill",
-		"extensions/other/extension.mjs": "preserve other extension",
+		"settings.json":                                  settings,
+		".mcp-writer.binding":                            `{"root":{"platform":"unix","device":1,"inode":2},"lock":{"platform":"unix","device":1,"inode":3}}`,
+		".mcp-writer.lock":                               "",
+		"config.json":                                    `{"keep":"config"}`,
+		"mcp-config.json":                                `{"mcpServers":{"keep":{"command":"host-command"}}}`,
+		"plugins/plugin/config":                          "preserve plugin",
+		"auth/state":                                     "fixture host state",
+		"instructions/user.md":                           "preserve instructions",
+		"hooks/hook":                                     "preserve hook",
+		"skills/user/SKILL.md":                           "preserve skill",
+		"extensions/other/extension.mjs":                 "preserve other extension",
 		"extensions/copilot-codespace/extension.mjs":     "unchanged original stable extension",
 		"extensions/copilot-codespace-old/extension.mjs": "unchanged generated extension",
 	}
@@ -136,6 +138,15 @@ func TestRemoteUIProfilePreservesHostConfiguration(t *testing.T) {
 		target, err := os.Readlink(filepath.Join(profile, name))
 		if err != nil || target != filepath.Join(original, name) || !filepath.IsAbs(target) {
 			t.Fatalf("host entry %s not preserved by absolute symlink: %q, %v", name, target, err)
+		}
+	}
+	for _, name := range []string{".mcp-writer.binding", ".mcp-writer.lock"} {
+		privatePath := filepath.Join(profile, name)
+		if _, err := os.Lstat(privatePath); !os.IsNotExist(err) {
+			t.Fatalf("private profile inherited root-bound MCP writer state %s: %v", name, err)
+		}
+		if err := os.WriteFile(privatePath, []byte("private writer state"), 0o600); err != nil {
+			t.Fatal(err)
 		}
 	}
 	for name, expected := range files {
