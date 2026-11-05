@@ -565,7 +565,7 @@ if (!manifest) {
   const bootstrap = await (remoteNative ? Promise.race([
     request("list_tools"),
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("extension host readiness timed out")), 20000);
+      timer = setTimeout(() => reject(new Error("extension host readiness timed out")), 120000);
     }),
   ]).finally(() => clearTimeout(timer)) : request("list_tools"));
   // The Go side returns { tools, systemMessage?, customAgents? }. Older builds

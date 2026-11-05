@@ -3,12 +3,102 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestExtensionHostStartupRepairCancellation(t *testing.T) {
+	artifact := buildLinuxHelperFixture(t, "linux", "amd64")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	bin := t.TempDir()
+	gh := `#!/bin/sh
+printf 'Host cs.test\n  HostName example.com\n'
+`
+	ssh := `#!/bin/sh
+for last; do :; done
+case "$last" in
+  *"base64 -d"*) printf '%s\n' "$$" > "$REPAIR_STARTED"; exec sleep 60 ;;
+  *"sha256sum"*) printf '%064d\n' 1 ;;
+  *"uname -m"*) printf 'x86_64\n' ;;
+  *'printf '*'"$HOME"'*) printf '/home/codespace\n' ;;
+esac
+`
+	for name, content := range map[string]string{"gh": gh, "ssh": ssh} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(content), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	started := filepath.Join(home, "repair-started")
+	t.Setenv("REPAIR_STARTED", started)
+	t.Setenv(codespaceLinuxHelperEnv, artifact)
+	t.Setenv(codespaceRemoteNativeEnv, "1")
+	t.Setenv(daemonDisabledEnv, "1")
+	t.Setenv(codespaceLifecycleConfigEnv, "")
+	data, err := json.Marshal([]registryEntry{{
+		Alias: "test", Name: "test", Workdir: "/workspaces/repo",
+		HelperPath: "/home/codespace/" + strings.Repeat("0", 64) + "/gh-copilot-codespace",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODESPACE_REGISTRY", string(data))
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		err := runExtensionHostIO(ctx, strings.NewReader(""), io.Discard)
+		close(finished)
+		result <- err
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+			return
+		default:
+		}
+		if data, err := os.ReadFile(started); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+				if proc, err := os.FindProcess(pid); err == nil {
+					_ = proc.Kill()
+				}
+			}
+		}
+	})
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("host exited before starting repair: %v", err)
+		case <-deadline:
+			t.Fatal("startup never reached helper repair")
+		case <-ticker.C:
+		}
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("startup cancellation error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup repair ignored cancellation")
+	}
+}
 
 // TestExtensionHostSubprocess_ConcurrentListCodespaces proves that a fast
 // list_codespaces returns before a slow list_available_codespaces by running

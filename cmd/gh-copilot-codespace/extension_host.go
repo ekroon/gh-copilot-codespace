@@ -69,7 +69,7 @@ func runExtensionHost() error {
 }
 
 func runExtensionHostIO(ctx context.Context, in io.Reader, out io.Writer) error {
-	reg, lifecycleCfg, err := toolRuntimeInputsFromEnv()
+	reg, lifecycleCfg, err := toolRuntimeInputsFromEnv(ctx)
 	if err != nil {
 		return err
 	}

@@ -107,25 +107,36 @@ func deployBinaryWithDeps(ctx context.Context, sshClient *ssh.Client, codespaceN
 		return "", err
 	}
 	if remoteDigest != "" && remoteDigest != digest {
-		return "", fmt.Errorf("content-addressed helper %q has digest %q, want %q; refusing to replace it", remotePath, remoteDigest, digest)
+		fmt.Fprintf(os.Stderr, "Cached exec agent checksum mismatch; repairing %s\n", remotePath)
 	}
 
-	if remoteDigest == "" {
+	if remoteDigest != digest {
 		fmt.Fprintln(os.Stderr, "Deploying exec agent to codespace...")
 		remoteDir := pathpkg.Dir(remotePath)
 		installCmd := fmt.Sprintf(`set -eu
 dir=%s
 dest=%s
+digest=%s
 mkdir -p "$dir"
 tmp="$dir/.upload-$$"
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 umask 077
 base64 -d > "$tmp"
+test "$(sha256sum -- "$tmp" | awk '{print $1}')" = "$digest" || { echo 'helper upload checksum mismatch' >&2; exit 1; }
 chmod 0755 "$tmp"
-mv -n "$tmp" "$dest"
+if [ -f "$dest" ]; then
+  checksum=$(sha256sum -- "$dest")
+  case "$checksum" in
+    "$digest "*) ;;
+    *) mv -f "$tmp" "$dest" ;;
+  esac
+else
+  mv -n "$tmp" "$dest"
+fi
 test -x "$dest"`,
 			deployShellQuote(remoteDir),
 			deployShellQuote(remotePath),
+			deployShellQuote(digest),
 		)
 		encoded := []byte(base64.StdEncoding.EncodeToString(binData))
 		if _, err := deps.remoteCommand(ctx, installCmd, encoded); err != nil {
@@ -157,7 +168,7 @@ test -x "$dest"`,
 
 func deployedHelperDigest(ctx context.Context, deps deployBinaryDeps, remotePath string) (string, error) {
 	command := fmt.Sprintf(
-		"if [ -f %s ]; then sha256sum -- %s | awk '{print $1}'; fi",
+		"if [ -f %s ]; then sha256sum -- %s; fi",
 		deployShellQuote(remotePath),
 		deployShellQuote(remotePath),
 	)
@@ -165,7 +176,16 @@ func deployedHelperDigest(ctx context.Context, deps deployBinaryDeps, remotePath
 	if err != nil {
 		return "", fmt.Errorf("checking deployed helper digest: %w", err)
 	}
-	return strings.TrimSpace(out), nil
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	digest := fields[0]
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size {
+		return "", fmt.Errorf("checking deployed helper digest: invalid SHA-256 output")
+	}
+	return digest, nil
 }
 
 func probeDeployedHelper(ctx context.Context, deps deployBinaryDeps, remotePath string) (helperinfo.Info, error) {
@@ -186,13 +206,31 @@ func restoreDeployedHelper(ctx context.Context, sshClient *ssh.Client, codespace
 		sshClient,
 		codespaceName,
 		remotePath,
-		deployBinaryDeps{remoteCommand: func(ctx context.Context, command string, stdin []byte) (string, error) {
-			return runRemoteCommandOnClient(ctx, sshClient, command, stdin)
-		}},
+		deployBinaryDeps{
+			detectArch:     detectCodespaceArch,
+			getLinuxBinary: getLinuxBinary,
+			binaryVersion:  binaryVersion,
+			remoteCommand: func(ctx context.Context, command string, stdin []byte) (string, error) {
+				return runRemoteCommandOnClient(ctx, sshClient, command, stdin)
+			},
+		},
 	)
 }
 
 func restoreDeployedHelperWithDeps(ctx context.Context, sshClient *ssh.Client, codespaceName, remotePath string, deps deployBinaryDeps) error {
+	digest := pathpkg.Base(pathpkg.Dir(remotePath))
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size || pathpkg.Base(remotePath) != "gh-copilot-codespace" {
+		return fmt.Errorf("helper path %q is not content-addressed; redeployment required", remotePath)
+	}
+	actual, err := deployedHelperDigest(ctx, deps, remotePath)
+	if err != nil {
+		return err
+	}
+	if actual != digest {
+		_, err := deployBinaryWithDeps(ctx, sshClient, codespaceName, deps)
+		return err
+	}
 	info, err := probeDeployedHelper(ctx, deps, remotePath)
 	if err != nil {
 		return err

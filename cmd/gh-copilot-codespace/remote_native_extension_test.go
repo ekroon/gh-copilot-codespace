@@ -13,7 +13,7 @@ func TestRemoteNativeExtensionReadinessAndFailure(t *testing.T) {
 	if err != nil {
 		t.Skip("node is not installed")
 	}
-	for _, scenario := range []string{"ready", "legacy", "missingManifest", "spawnError", "invalidProtocol", "timeout", "hostExit"} {
+	for _, scenario := range []string{"ready", "slowBootstrap", "legacy", "missingManifest", "spawnError", "invalidProtocol", "timeout", "hostExit"} {
 		t.Run(scenario, func(t *testing.T) {
 			source := extensionSource()
 			source = strings.Replace(source, `import { joinSession } from "@github/copilot-sdk/extension";`, `
@@ -71,7 +71,12 @@ function spawn() {
         patchArgs = request.args;
         result = {textResultForLlm:"remote patch applied", resultType:"success"};
       }
-      queueMicrotask(() => host.stdout.emit("data", JSON.stringify({id:request.id,result}) + "\n"));
+      const respond = () => host.stdout.emit("data", JSON.stringify({id:request.id,result}) + "\n");
+      if (scenario === "slowBootstrap" && request.method === "list_tools") {
+        setTimeout(respond, 35000);
+      } else {
+        queueMicrotask(respond);
+      }
     }
     done?.();
   };
@@ -82,7 +87,6 @@ const manifest = scenario === "missingManifest" ? undefined :
   {selfBinary:"/self",env:{CODESPACE_WORKSPACE_CONFIG:'{"alias":"pinned"}',COPILOT_HOME:profile}};
 `, 1)
 			source = strings.Replace(source, `const remoteNative = process.env.`+codespaceRemoteNativeEnv+` === "1" || Boolean(manifest?.env?.CODESPACE_WORKSPACE_CONFIG);`, `const remoteNative = scenario !== "legacy";`, 1)
-			source = strings.Replace(source, "20000);", "25);", 1)
 			checks := `
 if (configs.length !== 1) throw new Error("unexpected join count: " + configs.length);
 if (snapshotRejections !== 0) throw new Error("live plugin snapshot was rejected by a context/discovery override");
@@ -101,7 +105,7 @@ if (config.enableSkills !== false || config.skipCustomInstructions !== true ||
     config.enableOnDemandInstructionDiscovery !== false) throw new Error("native settings missing");
 if (JSON.stringify(config.availableTools) !== '["custom:*","mcp:*","builtin:task","builtin:ask_user","builtin:task_complete"]') throw new Error("native completion tool unavailable");
 if ("enableConfigDiscovery" in config || "onPermissionRequest" in config) throw new Error("MCP or permissions overridden");
-if (scenario === "ready" || scenario === "hostExit") {
+if (scenario === "ready" || scenario === "slowBootstrap" || scenario === "hostExit") {
   if (!logs.some(entry => entry.message.includes("LOCAL HOST folder: /host") && entry.message.includes("remote alias: pinned") && entry.message.includes("branch: topic"))) throw new Error("missing source identity status");
   if (!logs.some(entry => entry.level === "warning" && entry.message.includes("@attachment"))) throw new Error("missing local UI warning");
   const patch = config.tools.find(tool => tool.name === "apply_patch");
@@ -126,6 +130,8 @@ if (scenario === "ready" || scenario === "hostExit") {
 			cmd.Stdin = strings.NewReader(`const scenario = "` + scenario + `";
 const profile = "/private/native-session/profile with ' quote";
 process.env.COPILOT_HOME = profile;
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) => realSetTimeout(callback, delay / 1000, ...args);
 ` + source + checks)
 			if output, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("native extension %s: %v\n%s", scenario, err, output)

@@ -147,7 +147,7 @@ func main() {
 	}
 }
 
-func toolRuntimeInputsFromEnv() (*registry.Registry, mcp.LifecycleConfig, error) {
+func toolRuntimeInputsFromEnv(ctx context.Context) (*registry.Registry, mcp.LifecycleConfig, error) {
 	// Support multi-codespace via CODESPACE_REGISTRY env var (JSON)
 	// Falls back to single CODESPACE_NAME for backward compatibility
 	registryJSON := os.Getenv("CODESPACE_REGISTRY")
@@ -161,7 +161,7 @@ func toolRuntimeInputsFromEnv() (*registry.Registry, mcp.LifecycleConfig, error)
 
 	var reg *registry.Registry
 	if registryJSON != "" {
-		reg, err = registryFromJSON(context.Background(), registryJSON)
+		reg, err = registryFromJSON(ctx, registryJSON)
 		if err != nil {
 			return nil, mcp.LifecycleConfig{}, fmt.Errorf("invalid CODESPACE_REGISTRY: %w", err)
 		}
@@ -171,7 +171,6 @@ func toolRuntimeInputsFromEnv() (*registry.Registry, mcp.LifecycleConfig, error)
 			return nil, mcp.LifecycleConfig{}, fmt.Errorf("CODESPACE_NAME or CODESPACE_REGISTRY environment variable is required")
 		}
 		sshClient := ssh.NewClient(codespaceName)
-		ctx := context.Background()
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "extension-host: multiplexing setup warning: %v\n", err)
 		}
@@ -185,6 +184,9 @@ func toolRuntimeInputsFromEnv() (*registry.Registry, mcp.LifecycleConfig, error)
 		}); err != nil {
 			return nil, mcp.LifecycleConfig{}, fmt.Errorf("invalid single-codespace registry: %w", err)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, mcp.LifecycleConfig{}, err
 	}
 	return reg, lifecycleCfg, nil
 }
@@ -264,6 +266,8 @@ func registryFromJSON(ctx context.Context, data string) (*registry.Registry, err
 			if err := restoreDeployedHelper(ctx, sshClient, e.Name, helperPath); err != nil {
 				fmt.Fprintf(os.Stderr, "extension-host: ignoring incompatible helper for %s: %v\n", e.Alias, err)
 				helperPath = ""
+			} else {
+				helperPath = sshClient.FilesystemHelperPath()
 			}
 		}
 		return &registry.ManagedCodespace{
